@@ -45,7 +45,12 @@ function secretKey(): Uint8Array {
   return new TextEncoder().encode(secret);
 }
 
-async function issueSessionToken(userId: number): Promise<string> {
+/**
+ * Sign the stateless session JWT (HS256, sub = numeric user id, expiry per
+ * Session.maxAgeMs). Shared by the Kimi OAuth callback and the env-based
+ * password login (api/local-auth.ts) — both issue the same `kimi_sid` cookie.
+ */
+export async function issueSessionToken(userId: number): Promise<string> {
   return new SignJWT({ sub: String(userId) })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
