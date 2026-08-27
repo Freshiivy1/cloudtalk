@@ -1,0 +1,59 @@
+# Render.com blueprint for the CloudTalk main app (Docker web service).
+#
+# Render dashboard: New + → Blueprint → pick the GitHub repo Freshiivy1/cloudtalk,
+# or create a Web Service manually with Runtime = Docker pointing at this repo's
+# Dockerfile. Health check "/" hits the Vite-built SPA served by the Hono server
+# (200 once the process is up).
+#
+# NOTE on plan: "free" instances sleep after ~15 min of inactivity and cold-start
+# for ~30-60s — fine for demos, but Twilio webhooks against a sleeping instance
+# will time out. For real calling, use at least the "starter" plan.
+services:
+  - type: web
+    name: cloudtalk
+    runtime: docker
+    plan: free # recommended: starter (free instances sleep)
+    healthCheckPath: /
+    envVars:
+      # MySQL 8 connection string. Render has no managed MySQL — use an external
+      # provider (e.g. Aiven free plan). See DEPLOY-RENDER.md for provisioning +
+      # one-time schema setup. For SSL-enforcing providers append, e.g.:
+      #   ?ssl=%7B%22rejectUnauthorized%22%3Afalse%7D
+      - key: DATABASE_URL
+        sync: false
+      # Secret used to sign the kimi_sid session JWT (any long random string,
+      # e.g. `openssl rand -hex 32`). Required in production.
+      - key: SESSION_SECRET
+        sync: false
+      # Public origin of this service, e.g. https://cloudtalk.onrender.com —
+      # used to build absolute Twilio webhook URLs.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # Twilio — all five from the Twilio Console; see TWILIO_SETUP.md.
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_API_KEY_SID
+        sync: false
+      - key: TWILIO_API_KEY_SECRET
+        sync: false
+      - key: TWILIO_TWIML_APP_SID
+        sync: false
+      # Verified Twilio caller ID in E.164, e.g. +15551234567.
+      - key: TWILIO_CALLER_ID
+        sync: false
+      # External merge-detection relay (sibling repo callverify-merge-relay),
+      # deployed as its own Render service FIRST, e.g.
+      # wss://callverify-merge-relay.onrender.com/stream
+      - key: VERIFY_STREAM_URL
+        sync: false
+      # Shared secret with the relay (same value as the relay's own secret).
+      - key: VERIFY_STREAM_SECRET
+        sync: false
+      # Env-based password login (off-platform; replaces "Sign in with Kimi").
+      # Both must be set for the login form to work.
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
