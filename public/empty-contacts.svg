@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 160" width="240" height="160" fill="none">
+  <!-- Dashed connector between the two circles -->
+  <line x1="88" y1="80" x2="152" y2="80" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="4 6"/>
+  <!-- Left person circle -->
+  <circle cx="88" cy="80" r="32" stroke="#1C2942" stroke-width="1.5"/>
+  <circle cx="88" cy="70" r="10" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M70 100 C 70 88 106 88 106 100" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Right person circle -->
+  <circle cx="152" cy="80" r="32" stroke="#1C2942" stroke-width="1.5"/>
+  <circle cx="152" cy="70" r="10" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M134 100 C 134 88 170 88 170 100" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Teal plus badge at connector midpoint -->
+  <circle cx="120" cy="80" r="11" fill="#080D18" stroke="#2EE6A8" stroke-width="1.5"/>
+  <path d="M120 75.5 L120 84.5 M115.5 80 L124.5 80" stroke="#2EE6A8" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

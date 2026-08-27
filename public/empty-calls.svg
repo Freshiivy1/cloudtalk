@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 160" width="240" height="160" fill="none">
+  <!-- Three dashed signal arcs above the handset (centered at 120,138) -->
+  <path d="M82 86 A 52 52 0 0 1 158 86" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="4 6"/>
+  <path d="M64 78 A 70 70 0 0 1 176 78" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="4 6"/>
+  <path d="M46 70 A 88 88 0 0 1 194 70" stroke="#1C2942" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="4 6"/>
+  <!-- Single teal dot on the middle arc -->
+  <circle cx="120" cy="68" r="3" fill="#2EE6A8"/>
+  <!-- Telephone handset outline -->
+  <path d="M48 120
+           C 44 120 40 116 40 112 L40 106
+           C 40 84 76 70 120 70
+           C 164 70 200 84 200 106 L200 112
+           C 200 116 196 120 192 120 L174 120
+           C 170 120 166 116 166 112 L166 102
+           C 166 95 146 88 120 88
+           C 94 88 74 95 74 102 L74 112
+           C 74 116 70 120 66 120 Z"
+        stroke="#1C2942" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

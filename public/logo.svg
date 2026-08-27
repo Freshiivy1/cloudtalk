@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 40" width="160" height="40">
+  <defs>
+    <linearGradient id="ct-signal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#57F0C0"/>
+      <stop offset="1" stop-color="#2EE6A8"/>
+    </linearGradient>
+  </defs>
+  <!-- Mark: rounded-square ink-800 tile with three waveform bars -->
+  <rect x="0" y="0" width="40" height="40" rx="8" fill="#0C1424"/>
+  <rect x="10.5" y="13" width="4" height="14" rx="2" fill="url(#ct-signal)"/>
+  <rect x="18" y="8" width="4" height="24" rx="2" fill="url(#ct-signal)"/>
+  <rect x="25.5" y="14.5" width="4" height="11" rx="2" fill="url(#ct-signal)"/>
+  <!-- Wordmark -->
+  <text x="50" y="27" font-family="'Space Grotesk', 'Inter', sans-serif" font-size="21" font-weight="600" letter-spacing="-0.4" fill="#EAF1FB">Cloud</text>
+  <text x="112" y="27" font-family="'Space Grotesk', 'Inter', sans-serif" font-size="21" font-weight="600" letter-spacing="-0.4" fill="#2EE6A8">Talk</text>
+</svg>
