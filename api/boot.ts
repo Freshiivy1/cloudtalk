@@ -53,6 +53,23 @@ if (env.isProduction) {
   const { serve } = await import("@hono/node-server");
   const { serveStaticFiles } = await import("./lib/vite");
   const { attachVerificationStreamServer } = await import("./verification-stream");
+
+  // Self-migrate the MySQL schema on boot so a fresh deploy needs no manual
+  // `drizzle-kit migrate` step. No-op (with a warning) when DATABASE_URL is
+  // absent — the server still serves the SPA.
+  if (process.env.DATABASE_URL) {
+    try {
+      const { migrate } = await import("drizzle-orm/mysql2/migrator");
+      const { getDb } = await import("./queries/connection");
+      await migrate(getDb(), { migrationsFolder: "db/migrations" });
+      console.log("Database schema is up to date (migrations applied).");
+    } catch (err) {
+      console.error("Database migration failed — continuing boot:", err);
+    }
+  } else {
+    console.warn("DATABASE_URL not set — skipping migrations; DB-backed features will fail.");
+  }
+
   serveStaticFiles(app);
 
   const port = parseInt(process.env.PORT || "3000");

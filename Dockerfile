@@ -14,6 +14,10 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/public ./public
+# Runtime config (.env loaded via dotenv; platform env still takes precedence)
+# and Drizzle migrations (applied automatically at boot, see api/boot.ts).
+COPY .env ./.env
+COPY db/migrations ./db/migrations
 # Server listens on PORT (platform-injected; default 3000)
 EXPOSE 3000
 CMD ["node", "dist/boot.js"]
