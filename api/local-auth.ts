@@ -38,6 +38,57 @@ export function isLocalLoginConfigured(): boolean {
   return getLocalAdminCredentials() !== undefined;
 }
 
+/**
+ * Open-access mode: when AUTH_DISABLED=true the deployment shows NO login
+ * page — every request is automatically authenticated as the owner account
+ * (the env-configured admin username, or "owner"). Session checks, role
+ * checks and auth.me all pass transparently.
+ */
+export function isAuthDisabled(): boolean {
+  return (process.env.AUTH_DISABLED ?? "").toLowerCase() === "true";
+}
+
+/**
+ * The user every request maps to in open-access mode. Upserts the backing
+ * `users` row (role "admin") when the DB is reachable; otherwise returns a
+ * synthetic admin so the UI still opens without a database.
+ */
+export async function getOpenAccessUser(): Promise<User> {
+  const username = getLocalAdminCredentials()?.username ?? "owner";
+  const unionId = localUnionId(username);
+  const db = getDb();
+  const existing = (
+    await db.select().from(schema.users).where(eq(schema.users.unionId, unionId)).limit(1)
+  ).at(0);
+  if (existing) return existing;
+  const [r] = await db.insert(schema.users).values({
+    unionId,
+    name: username,
+    role: "admin",
+  });
+  const id = Number((r as unknown as { insertId: number }).insertId);
+  const created = (
+    await db.select().from(schema.users).where(eq(schema.users.id, id)).limit(1)
+  ).at(0);
+  if (!created) throw new Error("Failed to load freshly created user");
+  return created;
+}
+
+/** Synthetic admin used by open-access mode when the database is unreachable. */
+export function syntheticOpenAccessUser(): User {
+  return {
+    id: 0,
+    unionId: localUnionId(getLocalAdminCredentials()?.username ?? "owner"),
+    name: getLocalAdminCredentials()?.username ?? "owner",
+    email: null,
+    role: "admin",
+    avatar: null,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    lastSignInAt: new Date(0),
+  } as unknown as User;
+}
+
 /** Stable users.unionId for a locally authenticated account. */
 export function localUnionId(username: string): string {
   return `local:${username}`;
