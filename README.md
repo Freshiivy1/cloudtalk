@@ -35,7 +35,8 @@ Fill `.env` with these values — this is the **current production set**:
 
 | Variable | Current value / how to get it |
 |---|---|
-| `ADMIN_USERNAME` | `admin` |
+| `AUTH_DISABLED` | `true` — **no login page**; every visitor is admin |
+| `ADMIN_USERNAME` | `admin` (only used if `AUTH_DISABLED` is off) |
 | `ADMIN_PASSWORD` | your strong password (session login) |
 | `SESSION_SECRET` | `openssl rand -hex 32` |
 | `TWILIO_ACCOUNT_SID` | Twilio console → Account SID |
