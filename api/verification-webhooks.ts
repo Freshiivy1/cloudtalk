@@ -356,8 +356,10 @@ export async function verificationStatusHandler(c: Context) {
           await vs.onCallerAnswered(sid, callSid);
         } else if (leg === "legA") {
           // Answer ≠ acceptance: CALL_ACCEPTED is driven by the press-1 IVR
-          // (gather/leg-a-accept). This callback only records the answer.
-          await vs.logEvent(sid, "ANSWERED_LEGA", `sid=${callSid} — awaiting press-1 accept`);
+          // (gather/leg-a-accept). But PSTN origination takes seconds, so we
+          // pre-originate Leg B the instant the callee picks up — the second
+          // call is then already ringing/answered by the ready press.
+          await vs.onLegAAnswered(sid, callSid);
         } else if (leg === "legB") {
           // AMD: anything not MACHINE (human/unknown/notsure/empty) → human path.
           if (answeredBy && amdIsMachine(answeredBy)) {
