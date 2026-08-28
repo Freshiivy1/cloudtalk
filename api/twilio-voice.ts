@@ -49,6 +49,19 @@ export function twilioCallerId(): string {
   return cfg().callerId;
 }
 
+/**
+ * Leg-aware caller ID. Leg B (the "second call") uses TWILIO_CALLER_ID_LEG_B
+ * when set, so the callee never sees the same number calling twice in a row —
+ * back-to-back calls from one number trip carrier/handset spam screening.
+ * Falls back to TWILIO_CALLER_ID.
+ */
+export function twilioCallerIdFor(leg?: string): string {
+  if (leg === "legB" && process.env.TWILIO_CALLER_ID_LEG_B?.trim()) {
+    return process.env.TWILIO_CALLER_ID_LEG_B.trim();
+  }
+  return cfg().callerId;
+}
+
 let restClient: ReturnType<typeof twilio> | null = null;
 
 /**
