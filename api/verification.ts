@@ -584,10 +584,10 @@ export async function onCallAccepted(
   ) {
     session.legACallSid = callSid;
     await save(session);
-    // SPEED: Leg B was pre-originated when Leg A was answered (see
-    // onLegAAnswered), so by now it is already ringing or answered — this
-    // call is only the FSM ack + a fallback origination if the pre-origination
-    // failed.
+    // SPEED: pre-originate Leg B NOW, at the first press-1 — the second call
+    // rings during prompt 2 and arrives at the second "ready" press. (Firing
+    // earlier — at answer — made the second call arrive before the callee had
+    // accepted, which is not the intended flow.)
     await originateLegB(sessionId);
   }
 }
