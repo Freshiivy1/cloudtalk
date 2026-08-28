@@ -197,17 +197,21 @@ export async function verificationTwimlHandler(c: Context) {
             .onVoicemailDetected(sid, answeredBy)
             .catch((err) => console.error("[verify] leg-b AMD error:", err));
         }
-        // Merge detection: tight loop of 1-second <Record> chunks — each
-        // chunk's callback is Goertzel-scanned for the continuous DTMF-9
-        // tone leaking across a merge. (Media Streams are blocked by this
-        // hosting platform — error 31920 — and <Gather> can't hear in-band
-        // tones, so chunked recording analysis is the reliable path.)
-        // PRIMARY (when configured): live audio fork to the external relay's
-        // real-time detector → sub-0.5s merge detection. The record-chunk
-        // loop below stays as the always-on fallback (~2s).
+        // Merge detection strategy:
+        // PRIMARY (when VERIFY_STREAM_URL is configured): DUPLEX stream —
+        // <Connect><Stream> holds Leg B on the relay's WebSocket; the relay's
+        // Goertzel detector fires on ~300ms of leaked tone and speaks the
+        // verdict straight into the open socket (merge→verdict ≈ 0.3–0.4s,
+        // no Twilio round-trip). Leg A is torn down by the armed relay.
+        // FALLBACK (no relay): tight loop of 1-second <Record> chunks —
+        // each chunk's callback is Goertzel-scanned (~2s detection).
         const relayUrl = relayStreamUrl(sid);
         if (relayUrl) {
-          vr.start().stream({ url: relayUrl });
+          const connect = vr.connect();
+          const stream = connect.stream({ url: relayUrl });
+          stream.parameter({ name: "sid", value: sid });
+          stream.parameter({ name: "mode", value: "duplex" });
+          break;
         }
         // SILENT on Leg B: no words, no beep. 1s chunks → merge-to-termination
         // ≈1.5–2.5s typical (chunk + processing + analysis + REST hangups).
