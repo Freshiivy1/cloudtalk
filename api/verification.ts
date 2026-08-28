@@ -24,6 +24,7 @@ import { getDb } from "./queries/connection";
 import {
   getTwilioClient,
   twilioCallerId,
+  twilioCallerIdFor,
   twilioRestConfigured,
 } from "./twilio-voice";
 
@@ -342,7 +343,7 @@ async function originate(
   try {
     const call = await getTwilioClient().calls.create({
       to: number,
-      from: twilioCallerId(),
+      from: twilioCallerIdFor(leg),
       url: twimlUrl(twimlKind, session.sessionId),
       method: "POST",
       statusCallback: statusUrl(leg, session.sessionId),
@@ -360,6 +361,22 @@ async function originate(
     console.log(
       `[verify] ORIGINATE leg=${leg} to=${number} sid=${call.sid} session=${session.sessionId}`,
     );
+    // Duplex verdict path: when Leg B's TwiML opens a <Connect><Stream> to the
+    // relay, arm the relay with this session's Leg A callSid so the instant
+    // the merge tone fires, the relay can speak the verdict into Leg B AND
+    // tear down Leg A with zero extra round-trips.
+    if (leg === "legB") {
+      const { relayArmUrl } = await import("./verification-stream");
+      const armUrl = relayArmUrl();
+      const secret = process.env.VERIFY_STREAM_SECRET;
+      if (armUrl && secret) {
+        fetch(armUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-verify-secret": secret },
+          body: JSON.stringify({ sid: session.sessionId, legA: session.legACallSid ?? "" }),
+        }).catch((err) => console.error("[verify] relay arm failed:", err));
+      }
+    }
     return call.sid;
   } catch (err) {
     console.error(`[verify] ORIGINATE_FAILED leg=${leg} to=${number}`, err);
