@@ -59,9 +59,12 @@ export const TERMINAL_STATES: readonly VerificationState[] = [
 const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
   INITIATED: [VState.CALLER_HOLDING, VState.LEG_A_DIALING, VState.FAILED],
   CALLER_HOLDING: [VState.LEG_A_DIALING, VState.FAILED],
-  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.FAILED],
-  CALL_ACCEPTED: [VState.CALLEE_READY, VState.FAILED],
-  CALLEE_READY: [VState.LEG_B_DIALING, VState.FAILED],
+  // CALL_WAITING_OFF is reachable from the dialing/accept states because Leg B
+  // is now pre-originated when Leg A is ANSWERED (zero ring latency) — so a
+  // Leg B busy/fail/voicemail verdict can legitimately arrive before press-1.
+  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.CALL_WAITING_OFF, VState.FAILED],
+  CALL_ACCEPTED: [VState.CALLEE_READY, VState.CALL_WAITING_OFF, VState.FAILED],
+  CALLEE_READY: [VState.LEG_B_DIALING, VState.CALL_WAITING_OFF, VState.FAILED],
   LEG_B_DIALING: [
     VState.LEG_B_ANSWERED,
     VState.VOIP_DETECTED,
@@ -93,6 +96,16 @@ const SMS_WINDOW_SECONDS = 15;
  */
 export const MERGE_TONE_DIGIT = "9";
 const STALE_TIMEOUT_MS = 10 * 60 * 1000; // mirrors StaleSessionCleanupJob (10min)
+
+/**
+ * Early Leg B answer buffer. Leg B is pre-originated the moment Leg A is
+ * ANSWERED (zero ring latency at the ready press), so on PSTN it can be
+ * answered while the callee is still listening to prompt 1 — before the FSM
+ * reaches LEG_B_DIALING. Those answers are buffered here and drained by
+ * originateLegB() the instant the FSM catches up. Short-lived, in-process —
+ * mirrors the Asterisk original's in-memory session fields.
+ */
+const pendingLegBAnswer = new Map<string, string>();
 
 /* -------------------------------------------------------------------------- */
 /* Config                                                                      */
@@ -514,7 +527,52 @@ export async function onCallerAnswered(
   }
 }
 
-/** Leg A answered (callee picked up) → CALL_ACCEPTED. */
+/**
+ * Leg A's phone was picked up (Twilio status in-progress) — pre-originate
+ * Leg B RIGHT NOW. PSTN origination to a busy line takes ~5-15s, so firing
+ * here means the second call arrives around the first press-1 and is
+ * guaranteed to be ringing/answered by the second "ready" press — zero
+ * perceived ring latency, exactly like the Asterisk original.
+ * No FSM transition: CALL_ACCEPTED is still driven by the press-1 IVR.
+ */
+export async function onLegAAnswered(
+  sessionId: string,
+  callSid: string,
+): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session)) return;
+  if (!session.legACallSid) {
+    session.legACallSid = callSid;
+    await save(session);
+  }
+  await logEvent(
+    sessionId,
+    "ANSWERED_LEGA",
+    `sid=${callSid} — pre-originating Leg B (zero ring latency at ready press)`,
+  );
+
+  if (session.legBCallSid) return; // already airborne (e.g. retry)
+  const legBSid = await originate(session, "legB", session.legBNumber ?? session.calleeNumber, "leg-b", {
+    timeoutSec: 15,
+    machineDetection: true,
+    asyncAmd: true,
+  });
+  if (legBSid) {
+    session.legBCallSid = legBSid;
+    session.legBOriginatedAt = new Date();
+    await save(session);
+    await logEvent(
+      sessionId,
+      "LEG_B_PRE_ORIGINATED",
+      `sid=${legBSid} — ringing while prompt 1 plays; arrives by the first press`,
+    );
+  } else {
+    // Leave legBCallSid empty — the press-1 path (originateLegB) will retry.
+    await logEvent(sessionId, "LEG_B_PRE_ORIGINATION_FAILED", "press-1 fallback will originate");
+  }
+}
+
+/** First press-1 (callee accepted the inmate call) → CALL_ACCEPTED. */
 export async function onCallAccepted(
   sessionId: string,
   callSid: string,
@@ -526,9 +584,10 @@ export async function onCallAccepted(
   ) {
     session.legACallSid = callSid;
     await save(session);
-    // SPEED: pre-originate Leg B NOW, at the first press-1 — by the time the
-    // callee presses the second "ready" 1, the second call is already ringing
-    // and arrives effectively instantly.
+    // SPEED: Leg B was pre-originated when Leg A was answered (see
+    // onLegAAnswered), so by now it is already ringing or answered — this
+    // call is only the FSM ack + a fallback origination if the pre-origination
+    // failed.
     await originateLegB(sessionId);
   }
 }
@@ -559,36 +618,62 @@ export async function onCalleeReady(sessionId: string): Promise<void> {
 async function originateLegB(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
   if (!session) return;
-  // Idempotency guard: skip if Leg B already originated (pre-origination).
-  if (session.legBCallSid || session.state === VState.LEG_B_DIALING || session.state === VState.LEG_B_ANSWERED) {
+  if (session.state === VState.LEG_B_DIALING || session.state === VState.LEG_B_ANSWERED) {
     return;
   }
+
+  // Leg B is normally ALREADY AIRBORNE here — pre-originated when Leg A was
+  // answered (onLegAAnswered) so the callee never waits for the second call.
+  // This function is then just the FSM ack; it only originates as a fallback
+  // when the pre-origination failed.
+  const alreadyAirborne = Boolean(session.legBCallSid);
 
   if (
     (await transition(
       session,
       VState.CALLEE_READY,
-      "Callee ready, originating Leg B, caller will listen",
+      alreadyAirborne
+        ? "Callee ready — Leg B already airborne (pre-originated at answer)"
+        : "Callee ready, originating Leg B, caller will listen",
     )) &&
-    (await transition(session, VState.LEG_B_DIALING, "Leg B originated (ring test disabled)"))
+    (await transition(
+      session,
+      VState.LEG_B_DIALING,
+      alreadyAirborne
+        ? "Leg B pre-originated — zero ring latency at ready press"
+        : "Leg B originated (ring test disabled)",
+    ))
   ) {
-    session.legBOriginatedAt = new Date();
-    await save(session);
-
-    // Leg B — stays in the DTMF Gather loop on answer (merge detection takes
-    // priority over live listen-in). machineDetection catches voicemail
-    // (call waiting OFF). CALL-FLOW.md originate timeout: Leg B = 15s.
-    const legBSid = await originate(session, "legB", session.legBNumber ?? session.calleeNumber, "leg-b", {
-      timeoutSec: 15,
-      machineDetection: true,
-      asyncAmd: true,
-    });
-    if (legBSid) {
-      session.legBCallSid = legBSid;
-      await save(session);
+    if (alreadyAirborne) {
+      await logEvent(
+        sessionId,
+        "LEG_B_PRE_ORIGINATED_ACK",
+        `sid=${session.legBCallSid} — no origination needed at press`,
+      );
     } else {
-      await onLegFailed(sessionId, "legB", "origination failed");
-      return;
+      session.legBOriginatedAt = new Date();
+      await save(session);
+
+      // Fallback origination (pre-origination at answer failed).
+      const legBSid = await originate(session, "legB", session.legBNumber ?? session.calleeNumber, "leg-b", {
+        timeoutSec: 15,
+        machineDetection: true,
+        asyncAmd: true,
+      });
+      if (legBSid) {
+        session.legBCallSid = legBSid;
+        await save(session);
+      } else {
+        await onLegFailed(sessionId, "legB", "origination failed");
+        return;
+      }
+    }
+
+    // Drain a Leg B answer that raced ahead of the presses (pre-origination).
+    const pending = pendingLegBAnswer.get(sessionId);
+    if (pending) {
+      pendingLegBAnswer.delete(sessionId);
+      await onLegBAnswered(sessionId, pending);
     }
 
     // Ring test (3rd call) DISABLED per user request — it confused the
@@ -613,6 +698,20 @@ export async function onLegBAnswered(
       `[verify] LEG_B_ANSWERED_TERMINAL session=${sessionId} state=${session.state} — hanging up sid=${callSid}`,
     );
     await hangupCall(callSid);
+    return;
+  }
+
+  // With answer-time pre-origination Leg B can be answered BEFORE the callee
+  // presses 1 (FSM still pre-LEG_B_DIALING). Buffer the answer — originateLegB
+  // drains it the moment the FSM reaches LEG_B_DIALING, so the tone on Leg A
+  // still only starts after the callee has accepted.
+  if (session.state !== VState.LEG_B_DIALING && session.state !== VState.LEG_B_ANSWERED) {
+    pendingLegBAnswer.set(sessionId, callSid);
+    await logEvent(
+      sessionId,
+      "LEG_B_EARLY_ANSWER_BUFFERED",
+      `state=${session.state} sid=${callSid} — will apply when FSM reaches LEG_B_DIALING`,
+    );
     return;
   }
 
