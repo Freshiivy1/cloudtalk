@@ -52,6 +52,18 @@ export function relayStreamUrl(sessionId: string): string | null {
   return `${u}${u.includes("?") ? "&" : "?"}sid=${sessionId}`;
 }
 
+/**
+ * HTTPS URL of the relay's /arm endpoint (derived from VERIFY_STREAM_URL).
+ * The app POSTs {sid, legA} here when originating Leg B so the relay can
+ * speak the verdict in-band and tear down Leg A the instant the merge tone
+ * fires — the sub-0.5s path needs no Twilio REST round-trip.
+ */
+export function relayArmUrl(): string | null {
+  const u = process.env.VERIFY_STREAM_URL?.trim();
+  if (!u || !/^wss:\/\//.test(u)) return null;
+  return `${u.replace(/^wss:\/\//, "https://").replace(/[/?].*$/, "")}/arm`;
+}
+
 /* -------------------------------------------------------------------------- */
 /* DSP — μ-law decode + Goertzel (pure functions, unit-tested)                  */
 /* -------------------------------------------------------------------------- */
