@@ -67,7 +67,7 @@ if (env.isProduction) {
       console.error("Database migration failed — continuing boot:", err);
     }
   } else {
-    console.warn("DATABASE_URL not set — skipping migrations; DB-backed features will fail.");
+    console.warn("DATABASE_URL not set — skipping migrations; running in no-history mode (calls still work).");
   }
 
   serveStaticFiles(app);
