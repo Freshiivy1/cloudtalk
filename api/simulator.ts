@@ -13,7 +13,7 @@
  */
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import * as schema from "@db/schema";
-import { getDb } from "./queries/connection";
+import { getDbOrNull } from "./queries/connection";
 
 const LIVE_STATUSES = ["dialing", "ringing", "active", "held"] as const;
 
@@ -22,11 +22,18 @@ export async function logCallEvent(
   type: string,
   payload?: Record<string, unknown>,
 ) {
-  await getDb().insert(schema.callEvents).values({
-    callId,
-    type,
-    payload: payload ? JSON.stringify(payload) : null,
-  });
+  const db = getDbOrNull();
+  if (!db) return; // history is optional when DATABASE_URL is absent
+  try {
+    await db.insert(schema.callEvents).values({
+      callId,
+      type,
+      payload: payload ? JSON.stringify(payload) : null,
+    });
+  } catch (err) {
+    // Event mirroring must never break a real call or webhook response.
+    console.warn("[simulator] logCallEvent failed:", (err as Error).message);
+  }
 }
 
 function rand(min: number, max: number) {
@@ -34,7 +41,9 @@ function rand(min: number, max: number) {
 }
 
 async function getSetting(key: string): Promise<string | null> {
-  const rows = await getDb()
+  const db = getDbOrNull();
+  if (!db) return null;
+  const rows = await db
     .select()
     .from(schema.settings)
     .where(eq(schema.settings.key, key))
@@ -43,7 +52,9 @@ async function getSetting(key: string): Promise<string | null> {
 }
 
 async function setSetting(key: string, value: string) {
-  await getDb()
+  const db = getDbOrNull();
+  if (!db) return;
+  await db
     .insert(schema.settings)
     .values({ key, value })
     .onDuplicateKeyUpdate({ set: { value } });
@@ -58,7 +69,8 @@ function randomAuNumber() {
 
 /** Advance all live simulated calls according to their schedule. */
 async function progressLiveCalls(now: Date) {
-  const db = getDb();
+  const db = getDbOrNull();
+  if (!db) return;
   const live = await db
     .select()
     .from(schema.calls)
@@ -136,7 +148,9 @@ async function setExtensionStatus(
   extensionId: number,
   status: "idle" | "ringing" | "in_call" | "held" | "offline",
 ) {
-  await getDb()
+  const db = getDbOrNull();
+  if (!db) return;
+  await db
     .update(schema.extensions)
     .set({ status })
     .where(eq(schema.extensions.id, extensionId));
@@ -144,7 +158,8 @@ async function setExtensionStatus(
 
 /** Spawn new simulated traffic so the live monitor always has a pulse. */
 async function maybeSpawnCall(now: Date) {
-  const db = getDb();
+  const db = getDbOrNull();
+  if (!db) return;
   const liveCount = await db
     .select({ n: sql<number>`count(*)` })
     .from(schema.calls)
@@ -229,7 +244,8 @@ export async function advanceSimulation() {
 
 /** Recent global event feed — the stream the Live Analysis dock consumes. */
 export async function recentEvents(limit = 30) {
-  const db = getDb();
+  const db = getDbOrNull();
+  if (!db) return [];
   return db
     .select({
       id: schema.callEvents.id,
