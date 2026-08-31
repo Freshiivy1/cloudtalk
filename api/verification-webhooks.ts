@@ -490,22 +490,20 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
   const sid = c.req.query("sid") ?? "";
   const a = attemptFrom(c);
   const vr = new VoiceResponse();
-  const P = vs.verifyPrompts();
   try {
     const body = await c.req.parseBody();
     const digits = String(body.Digits ?? "");
 
     if (digits === "1") {
-      // Callee accepted → CALL_ACCEPTED, then immediately ask step 2.
+      // Callee accepted → CALL_ACCEPTED. SINGLE press-1 flow (per user
+      // request): no second "ready" press — onCallAccepted pre-originates
+      // Leg B itself, so we acknowledge and park Leg A on the hold loop
+      // immediately. The leg-a-ready step remains in code for reference but
+      // is no longer reachable from this flow.
       await vs.onCallAccepted(sid, String(body.CallSid ?? ""));
-      const gather = vr.gather({
-        numDigits: 1,
-        timeout: IVR_GATHER_TIMEOUT,
-        action: vs.gatherLegAReadyUrl(sid, 0),
-        method: "POST",
-      });
-      gather.say(P.ready);
-      vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), 1));
+      vr.say("Thank you. Please stay on the line while your call is connected.");
+      vr.pause({ length: 60 });
+      vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
     } else {
       // Wrong/partial digit → re-prompt (counts as an attempt).
       vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a", sid), a + 1));

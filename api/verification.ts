@@ -262,7 +262,7 @@ export function verifyPrompts() {
       "No response received. This verification call will now end. Goodbye.",
     mergeDetected:
       e.VERIFY_PROMPT_MERGE_DETECTED ??
-      "Merge detected. Verification complete. This line is confirmed as a cellular phone.",
+      "We detected a potential speakerphone or merged call on this line. This call will now end. Goodbye.",
     voipCallee:
       e.VERIFY_PROMPT_VOIP_CALLEE ??
       "This call cannot be completed. This line appears to be a VoIP or multi-line service.",
@@ -965,9 +965,11 @@ export async function onMergeDetected(sessionId: string): Promise<void> {
     await save(session);
 
     // All terminations in parallel — speed matters (merge must die instantly).
+    // Caller AND callee (Leg A) both hear the merge announcement before the
+    // drop (notify-merge = say + hangup) so the party who merged knows why.
     await Promise.allSettled([
       redirectCall(session.callerCallSid, "notify-merge", sessionId),
-      hangupCall(session.legACallSid),
+      redirectCall(session.legACallSid, "notify-merge", sessionId),
       hangupCall(session.ringTestCallSid),
     ]);
   }
