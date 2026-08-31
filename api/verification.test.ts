@@ -25,6 +25,12 @@ process.env.TWILIO_CALLER_ID ??= "+61400000001";
 const twilioMock = vi.hoisted(() => ({
   createdCalls: [] as Array<Record<string, unknown>>,
   updatedCalls: [] as Array<{ sid: string; url?: string; status?: string }>,
+  participantUpdates: [] as Array<{
+    conference: string;
+    participant: string;
+    announceUrl?: string;
+    announceMethod?: string;
+  }>,
 }));
 
 vi.mock("twilio", async (importOriginal) => {
@@ -46,6 +52,18 @@ vi.mock("twilio", async (importOriginal) => {
         },
       },
     ),
+    conferences: (name: string) => ({
+      participants: (participantSid: string) => ({
+        update: async (opts: { announceUrl?: string; announceMethod?: string }) => {
+          twilioMock.participantUpdates.push({
+            conference: name,
+            participant: participantSid,
+            ...opts,
+          });
+          return {};
+        },
+      }),
+    }),
   };
   const factory = (() => fakeClient) as unknown as typeof realTwilio;
   // verification-webhooks.ts uses twilio.twiml.VoiceResponse for real TwiML.
@@ -53,7 +71,7 @@ vi.mock("twilio", async (importOriginal) => {
   return { ...actual, default: factory };
 });
 
-const { createdCalls, updatedCalls } = twilioMock;
+const { createdCalls, updatedCalls, participantUpdates } = twilioMock;
 
 const RUN = `t${Date.now().toString(36)}`;
 const createdIds: string[] = [];
@@ -238,6 +256,43 @@ describe("state machine", () => {
     expect((await vs.findSession(stale.sessionId))!.failureReason).toContain("Stale");
     expect((await vs.findSession(fresh.sessionId))!.state).toBe(vs.VState.LEG_A_DIALING);
     expect((await vs.findSession(done.sessionId))!.state).toBe(vs.VState.COMPLETED);
+  });
+});
+
+describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
+  it("targets the Leg A (callee) conference participant and never hangs up/redirects", async () => {
+    const s = await makeSession(vs.VState.CALLER_HOLDING, {
+      callerCallSid: "CA_noise_caller",
+      legACallSid: "CA_noise_legA",
+    });
+    const updBefore = updatedCalls.length;
+    const partBefore = participantUpdates.length;
+    await vs.injectChallengeNoise(s.sessionId, "score=0.90 test");
+    // Exactly one announce, on the verify-<sid> conference, to Leg A only.
+    const added = participantUpdates.slice(partBefore);
+    expect(added).toHaveLength(1);
+    expect(added[0].conference).toBe(`verify-${s.sessionId}`);
+    expect(added[0].participant).toBe("CA_noise_legA");
+    expect(added[0].participant).not.toBe("CA_noise_caller");
+    expect(added[0].announceUrl).toContain("/api/verify/challenge-noise.wav");
+    // No hangup/redirect of any leg — the call continues.
+    expect(updatedCalls.slice(updBefore)).toHaveLength(0);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("SPEAKERPHONE_SUSPECTED");
+    const sp = (await events(s.sessionId)).find((e) => e.eventType === "SPEAKERPHONE_SUSPECTED");
+    expect(sp?.details).toContain("target=legA-callee");
+  });
+
+  it("skips (no caller-leg fallback) when legACallSid is missing", async () => {
+    const s = await makeSession(vs.VState.CALLER_HOLDING, {
+      callerCallSid: "CA_noise_caller2",
+      legACallSid: null,
+    });
+    const updBefore = updatedCalls.length;
+    const partBefore = participantUpdates.length;
+    await vs.injectChallengeNoise(s.sessionId, "score=0.90 test");
+    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    expect(updatedCalls.slice(updBefore)).toHaveLength(0);
   });
 });
 
@@ -517,6 +572,19 @@ describe("Leg A press-1 IVR", () => {
     expect(body).toContain("/api/verify/gather/leg-a-accept?sid=abc123");
     // timeout falls through to a re-prompt redirect (attempt incremented)
     expect(body).toContain("&amp;a=1");
+    // Outer speakerphone detection: non-blocking <Start><Stream> of the
+    // callee's uplink to the in-process stream endpoint (first prompt only).
+    expect(body).toContain("<Start>");
+    expect(body).toContain("/api/verify/stream?sid=abc123");
+    expect(body).toContain('track="inbound_track"');
+  });
+
+  it("leg-a re-prompt (a>0) does not start a duplicate media stream", async () => {
+    const res = await postForm("/api/verify/twiml/leg-a?sid=abc123&a=1");
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("<Gather");
+    expect(body).not.toContain("<Start>");
   });
 
   it("press 1 to accept → Leg B PRE-ORIGINATED (already dialing), serves ready gather", async () => {

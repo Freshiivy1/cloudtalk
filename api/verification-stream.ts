@@ -14,7 +14,10 @@
  * onMergeDetected() and redirect Leg B to the verdict TwiML.
  *
  * Wire-up: api/boot.ts attaches attachVerificationStreamServer() to the HTTP
- * server in production; Leg B TwiML references the wss:// URL.
+ * server in production. Leg A's TwiML opens a non-blocking <Start><Stream>
+ * to this endpoint (inbound track) so the relayguard speakerphone detector
+ * can analyze the callee's uplink audio in-process; Leg B merge detection
+ * uses the external relay (VERIFY_STREAM_URL) when configured.
  */
 import type { Server as HttpServer, IncomingMessage } from "http";
 import type { Duplex } from "stream";
@@ -171,6 +174,50 @@ export class MergeToneDetector {
 export const STREAM_PATH = "/api/verify/stream";
 
 /**
+ * wss:// URL of the IN-PROCESS media-stream endpoint for LEG A (callee)
+ * speakerphone detection. Unlike Leg B merge detection — which may run on
+ * the external relay (VERIFY_STREAM_URL) — the outer-speakerphone analyzer
+ * always runs here, on the callee's inbound (uplink) audio track.
+ */
+export function legAStreamUrl(sessionId: string): string | null {
+  const base = vs.getPublicBaseUrl();
+  if (!base) return null;
+  return `${base.replace(/^http/, "ws")}${STREAM_PATH}?sid=${sessionId}`;
+}
+
+/**
+ * Resolve a stream's Twilio CallSid to a verification session via
+ * verification_sessions.legACallSid and build the relayguard speakerphone
+ * detector for it. Returns null — gracefully, no throw — when the CallSid
+ * is not a known Leg A call or the lookup fails.
+ */
+async function legASpeakerphoneDetector(
+  callSid: string,
+): Promise<SpeakerphoneDetector | null> {
+  try {
+    const session = await vs.findSessionByLegACallSid(callSid);
+    if (!session) {
+      console.log(
+        `[verify-stream] stream start callSid=${callSid} — not a Leg A (callee) call, no speakerphone detection`,
+      );
+      return null;
+    }
+    const sid = session.sessionId;
+    return new SpeakerphoneDetector({
+      onSuspicious: (score, detail) => {
+        console.warn(`[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} ${detail}`);
+        void vs
+          .injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`)
+          .catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
+      },
+    });
+  } catch (err) {
+    console.error(`[verify-stream] Leg A session lookup failed callSid=${callSid}:`, err);
+    return null;
+  }
+}
+
+/**
  * Attach the verification media-stream WebSocket endpoint to the HTTP server.
  * Twilio connects to wss://{PUBLIC_BASE_URL}/api/verify/stream?sid=<sessionId>.
  */
@@ -194,34 +241,46 @@ export function attachVerificationStreamServer(server: HttpServer): void {
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const sid = new URL(req.url ?? "", "http://localhost").searchParams.get("sid") ?? "";
     const detector = new MergeToneDetector();
-    // Relayguard speakerphone detector — runs in-process on the same inbound
-    // frames (the leg carrying the caller/inmate audio). Advisory only: on
-    // suspicion it injects challenge noise toward the caller participant —
-    // the call is NEVER hung up or redirected from here. When merge detection
-    // runs on the external relay (VERIFY_STREAM_URL) no local frames exist,
-    // so this detector simply never sees audio and stays idle.
-    const spDetector = new SpeakerphoneDetector({
-      onSuspicious: (score, detail) => {
-        console.warn(`[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} ${detail}`);
-        void vs
-          .injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`)
-          .catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
-      },
-    });
+    // Relayguard speakerphone detector — attached LAZILY on the stream's
+    // `start` event, and only when the Twilio CallSid resolves to a session's
+    // legACallSid. Only CALLEE-side (Leg A) audio is analyzed: the outer
+    // speakerphone case is the CALLEE having the call on speaker, so on
+    // suspicion the challenge noise goes to the callee participant — never
+    // the caller/inmate leg, and the call is NEVER hung up or redirected
+    // from here. Leg B merge detection runs on the external relay
+    // (VERIFY_STREAM_URL), so no speakerphone detector attaches there.
+    let spDetector: SpeakerphoneDetector | null = null;
     let frames = 0;
     console.log(`[verify-stream] connected sid=${sid}`);
 
     ws.on("message", (data: Buffer) => {
-      let msg: { event?: string; media?: { track?: string; payload?: string } };
+      let msg: {
+        event?: string;
+        media?: { track?: string; payload?: string };
+        start?: { callSid?: string };
+      };
       try {
         msg = JSON.parse(data.toString("utf8"));
       } catch {
         return;
       }
+      if (msg.event === "start") {
+        const callSid = msg.start?.callSid ?? "";
+        if (callSid) {
+          void legASpeakerphoneDetector(callSid)
+            .then((d) => {
+              if (d) spDetector = d;
+            })
+            .catch((err) =>
+              console.error("[verify-stream] speakerphone detector attach error:", err),
+            );
+        }
+        return;
+      }
       if (msg.event !== "media" || !msg.media?.payload) return;
       if (msg.media.track && msg.media.track !== "inbound") return;
       frames++;
-      spDetector.push(msg.media.payload);
+      spDetector?.push(msg.media.payload);
       if (detector.push(msg.media.payload)) {
         console.log(
           `[verify-stream] MERGE TONE DETECTED sid=${sid} after ${frames} frames (~${frames * 20}ms of audio)`,

@@ -276,6 +276,24 @@ export async function findSession(
   return rows[0];
 }
 
+/**
+ * Resolve a Twilio CallSid to a session via its LEG A (callee) leg. Used by
+ * the in-process media-stream endpoint to attach relayguard speakerphone
+ * detection only to callee-side audio. Returns null when no session's
+ * legACallSid matches (e.g. a Leg B stream or an unknown call).
+ */
+export async function findSessionByLegACallSid(
+  callSid: string,
+): Promise<VerificationSession | null> {
+  if (!callSid) return null;
+  const rows = await getDb()
+    .select()
+    .from(schema.verificationSessions)
+    .where(eq(schema.verificationSessions.legACallSid, callSid))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 export async function logEvent(
   sessionId: string,
   eventType: string,
@@ -1155,9 +1173,16 @@ async function sendSmsOnce(
 }
 
 /**
- * Speakerphone suspected — inject the relayguard challenge noise toward the
- * CALLER PARTICIPANT ONLY via a Twilio conference announce. The call
- * CONTINUES: this never hangs up or redirects any leg.
+ * OUTER SPEAKERPHONE case — inject the relayguard challenge noise toward the
+ * CALLEE (Leg A, the dialed party) participant ONLY via a Twilio conference
+ * announce. With the noise on the callee's downlink they can't hear the
+ * inmate/caller clearly while on speakerphone and are prompted to get off
+ * speaker to hear better. The caller/inmate leg NEVER gets this noise (the
+ * in-call has its own separate tone — untouched here). The call CONTINUES:
+ * this never hangs up or redirects any leg.
+ *
+ * If the session has no legACallSid the announce is skipped (logged) — we do
+ * NOT fall back to the caller leg.
  *
  * Best-effort throughout: any failure is logged (and recorded as a
  * verification event) but never thrown back into the media path.
@@ -1172,11 +1197,11 @@ export async function injectChallengeNoise(
     await logEvent(
       sessionId,
       "SPEAKERPHONE_SUSPECTED",
-      `challenge-noise injection | ${reason}`.slice(0, 512),
+      `challenge-noise injection target=legA-callee | ${reason}`.slice(0, 512),
     );
     if (isTerminal(session)) return;
-    if (!session.callerCallSid) {
-      console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no caller leg, skipping announce`);
+    if (!session.legACallSid) {
+      console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no Leg A (callee) leg, skipping announce`);
       return;
     }
     const base = getPublicBaseUrl();
@@ -1186,13 +1211,13 @@ export async function injectChallengeNoise(
     }
     await getTwilioClient()
       .conferences(conferenceName(sessionId))
-      .participants(session.callerCallSid)
+      .participants(session.legACallSid)
       .update({
         announceUrl: `${base}/api/verify/challenge-noise.wav`,
         announceMethod: "GET",
       });
     console.log(
-      `[verify] CHALLENGE_NOISE_INJECTED session=${sessionId} caller=${session.callerCallSid} | ${reason}`,
+      `[verify] CHALLENGE_NOISE_INJECTED session=${sessionId} legA=${session.legACallSid} target=legA-callee | ${reason}`,
     );
     // Best-effort mirror into the shared call_events stream (guarded calls
     // link their calls row via clientCallId = guarded-<sessionId>).
@@ -1205,7 +1230,11 @@ export async function injectChallengeNoise(
         .limit(1);
       const callId = Number(rows.at(0)?.id ?? 0);
       if (callId) {
-        await logCallEvent(callId, "speakerphone_suspected", { sessionId, reason });
+        await logCallEvent(callId, "speakerphone_suspected", {
+          sessionId,
+          reason,
+          target: "legA-callee",
+        });
       }
     } catch (err) {
       console.warn("[verify] logCallEvent mirror failed:", (err as Error).message);

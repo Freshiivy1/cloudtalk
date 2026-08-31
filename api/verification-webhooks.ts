@@ -28,7 +28,7 @@ import type { Context } from "hono";
 import fs from "fs";
 import path from "path";
 import * as vs from "./verification";
-import { relayStreamUrl } from "./verification-stream";
+import { legAStreamUrl, relayStreamUrl } from "./verification-stream";
 import { challengeNoiseWav } from "./relayguard/noise";
 
 /**
@@ -62,9 +62,11 @@ export async function verificationToneHandler(c: Context) {
 /**
  * GET /api/verify/challenge-noise.wav — serves the relayguard probe-loop
  * challenge noise (8 kHz mono 16-bit PCM WAV) with a proper audio/wav
- * Content-Type. Used as the conference announceUrl when speakerphone use is
- * suspected: Twilio plays it to the CALLER participant only (the call
- * continues — no hangup). Generated in-process and cached, so no static file.
+ * Content-Type. Used as the conference announceUrl for the OUTER
+ * speakerphone case: Twilio plays it to the CALLEE (Leg A) participant only,
+ * so the callee is prompted to get off speakerphone to hear clearly (the
+ * call continues — no hangup). Generated in-process and cached, so no static
+ * file.
  */
 export async function challengeNoiseHandler(c: Context) {
   try {
@@ -149,6 +151,19 @@ export async function verificationTwimlHandler(c: Context) {
           vr.say(P.reject);
           vr.hangup();
           break;
+        }
+        // Outer speakerphone detection: open a NON-BLOCKING <Start><Stream>
+        // of the callee's uplink (inbound track) to the in-process relayguard
+        // analyzer. <Start> does not hold or alter the call — the gather
+        // flow below is untouched — and the stream persists for the rest of
+        // the call, so it is started once (first prompt only, not on
+        // re-prompt redirects). Detection always uses the in-process stream
+        // endpoint; Leg B merge detection stays on the external relay.
+        if (a === 0) {
+          const streamUrl = legAStreamUrl(sid);
+          if (streamUrl) {
+            vr.start().stream({ url: streamUrl, track: "inbound_track" });
+          }
         }
         const gather = vr.gather({
           numDigits: 1,
