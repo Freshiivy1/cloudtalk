@@ -578,7 +578,7 @@ export const telephonyRouter = createRouter({
    * It is deliberately independent from MySQL: the Twilio call is placed first;
    * history persistence is best-effort and never changes the call result.
    */
-  call: authedQuery
+  placeCall: authedQuery
     .input(
       z.object({
         to: z.string().min(3),
