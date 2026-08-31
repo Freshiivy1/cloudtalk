@@ -64,7 +64,7 @@ export class TwilioTelephonyProvider implements TelephonyProvider {
    * Create + initialize. Returns null when Twilio is not configured or the
    * token request fails — callers fall back to the simulated provider.
    */
-  static async create(): Promise<TwilioTelephonyProvider | null> {
+  private static async fetchToken(): Promise<string | null> {
     try {
       const res = await fetch("/api/trpc/telephony.voice.token?batch=1", {
         credentials: "include",
@@ -72,6 +72,16 @@ export class TwilioTelephonyProvider implements TelephonyProvider {
       if (!res.ok) return null;
       const json = await res.json();
       const token = json?.[0]?.result?.data?.json?.token as string | undefined;
+      return token ?? null;
+    } catch (err) {
+      console.warn("[twilio] token fetch failed:", err);
+      return null;
+    }
+  }
+
+  static async create(): Promise<TwilioTelephonyProvider | null> {
+    try {
+      const token = await TwilioTelephonyProvider.fetchToken();
       if (!token) return null;
 
       const p = new TwilioTelephonyProvider();
@@ -130,6 +140,16 @@ export class TwilioTelephonyProvider implements TelephonyProvider {
       call.on("reject", () => this.finishCall(true));
     });
     this.device.on("error", (e) => console.error("[twilio] device error", e));
+    this.device.on("tokenWillExpire", () => {
+      void TwilioTelephonyProvider.fetchToken().then((token) => {
+        if (!token || !this.device) return;
+        try {
+          this.device.updateToken(token);
+        } catch (err) {
+          console.warn("[twilio] token refresh failed:", err);
+        }
+      });
+    });
   }
 
   private wireCallEvents(call: TwilioCall) {
@@ -271,8 +291,46 @@ export class TwilioTelephonyProvider implements TelephonyProvider {
     this.emitAll();
   }
 
+  /**
+   * Best-effort speakerphone routing. Browsers do not expose a universal
+   * "speakerphone" device (especially on desktop), so this always records the
+   * attempt and reports whether an output device could actually be selected.
+   */
+  private async applySpeakerPreference(speakerOn: boolean): Promise<boolean> {
+    try {
+      type SpeakerDevices = { set?: (deviceId: string) => Promise<void> };
+      const audio = (this.device as unknown as {
+        audio?: { speakerDevices?: SpeakerDevices };
+      })?.audio;
+      const speakerDevices = audio?.speakerDevices;
+      const set = speakerDevices?.set?.bind(speakerDevices);
+      if (!set || typeof navigator === "undefined") return false;
+      const mediaDevices = navigator.mediaDevices;
+      if (!mediaDevices?.enumerateDevices) return false;
+      const devices = await mediaDevices.enumerateDevices();
+      const outputs = devices.filter((d) => d.kind === "audiooutput");
+      if (outputs.length === 0) return false;
+      const preferred = speakerOn
+        ? (outputs.find((d) => /speaker|spk/i.test(d.label)) ?? outputs[0])
+        : outputs.find((d) => /earpiece|receiver|default/i.test(d.label));
+      if (!preferred) return false;
+      await set(preferred.deviceId);
+      return true;
+    } catch (err) {
+      console.warn("[twilio] speaker output selection failed:", err);
+      return false;
+    }
+  }
+
   toggleSpeaker(): void {
     this.speakerOn = !this.speakerOn;
+    void this.applySpeakerPreference(this.speakerOn)
+      .then((supported) =>
+        this.emit("speakerphone_toggled", { speakerOn: this.speakerOn, supported }),
+      )
+      .catch(() =>
+        this.emit("speakerphone_toggled", { speakerOn: this.speakerOn, supported: false }),
+      );
     this.emitAll();
   }
 
