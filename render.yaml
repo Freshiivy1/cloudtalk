@@ -15,6 +15,9 @@ services:
     plan: free # recommended: starter (free instances sleep)
     healthCheckPath: /
     envVars:
+      # Owner mode: open straight into the dashboard with no login page.
+      - key: AUTH_DISABLED
+        value: "true"
       # MySQL 8 connection string. Render has no managed MySQL — use an external
       # provider (e.g. Aiven free plan). See DEPLOY-RENDER.md for provisioning +
       # one-time schema setup. For SSL-enforcing providers append, e.g.:
@@ -42,6 +45,9 @@ services:
         sync: false
       # Verified Twilio caller ID in E.164, e.g. +15551234567.
       - key: TWILIO_CALLER_ID
+        sync: false
+      # Optional separate caller ID for verification Leg B.
+      - key: TWILIO_CALLER_ID_LEG_B
         sync: false
       # External merge-detection relay (sibling repo callverify-merge-relay),
       # deployed as its own Render service FIRST, e.g.
