@@ -91,7 +91,9 @@ export type TelephonyEvent =
   | 'call_resumed'
   | 'call_ended'
   | 'presence_changed'
-  | 'queue_updated';
+  | 'queue_updated'
+  | 'speakerphone_toggled'
+  | 'listen_live_toggled';
 
 export type TelephonyEventPayload = {
   incoming_call: { call: CallInfo };
@@ -102,6 +104,8 @@ export type TelephonyEventPayload = {
   call_ended: { call: CallInfo | null; durationSecs: number; missed: boolean };
   presence_changed: { presence: PresenceStatus };
   queue_updated: { queue: QueuedCaller[] };
+  speakerphone_toggled: { speakerOn: boolean; supported: boolean };
+  listen_live_toggled: { listenLiveOn: boolean; supported: boolean };
 };
 
 export type TelephonyHandler = (payload: unknown) => void;
@@ -450,6 +454,7 @@ export class SimulatedTelephonyProvider implements TelephonyProvider {
   toggleSpeaker(): void {
     this.withLatency(() => {
       this.speakerOn = !this.speakerOn;
+      this.emit('speakerphone_toggled', { speakerOn: this.speakerOn, supported: true });
       if (this.call) {
         this.emit(this.state === 'held' ? 'call_held' : this.state === 'active' ? 'call_resumed' : 'call_ringing', { call: this.call });
       }
@@ -703,6 +708,8 @@ const ALL_EVENTS: TelephonyEvent[] = [
   'call_ended',
   'presence_changed',
   'queue_updated',
+  'speakerphone_toggled',
+  'listen_live_toggled',
 ];
 
 /**
@@ -742,21 +749,34 @@ export function useTelephony(): UseTelephony {
   const [provider, setProvider] = useState<AnyTelephonyProvider>(() => new SimulatedTelephonyProvider());
   const [snapshot, setSnapshot] = useState<TelephonySnapshot>(() => provider.snapshot());
 
-  // Swap in the REAL Twilio provider when enabled + configured. The simulated
-  // provider stays as an automatic fallback so the app never dead-ends.
+  // Swap in the REAL Twilio provider when the backend says it is configured.
+  // This intentionally does NOT depend on a build-time VITE_* flag: Render
+  // Docker images are built before runtime env vars are reliable for Vite.
+  // The simulated provider stays as an automatic fallback so the app never
+  // dead-ends if Twilio is down or misconfigured.
   useEffect(() => {
-    if (import.meta.env.VITE_TWILIO_ENABLED !== 'true') return;
     let cancelled = false;
-    import('./twilio-provider').then(({ TwilioTelephonyProvider }) =>
-      TwilioTelephonyProvider.create().then((p) => {
+    (async () => {
+      try {
+        const res = await fetch('/api/trpc/telephony.voice.status?batch=1', {
+          credentials: 'include',
+        });
+        if (!res.ok) return;
+        const json = await res.json();
+        const enabled = Boolean(json?.[0]?.result?.data?.json?.enabled);
+        if (!enabled || cancelled) return;
+        const { TwilioTelephonyProvider } = await import('./twilio-provider');
+        const p = await TwilioTelephonyProvider.create();
         if (p && !cancelled) {
           setProvider((old) => {
             old.dispose();
             return p;
           });
         }
-      }),
-    );
+      } catch (err) {
+        console.warn('[telephony] provider probe failed; staying simulated:', err);
+      }
+    })();
     return () => {
       cancelled = true;
     };
