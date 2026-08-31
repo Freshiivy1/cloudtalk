@@ -3,4 +3,4 @@
 -- such sessions bridge caller+callee live (BRIDGED) after verification passes.
 -- NULL/false rows keep the legacy verify-then-announce behavior unchanged.
 ALTER TABLE `verification_sessions`
-	ADD COLUMN `guarded` boolean;--> statement-breakpoint
+	ADD COLUMN `guarded` boolean;
