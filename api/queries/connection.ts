@@ -16,31 +16,15 @@ import * as schema from "@db/schema";
 
 let pool: mysql.Pool | null = null;
 let db: MySql2Database<typeof schema> | null = null;
-let isMock = false;
-
-// Mock query builder that returns empty results for all operations
-const mockDb = new Proxy({} as MySql2Database<typeof schema>, {
-  get(_target, prop) {
-    // Return a chainable mock for any property access
-    const chainable = new Proxy(() => {}, {
-      get() { return chainable; },
-      apply() { return Promise.resolve([]); }
-    });
-    return chainable;
-  }
-});
 
 export function getDb(): MySql2Database<typeof schema> {
   if (db) return db;
-  if (isMock) return mockDb;
-
   const url = process.env.DATABASE_URL;
   if (!url) {
-    console.warn("[db] DATABASE_URL not set — using mock DB (calls work, no persistence)");
-    isMock = true;
-    return mockDb;
+    throw new Error(
+      "DATABASE_URL is required (mysql://user:pass@host:port/database)",
+    );
   }
-
   pool = mysql.createPool({
     uri: url,
     connectionLimit: 10,
