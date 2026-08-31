@@ -1402,6 +1402,16 @@ export async function injectChallengeNoise(
   try {
     const session = await findSession(sessionId);
     if (!session) return;
+    // Only inject once the call is BRIDGED — before that, Leg A (callee) is
+    // not a conference participant yet (still ringing / in the press-1 IVR),
+    // so a conference announce would 404. Suspicion detected on pre-bridge
+    // audio (ringback, IVR prompts) is ignored by design.
+    if (session.state !== VState.BRIDGED) {
+      console.log(
+        `[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} state=${session.state} — not BRIDGED yet, skipping announce | ${reason}`,
+      );
+      return;
+    }
     const injection = (noiseInjectionCount.get(sessionId) ?? 0) + 1;
     noiseInjectionCount.set(sessionId, injection);
     // Throttle the DB event writes to max 1 per noiseEventThrottleMs() (30s)
