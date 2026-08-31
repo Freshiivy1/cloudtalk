@@ -411,15 +411,3 @@ export const telephonyRouter = createRouter({
     }),
   }),
 });
-  call: authedMutation
-    .input(z.object({ to: z.string(), from: z.string().optional() }))
-    .mutation(async ({ ctx, input }) => {
-      const client = getTwilioClient();
-      const fromNumber = input.from || process.env.TWILIO_CALLER_ID!;
-      const call = await client.calls.create({
-        to: input.to,
-        from: fromNumber,
-        twiml: `<Response><Dial callerId="${fromNumber}">${input.to}</Dial></Response>`,
-      });
-      return { sid: call.sid, status: call.status };
-    }),
