@@ -328,6 +328,24 @@ export default function CallHistory() {
         <span className="flex flex-col">
           <span className="text-sm font-medium text-text-hi">{row.contactName ?? 'Unknown'}</span>
           <span className="font-mono text-xs text-text-low">{peerNumber(row)}</span>
+          <span className="mt-1 flex flex-wrap gap-1">
+            <span
+              className={cn(
+                'rounded-full border px-1.5 py-0.5 text-[10px] font-medium',
+                row.speakerphoneAttempted
+                  ? 'border-sky/40 bg-sky/10 text-sky'
+                  : 'border-line bg-ink-800 text-text-low'
+              )}
+              title={row.speakerphoneUsed ? 'Speakerphone was used' : row.speakerphoneAttempted ? 'Speakerphone was attempted' : 'No speakerphone attempt'}
+            >
+              Speaker {row.speakerphoneAttempted ? (row.speakerphoneUsed ? 'used' : 'tried') : 'no'}
+            </span>
+            {(row.listenLiveAttempted || row.listenLiveUsed) && (
+              <span className="rounded-full border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] font-medium text-amber">
+                Listen live {row.listenLiveUsed ? 'used' : 'tried'}
+              </span>
+            )}
+          </span>
         </span>
       ),
     },
