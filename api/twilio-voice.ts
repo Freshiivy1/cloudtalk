@@ -16,7 +16,7 @@ import twilio from "twilio";
 import type { Context } from "hono";
 import { eq } from "drizzle-orm";
 import * as schema from "@db/schema";
-import { getDb } from "./queries/connection";
+import { getDbOrNull } from "./queries/connection";
 import { logCallEvent } from "./simulator";
 
 function cfg() {
@@ -142,18 +142,33 @@ export async function statusCallbackHandler(c: Context) {
     const ourId = Number(body.cloudtalkCallId ?? 0);
     const type = STATUS_MAP[status] ?? `twilio_${status}`;
 
-    if (ourId) {
-      await logCallEvent(ourId, type, { twilioSid: callSid, status });
+    const db = getDbOrNull();
+    if (!db) return c.text("ok"); // history optional; never fail Twilio callbacks
+
+    // Prefer the explicit cloudtalkCallId, but also support Twilio SID matching
+    // for REST-originated calls where the callback only carries CallSid.
+    let callId = ourId;
+    if (!callId && callSid) {
+      const rows = await db
+        .select({ id: schema.calls.id })
+        .from(schema.calls)
+        .where(eq(schema.calls.twilioSid, callSid))
+        .limit(1);
+      callId = Number(rows.at(0)?.id ?? 0);
+    }
+
+    if (callId) {
+      await logCallEvent(callId, type, { twilioSid: callSid, status });
       if (status === "completed" || status === "busy" || status === "no-answer" || status === "failed") {
         const duration = Number(body.CallDuration ?? 0);
-        await getDb()
+        await db
           .update(schema.calls)
           .set({
             status: status === "completed" ? "completed" : "failed",
             endedAt: new Date(),
             durationSec: duration,
           })
-          .where(eq(schema.calls.id, ourId));
+          .where(eq(schema.calls.id, callId));
       }
     }
   } catch (err) {
