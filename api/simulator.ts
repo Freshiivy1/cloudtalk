@@ -249,16 +249,16 @@ export async function recentEvents(limit = 30) {
   try {
     return await db
       .select({
-      id: schema.callEvents.id,
-      callId: schema.callEvents.callId,
-      type: schema.callEvents.type,
-      payload: schema.callEvents.payload,
-      createdAt: schema.callEvents.createdAt,
-      contactName: schema.calls.contactName,
-      fromNumber: schema.calls.fromNumber,
-      toNumber: schema.calls.toNumber,
-      direction: schema.calls.direction,
-    })
+        id: schema.callEvents.id,
+        callId: schema.callEvents.callId,
+        type: schema.callEvents.type,
+        payload: schema.callEvents.payload,
+        createdAt: schema.callEvents.createdAt,
+        contactName: schema.calls.contactName,
+        fromNumber: schema.calls.fromNumber,
+        toNumber: schema.calls.toNumber,
+        direction: schema.calls.direction,
+      })
       .from(schema.callEvents)
       .innerJoin(schema.calls, eq(schema.callEvents.callId, schema.calls.id))
       .orderBy(desc(schema.callEvents.id))

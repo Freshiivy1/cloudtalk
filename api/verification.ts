@@ -164,6 +164,18 @@ export function noiseEventThrottleMs(): number {
   return Number.isFinite(v) && v >= 0 ? v : 30_000;
 }
 
+/**
+ * Drop all per-session in-process map entries. Call whenever a session reaches
+ * a terminal state so these short-lived Maps can't grow unboundedly over the
+ * process lifetime. Safe to call for unknown/already-cleaned sessionIds.
+ */
+function cleanupSessionMaps(sessionId: string): void {
+  pendingLegBAnswer.delete(sessionId);
+  mergeWatchArmedAt.delete(sessionId);
+  noiseInjectionCount.delete(sessionId);
+  lastNoiseEventAt.delete(sessionId);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Config                                                                      */
 /* -------------------------------------------------------------------------- */
@@ -398,6 +410,7 @@ async function transition(
   await save(session);
   console.log(`[verify] STATE ${old} → ${newState} | ${detail}`);
   await logEvent(session.sessionId, newState, `${old} → ${newState} | ${detail}`);
+  if (TERMINAL_STATES.includes(newState)) cleanupSessionMaps(session.sessionId);
   return true;
 }
 
@@ -1291,6 +1304,7 @@ async function failSession(
   session.failureReason = reason;
   session.completedAt = new Date();
   await save(session);
+  cleanupSessionMaps(session.sessionId);
 
   console.warn(`[verify] SESSION_FAILED sessionId=${session.sessionId} reason=${reason}`);
   await logEvent(session.sessionId, "SESSION_FAILED", reason);
