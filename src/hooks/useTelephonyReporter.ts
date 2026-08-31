@@ -16,6 +16,8 @@ import type {
 
 type ReporterSource = {
   on: (event: TelephonyEvent, handler: TelephonyHandler) => () => void;
+  /** Used only as a subscription dependency so we resubscribe after provider swaps. */
+  provider: unknown;
 };
 
 const PRESENCE_MAP: Record<
@@ -35,13 +37,30 @@ export function useTelephonyReporter(t: ReporterSource) {
   const setPresence = trpc.telephony.presence.set.useMutation();
 
   const serverCallId = useRef<number | null>(null);
+  const pendingEvents = useRef<Array<{ type: string; payload?: Record<string, unknown> }>>([]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
 
+    const flushPending = () => {
+      const id = serverCallId.current;
+      if (id == null || id === 0) {
+        if (id === 0) pendingEvents.current = [];
+        return;
+      }
+      const queued = pendingEvents.current.splice(0);
+      queued.forEach((e) => event.mutate({ callId: id, type: e.type, payload: e.payload }));
+    };
+
     const reportEvent = (type: string, payload?: Record<string, unknown>) => {
       const id = serverCallId.current;
-      if (id == null) return;
+      if (id == null) {
+        // Provider events can fire before originate.onSuccess returns; queue them
+        // briefly so fast-answering real calls do not lose call_active/call_ended.
+        pendingEvents.current.push({ type, payload });
+        return;
+      }
+      if (id === 0) return; // no-history mode
       event.mutate({ callId: id, type, payload });
     };
 
@@ -54,10 +73,21 @@ export function useTelephonyReporter(t: ReporterSource) {
           fromNumber: call.direction === 'inbound' ? call.number : 'softphone',
           toNumber: call.direction === 'inbound' ? 'softphone' : call.number,
           contactName: call.contact?.name,
+          clientCallId: call.id,
         },
         {
           onSuccess: (r) => {
             serverCallId.current = r.id;
+            if (r.id === 0) {
+              pendingEvents.current = [];
+            } else {
+              flushPending();
+            }
+          },
+          onError: () => {
+            // Never leak a failed call's queued events onto the next call.
+            serverCallId.current = null;
+            pendingEvents.current = [];
           },
         },
       );
@@ -81,6 +111,22 @@ export function useTelephonyReporter(t: ReporterSource) {
         reportEvent('call_ended', { durationSecs, missed });
         serverCallId.current = null;
       }),
+      t.on('speakerphone_toggled', (p) => {
+        const { speakerOn, supported } =
+          p as TelephonyEventPayload['speakerphone_toggled'];
+        reportEvent('speakerphone_attempted', { enabled: speakerOn, supported });
+        reportEvent(speakerOn ? 'speakerphone_enabled' : 'speakerphone_disabled', {
+          supported,
+        });
+      }),
+      t.on('listen_live_toggled', (p) => {
+        const { listenLiveOn, supported } =
+          p as TelephonyEventPayload['listen_live_toggled'];
+        reportEvent('listen_live_attempted', { enabled: listenLiveOn, supported });
+        reportEvent(listenLiveOn ? 'listen_live_started' : 'listen_live_stopped', {
+          supported,
+        });
+      }),
       t.on('presence_changed', (p) => {
         const { presence } = p as TelephonyEventPayload['presence_changed'];
         setPresence.mutate({ presence: PRESENCE_MAP[presence] });
@@ -88,5 +134,5 @@ export function useTelephonyReporter(t: ReporterSource) {
     ];
     return () => unsubs.forEach((u) => u());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAuthenticated]);
+  }, [isAuthenticated, t.provider]);
 }
