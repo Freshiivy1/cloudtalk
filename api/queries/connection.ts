@@ -1,13 +1,19 @@
 /**
  * Shared MySQL (mysql2) connection pool + Drizzle handle.
  *
- * Every router/service module imports `getDb()` lazily (never at module top
- * level) so importing the router graph in tests/tools does not require a live
- * database — the pool is only created on first use.
+ * Every router/service module imports lazily (never at module top level) so
+ * importing the router graph in tests/tools does not require a live database —
+ * the pool is only created on first use.
  *
  * Connection string: DATABASE_URL (mysql://user:pass@host:port/db), loaded
  * from .env via dotenv. This is the single source of truth also used by
  * drizzle.config.ts and db/seed.ts.
+ *
+ * Resilience contract:
+ * - `getDb()` keeps the historical behavior for DB-required modules and throws
+ *   when DATABASE_URL is missing.
+ * - `getDbOrNull()` is the safe path for user-facing telephony routes: it
+ *   returns null instead of throwing so real calls can proceed without history.
  */
 import "dotenv/config";
 import { drizzle, type MySql2Database } from "drizzle-orm/mysql2";
@@ -16,6 +22,10 @@ import * as schema from "@db/schema";
 
 let pool: mysql.Pool | null = null;
 let db: MySql2Database<typeof schema> | null = null;
+
+export function hasDatabase(): boolean {
+  return Boolean(process.env.DATABASE_URL?.trim());
+}
 
 export function getDb(): MySql2Database<typeof schema> {
   if (db) return db;
@@ -32,6 +42,17 @@ export function getDb(): MySql2Database<typeof schema> {
   });
   db = drizzle(pool, { schema, mode: "default" });
   return db;
+}
+
+/** Safe variant for optional-history paths: null when no DB is configured. */
+export function getDbOrNull(): MySql2Database<typeof schema> | null {
+  if (!hasDatabase()) return null;
+  try {
+    return getDb();
+  } catch (err) {
+    console.error("[db] connection unavailable:", err);
+    return null;
+  }
 }
 
 /** Graceful shutdown hook for scripts (seed, fire-test). */
