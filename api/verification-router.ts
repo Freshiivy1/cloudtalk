@@ -15,9 +15,11 @@ import { TRPCError } from "@trpc/server";
 import { asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import * as schema from "@db/schema";
-import { adminQuery, createRouter } from "./middleware";
-import { getDb } from "./queries/connection";
+import { adminQuery, authedQuery, createRouter } from "./middleware";
+import { getDb, getDbOrNull } from "./queries/connection";
 import * as vs from "./verification";
+import { twilioCallerIdFor } from "./twilio-voice";
+import { logCallEvent } from "./simulator";
 
 /** Normalize then require strict E.164 (mirror of normalizePhoneNumber). */
 function toE164(raw: string, field: string): string {
@@ -63,6 +65,59 @@ export const verificationRouter = createRouter({
           ? toE164(input.ringTestNumber, "ringTestNumber")
           : null,
       });
+    }),
+
+  /**
+   * Guarded inmate call (softphone mode): the agent dials a callee through
+   * the full verification engine, but the CALLER leg rings the agent's own
+   * browser softphone (Twilio Client) instead of a PSTN number. Speakerphone
+   * suspicion during the call triggers a caller-only challenge-noise
+   * announce — never a hangup. Any authed agent may use this (same auth as
+   * the softphone telephony router).
+   */
+  initiateGuarded: authedQuery
+    .input(z.object({ calleeNumber: z.string().min(3).max(32) }))
+    .mutation(async ({ input, ctx }) => {
+      try {
+        vs.setRuntimeBaseUrl(new URL(ctx.req.url).origin);
+      } catch {
+        /* ignore — env var may still provide the base URL */
+      }
+      await vs.sweepStaleSessions();
+      const callee = toE164(input.calleeNumber, "calleeNumber");
+      // Same Twilio Client identity resolution as telephony.voice.token.
+      const callerClient = `user-${ctx.user.id}`;
+      const session = await vs.initiate({ calleeNumber: callee, callerClient });
+
+      // Best-effort history row (like placeCall), marked as guarded. The
+      // clientCallId links this row to the verification session so later
+      // events (e.g. speakerphone_suspected) can find it.
+      const db = getDbOrNull();
+      if (db) {
+        try {
+          const fromNumber = twilioCallerIdFor("legA") || "guarded";
+          const [r] = await db.insert(schema.calls).values({
+            direction: "outbound",
+            status: "dialing",
+            fromNumber,
+            toNumber: callee,
+            agentId: ctx.user.id,
+            twilioSid: session.callerCallSid ?? null,
+            clientCallId: `guarded-${session.sessionId}`,
+            note: `guarded inmate call (verification session ${session.sessionId})`,
+            startedAt: new Date(),
+          });
+          const callId = Number((r as unknown as { insertId: number }).insertId);
+          await logCallEvent(callId, "call_ringing", {
+            agentId: ctx.user.id,
+            guarded: true,
+            verificationSessionId: session.sessionId,
+          });
+        } catch (err) {
+          console.warn("[verify] guarded history insert failed:", (err as Error).message);
+        }
+      }
+      return { sessionId: session.sessionId };
     }),
 
   /** Sessions, most recent first. Lazy stale sweep mirrors StaleSessionCleanupJob. */

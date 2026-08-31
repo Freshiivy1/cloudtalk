@@ -20,6 +20,7 @@ import {
   ArrowDownLeft,
   RotateCcw,
   Loader2,
+  ShieldCheck,
 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router';
 import AppShell, { PRESENCE_OPTIONS, presenceDotClass, presenceLabel } from '@/components/AppShell';
@@ -28,6 +29,7 @@ import CallAvatar from '@/components/CallAvatar';
 import WaveformRibbon from '@/components/WaveformRibbon';
 import StatCard from '@/components/StatCard';
 import { cn } from '@/lib/utils';
+import { Switch } from '@/components/ui/switch';
 import { useTelephonyReporter } from '@/hooks/useTelephonyReporter';
 import {
   useTelephony,
@@ -41,6 +43,8 @@ import { trpc } from '@/providers/trpc';
 
 const EASE = [0.22, 1, 0.36, 1] as [number, number, number, number];
 const AGENT_EXT = '104';
+/** sessionStorage key — "Guarded inmate call" toggle persists for the session. */
+const GUARDED_KEY = 'cloudtalk.guardedInmateCall';
 
 /** Ticking seconds, re-render every 1s. */
 function useNow(activeMs = 1000): number {
@@ -145,6 +149,36 @@ export default function Softphone() {
   const [noteOpen, setNoteOpen] = useState(false);
   const [note, setNote] = useState('');
   const [heroHover, setHeroHover] = useState(false);
+  // Guarded inmate call mode — persists for the browser session.
+  const [guarded, setGuardedState] = useState(() => {
+    try {
+      return sessionStorage.getItem(GUARDED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const setGuarded = useCallback((v: boolean) => {
+    setGuardedState(v);
+    try {
+      sessionStorage.setItem(GUARDED_KEY, v ? '1' : '0');
+    } catch {
+      /* storage unavailable — state still lives in-memory */
+    }
+  }, []);
+  const [guardedStatus, setGuardedStatus] = useState<string | null>(null);
+  const initiateGuarded = trpc.verification.initiateGuarded.useMutation({
+    onSuccess: () => {
+      setPending(null);
+      setGuardedStatus(
+        'Guarded call starting — answer the incoming call on this softphone, then follow the prompts.'
+      );
+    },
+    onError: (err) => {
+      setGuardedStatus(null);
+      setPending(null);
+      toast.error(`Guarded call failed: ${err.message}`);
+    },
+  });
   const now = useNow();
   const prevState = useRef(callState);
 
@@ -172,6 +206,7 @@ export default function Softphone() {
         setDtmfOpen(false);
         setNoteOpen(false);
         setNote('');
+        setGuardedStatus(null);
       }
     }
   }, [callState]);
@@ -210,8 +245,16 @@ export default function Softphone() {
       toast.error('Enter a valid phone number — e.g. +61 4XX XXX XXX');
       return;
     }
+    if (guarded) {
+      // Guarded inmate call: route through the verification engine — the
+      // caller leg rings THIS softphone as an incoming Twilio Voice call.
+      setPending('call');
+      setGuardedStatus(null);
+      initiateGuarded.mutate({ calleeNumber: n });
+      return;
+    }
     act('call', () => t.dial(n));
-  }, [digits, act, t]);
+  }, [digits, act, t, guarded, initiateGuarded]);
 
   // ---- keyboard support --------------------------------------------------
   useEffect(() => {
@@ -416,6 +459,27 @@ export default function Softphone() {
                       onPlus={() => setDigits((prev) => (prev.startsWith('+') ? prev : ('+' + prev).slice(0, 24)))}
                     />
                   </div>
+
+                  {/* guarded inmate call toggle */}
+                  <div className="mt-4 flex w-full max-w-[280px] items-center justify-between rounded-[10px] border border-line bg-ink-800 px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck className={cn('h-4 w-4', guarded ? 'text-signal' : 'text-text-low')} />
+                      <div>
+                        <p className="text-xs font-medium text-text-hi">Guarded inmate call</p>
+                        <p className="text-[10px] text-text-low">Verified line · challenge noise on speakerphone</p>
+                      </div>
+                    </div>
+                    <Switch
+                      checked={guarded}
+                      onCheckedChange={setGuarded}
+                      aria-label="Guarded inmate call"
+                    />
+                  </div>
+                  {guardedStatus && (
+                    <p className="mt-2 w-full max-w-[280px] text-center text-[11px] leading-snug text-signal">
+                      {guardedStatus}
+                    </p>
+                  )}
 
                   {/* quick action row */}
                   <motion.div

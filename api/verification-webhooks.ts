@@ -29,6 +29,7 @@ import fs from "fs";
 import path from "path";
 import * as vs from "./verification";
 import { relayStreamUrl } from "./verification-stream";
+import { challengeNoiseWav } from "./relayguard/noise";
 
 /**
  * GET /api/verify/tone.wav — serves the in-band DTMF verification tone with a
@@ -56,6 +57,27 @@ export async function verificationToneHandler(c: Context) {
     }
   }
   return c.text("tone not found", 404);
+}
+
+/**
+ * GET /api/verify/challenge-noise.wav — serves the relayguard probe-loop
+ * challenge noise (8 kHz mono 16-bit PCM WAV) with a proper audio/wav
+ * Content-Type. Used as the conference announceUrl when speakerphone use is
+ * suspected: Twilio plays it to the CALLER participant only (the call
+ * continues — no hangup). Generated in-process and cached, so no static file.
+ */
+export async function challengeNoiseHandler(c: Context) {
+  try {
+    const buf = challengeNoiseWav();
+    return c.body(new Uint8Array(buf), 200, {
+      "Content-Type": "audio/wav",
+      "Content-Length": String(buf.byteLength),
+      "Cache-Control": "no-store",
+    });
+  } catch (err) {
+    console.error("[verify] challenge-noise render failed:", err);
+    return c.text("noise unavailable", 500);
+  }
 }
 
 const VoiceResponse = twilio.twiml.VoiceResponse;

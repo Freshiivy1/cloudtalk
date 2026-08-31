@@ -22,6 +22,7 @@ import type { Context } from "hono";
 import { WebSocketServer, WebSocket } from "ws";
 import * as vs from "./verification";
 import { getTwilioClient } from "./twilio-voice";
+import { SpeakerphoneDetector } from "./relayguard/speakerphone-detector";
 
 /**
  * POST /api/verify/stream-detected?sid=… — called by the EXTERNAL relay
@@ -193,6 +194,20 @@ export function attachVerificationStreamServer(server: HttpServer): void {
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const sid = new URL(req.url ?? "", "http://localhost").searchParams.get("sid") ?? "";
     const detector = new MergeToneDetector();
+    // Relayguard speakerphone detector — runs in-process on the same inbound
+    // frames (the leg carrying the caller/inmate audio). Advisory only: on
+    // suspicion it injects challenge noise toward the caller participant —
+    // the call is NEVER hung up or redirected from here. When merge detection
+    // runs on the external relay (VERIFY_STREAM_URL) no local frames exist,
+    // so this detector simply never sees audio and stays idle.
+    const spDetector = new SpeakerphoneDetector({
+      onSuspicious: (score, detail) => {
+        console.warn(`[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} ${detail}`);
+        void vs
+          .injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`)
+          .catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
+      },
+    });
     let frames = 0;
     console.log(`[verify-stream] connected sid=${sid}`);
 
@@ -206,6 +221,7 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       if (msg.event !== "media" || !msg.media?.payload) return;
       if (msg.media.track && msg.media.track !== "inbound") return;
       frames++;
+      spDetector.push(msg.media.payload);
       if (detector.push(msg.media.payload)) {
         console.log(
           `[verify-stream] MERGE TONE DETECTED sid=${sid} after ${frames} frames (~${frames * 20}ms of audio)`,

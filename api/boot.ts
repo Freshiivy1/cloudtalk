@@ -8,6 +8,7 @@ import { env } from "./lib/env";
 import { createOAuthCallbackHandler } from "./kimi/auth";
 import { statusCallbackHandler, voiceWebhookHandler } from "./twilio-voice";
 import {
+  challengeNoiseHandler,
   verificationGatherHandler,
   verificationGatherLegAAcceptHandler,
   verificationGatherLegAReadyHandler,
@@ -37,6 +38,8 @@ app.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
 // Serve the in-band DTMF verification tone with a proper audio/wav Content-Type
 // (the generic static server returns octet-stream; Twilio refuses it — error 12300).
 app.get("/api/verify/tone.wav", verificationToneHandler);
+// Relayguard challenge-noise probe (conference announce on suspected speakerphone).
+app.get("/api/verify/challenge-noise.wav", challengeNoiseHandler);
 app.use("/api/trpc/*", async (c) => {
   return fetchRequestHandler({
     endpoint: "/api/trpc",

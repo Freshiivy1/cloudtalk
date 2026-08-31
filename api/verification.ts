@@ -440,6 +440,13 @@ export interface InitiateInput {
   callerNumber?: string | null;
   legBNumber?: string | null;
   ringTestNumber?: string | null;
+  /**
+   * Twilio Client identity of a browser softphone (e.g. "user-42"). When set,
+   * the caller leg is originated to `client:<callerClient>` (the browser
+   * answers inside the softphone) instead of a PSTN caller number — the
+   * "Guarded inmate call" mode. Takes precedence over callerNumber.
+   */
+  callerClient?: string;
 }
 
 export async function initiate(
@@ -479,7 +486,21 @@ export async function initiate(
 
   const created = (await findSession(sessionId))!;
 
-  if (input.callerNumber) {
+  if (input.callerClient) {
+    // Guarded inmate call: the caller leg rings the agent's browser softphone
+    // (Twilio Client address) and parks it in the same caller-hold flow.
+    const to = `client:${input.callerClient}`;
+    await logEvent(sessionId, "ORIGINATING_CALLER", `Originating caller (guarded, Twilio Client): ${to}`);
+    const callSid = await originate(created, "caller", to, "caller-hold", {
+      timeoutSec: 30,
+    });
+    if (!callSid) {
+      await failSession(created, "Caller origination failed");
+    } else {
+      created.callerCallSid = callSid;
+      await save(created);
+    }
+  } else if (input.callerNumber) {
     // Caller leg: park the caller in a conference with instructions.
     // CALL-FLOW.md originate timeouts: caller = 30s.
     await logEvent(sessionId, "ORIGINATING_CALLER", `Originating caller: ${input.callerNumber}`);
@@ -1131,6 +1152,67 @@ async function sendSmsOnce(
         err instanceof Error ? err.message : String(err),
       ).catch(() => {});
     });
+}
+
+/**
+ * Speakerphone suspected — inject the relayguard challenge noise toward the
+ * CALLER PARTICIPANT ONLY via a Twilio conference announce. The call
+ * CONTINUES: this never hangs up or redirects any leg.
+ *
+ * Best-effort throughout: any failure is logged (and recorded as a
+ * verification event) but never thrown back into the media path.
+ */
+export async function injectChallengeNoise(
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session) return;
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_SUSPECTED",
+      `challenge-noise injection | ${reason}`.slice(0, 512),
+    );
+    if (isTerminal(session)) return;
+    if (!session.callerCallSid) {
+      console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no caller leg, skipping announce`);
+      return;
+    }
+    const base = getPublicBaseUrl();
+    if (!base) {
+      console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no public base URL, skipping announce`);
+      return;
+    }
+    await getTwilioClient()
+      .conferences(conferenceName(sessionId))
+      .participants(session.callerCallSid)
+      .update({
+        announceUrl: `${base}/api/verify/challenge-noise.wav`,
+        announceMethod: "GET",
+      });
+    console.log(
+      `[verify] CHALLENGE_NOISE_INJECTED session=${sessionId} caller=${session.callerCallSid} | ${reason}`,
+    );
+    // Best-effort mirror into the shared call_events stream (guarded calls
+    // link their calls row via clientCallId = guarded-<sessionId>).
+    try {
+      const { logCallEvent } = await import("./simulator");
+      const rows = await getDb()
+        .select({ id: schema.calls.id })
+        .from(schema.calls)
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`))
+        .limit(1);
+      const callId = Number(rows.at(0)?.id ?? 0);
+      if (callId) {
+        await logCallEvent(callId, "speakerphone_suspected", { sessionId, reason });
+      }
+    } catch (err) {
+      console.warn("[verify] logCallEvent mirror failed:", (err as Error).message);
+    }
+  } catch (err) {
+    console.error(`[verify] injectChallengeNoise failed session=${sessionId}:`, err);
+  }
 }
 
 /** Store a call SID on the session if not already set (storeChannel port). */
