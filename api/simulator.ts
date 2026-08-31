@@ -246,8 +246,9 @@ export async function advanceSimulation() {
 export async function recentEvents(limit = 30) {
   const db = getDbOrNull();
   if (!db) return [];
-  return db
-    .select({
+  try {
+    return await db
+      .select({
       id: schema.callEvents.id,
       callId: schema.callEvents.callId,
       type: schema.callEvents.type,
@@ -258,8 +259,14 @@ export async function recentEvents(limit = 30) {
       toNumber: schema.calls.toNumber,
       direction: schema.calls.direction,
     })
-    .from(schema.callEvents)
-    .innerJoin(schema.calls, eq(schema.callEvents.callId, schema.calls.id))
-    .orderBy(desc(schema.callEvents.id))
-    .limit(limit);
+      .from(schema.callEvents)
+      .innerJoin(schema.calls, eq(schema.callEvents.callId, schema.calls.id))
+      .orderBy(desc(schema.callEvents.id))
+      .limit(limit);
+  } catch (err) {
+    // The event feed is an optional-history surface: an unreachable database
+    // must degrade to an empty feed, never a tRPC 500.
+    console.warn("[simulator] recentEvents failed:", (err as Error).message);
+    return [];
+  }
 }

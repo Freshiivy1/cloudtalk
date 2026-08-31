@@ -39,6 +39,14 @@ export function getDb(): MySql2Database<typeof schema> {
     uri: url,
     connectionLimit: 10,
     enableKeepAlive: true,
+    // Bound the time a single query can spend waiting on a TCP connect. With a
+    // stale/unreachable DATABASE_URL (e.g. an expired external MySQL still set
+    // in the dashboard while the app is meant to run in no-history mode) the
+    // default 10s timeout makes every graceful-fallback op stall for seconds;
+    // several sequential ops then exceed the platform proxy timeout and the
+    // batched tRPC request surfaces as HTTP 5xx even though the code "handles"
+    // the missing DB. 3s is still generous for a healthy MySQL.
+    connectTimeout: 3000,
   });
   db = drizzle(pool, { schema, mode: "default" });
   return db;
