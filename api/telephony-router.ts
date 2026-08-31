@@ -408,6 +408,18 @@ export const telephonyRouter = createRouter({
         from: fromNumber,
         twiml: `<Response><Dial callerId="${fromNumber}">${input.to}</Dial></Response>`,
       });
+      try {
+        await getDb().insert(schema.calls).values({
+          sid: call.sid,
+          direction: "outbound",
+          from: fromNumber,
+          to: input.to,
+          status: call.status,
+          startedAt: new Date(),
+        });
+      } catch (e) {
+        console.warn("[telephony] DB unavailable, call not logged:", (e as Error).message);
+      }
       return { sid: call.sid, status: call.status };
     }),
 });
