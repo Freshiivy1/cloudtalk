@@ -219,8 +219,49 @@ export async function verificationTwimlHandler(c: Context) {
         // into Leg B's <Gather> → MERGE_DETECTED.
         // Served via /api/verify/tone.wav (explicit audio/wav Content-Type —
         // the static server returns octet-stream and Twilio refuses to fetch it).
+        //
+        // GUARDED MODE ONLY: this self-redirect loop doubles as the timer-free
+        // poll for the merge-detection watch (fallback for runtimes without
+        // guaranteed background timers). Once the watch elapses with no merge
+        // the session has PASSED: bridge inline (this fetch IS Leg A, so we
+        // serve the bridge TwiML directly instead of a REST redirect) and the
+        // caller leg is redirected by maybeBridgeGuarded. Guarded sessions get
+        // loop=1 so the poll cadence is one tone-play instead of ten.
+        // NON-guarded sessions render the exact legacy TwiML below.
+        if (sid) {
+          const session = await vs.findSession(sid);
+          if (session?.guarded) {
+            const bridged =
+              session.state === vs.VState.BRIDGED ||
+              (await vs.maybeBridgeGuarded(sid, { legAInline: true }));
+            if (bridged) {
+              vr.dial().conference(
+                { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
+                vs.conferenceName(sid),
+              );
+              break;
+            }
+            vr.play({ loop: 1 }, `${vs.requirePublicBaseUrl()}/api/verify/tone.wav`);
+            vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-tone", sid));
+            break;
+          }
+        }
         vr.play({ loop: 10 }, `${vs.requirePublicBaseUrl()}/api/verify/tone.wav`);
         vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-tone", sid));
+        break;
+      }
+
+      case "guarded-bridge": {
+        // GUARDED MODE ONLY: verification passed — bridge the caller (inmate
+        // softphone) and the callee (Leg A) into a LIVE two-way conference.
+        // endConferenceOnExit on both legs: when either party hangs up the
+        // other is dropped and the status callback marks the session
+        // COMPLETED. Leg A's <Start><Stream> persists across the redirect
+        // into this TwiML, so speakerphone detection continues in-call.
+        vr.dial().conference(
+          { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
+          vs.conferenceName(sid),
+        );
         break;
       }
 

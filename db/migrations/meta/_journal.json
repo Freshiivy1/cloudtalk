@@ -15,6 +15,13 @@
       "when": 1788150000000,
       "tag": "0001_call_telephony_flags",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1788236400000,
+      "tag": "0002_verification_sessions_guarded",
+      "breakpoints": true
     }
   ]
 }

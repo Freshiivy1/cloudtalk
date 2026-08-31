@@ -194,6 +194,14 @@ export const verificationSessions = mysqlTable(
     legBNumber: varchar("legBNumber", { length: 32 }),
     ringTestNumber: varchar("ringTestNumber", { length: 32 }),
     state: varchar("state", { length: 32 }).notNull(),
+    /**
+     * Guarded inmate-call mode marker (additive, nullable). TRUE when the
+     * session was created via verification.initiateGuarded (caller leg = the
+     * agent's browser softphone, `client:user-N`). Guarded sessions bridge
+     * caller + callee live (state BRIDGED) once verification passes instead
+     * of the notify-* verdict announcements. NULL/false = legacy behavior.
+     */
+    guarded: boolean("guarded"),
     callerCallSid: varchar("callerCallSid", { length: 64 }),
     legACallSid: varchar("legACallSid", { length: 64 }),
     legBCallSid: varchar("legBCallSid", { length: 64 }),

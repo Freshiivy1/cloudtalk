@@ -40,6 +40,14 @@ export const VState = {
   CALLEE_READY: "CALLEE_READY",
   LEG_B_DIALING: "LEG_B_DIALING",
   LEG_B_ANSWERED: "LEG_B_ANSWERED",
+  /**
+   * GUARDED MODE ONLY: verification passed (callee accepted + merge-detection
+   * watch window elapsed with no merge) and the caller (inmate softphone) +
+   * callee (Leg A) are bridged LIVE in conference verify-<sid>. Non-guarded
+   * sessions never enter this state. Not terminal — ends as COMPLETED when
+   * either party hangs up (or FAILED via manual termination).
+   */
+  BRIDGED: "BRIDGED",
   COMPLETED: "COMPLETED",
   MERGE_DETECTED: "MERGE_DETECTED",
   VOIP_DETECTED: "VOIP_DETECTED",
@@ -74,10 +82,19 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
     VState.FAILED,
   ],
   LEG_B_ANSWERED: [
+    VState.BRIDGED,
     VState.COMPLETED,
     VState.MERGE_DETECTED,
     VState.VOIP_DETECTED,
     VState.CALL_WAITING_OFF,
+    VState.FAILED,
+  ],
+  // Post-bridge merge/voip detection via the media-stream path keeps the
+  // existing hang-up-everything behavior (those flows are unchanged).
+  BRIDGED: [
+    VState.COMPLETED,
+    VState.MERGE_DETECTED,
+    VState.VOIP_DETECTED,
     VState.FAILED,
   ],
   COMPLETED: [],
@@ -107,6 +124,45 @@ const STALE_TIMEOUT_MS = 10 * 60 * 1000; // mirrors StaleSessionCleanupJob (10mi
  * mirrors the Asterisk original's in-memory session fields.
  */
 const pendingLegBAnswer = new Map<string, string>();
+
+/**
+ * Merge-detection watch window (ms). A GUARDED session is deemed PASSED —
+ * and the live bridge is allowed — only after Leg B was answered by a human
+ * (LEG_B_ANSWERED: the callee's line did NOT take the second call, so it is
+ * a single cellular line) AND this much time has elapsed with no merge-tone
+ * leak. The engine otherwise has no "no merge" pass point (COMPLETED only
+ * fires when Leg B hangs up), so this window defines it cleanly.
+ * Env-overridable via VERIFY_MERGE_WATCH_MS (mainly for tests).
+ */
+export function mergeWatchMs(): number {
+  const v = Number(process.env.VERIFY_MERGE_WATCH_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 15_000;
+}
+
+/**
+ * In-process record of when the merge watch was armed per session (LEG_B_
+ * ANSWERED). Short-lived, mirrors the pendingLegBAnswer pattern. Used by the
+ * leg-a-tone TwiML poll fallback so the bridge also happens on runtimes
+ * where setTimeout callbacks are not guaranteed to run.
+ */
+const mergeWatchArmedAt = new Map<string, number>();
+
+/** Per-session challenge-noise injection counter (event payload enrichment). */
+const noiseInjectionCount = new Map<string, number>();
+
+/**
+ * Per-session wall-clock of the last SPEAKERPHONE_SUSPECTED event WRITE.
+ * The noise itself re-injects every refire interval (~8s) but the DB event
+ * stream is throttled to one row per noiseEventThrottleMs() so a sustained
+ * suspicion doesn't flood verification_events.
+ */
+const lastNoiseEventAt = new Map<string, number>();
+
+/** Min ms between SPEAKERPHONE_SUSPECTED event writes (default 30s). */
+export function noiseEventThrottleMs(): number {
+  const v = Number(process.env.VERIFY_NOISE_EVENT_THROTTLE_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 30_000;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Config                                                                      */
@@ -494,6 +550,9 @@ export async function initiate(
     legBNumber: input.legBNumber ?? input.calleeNumber,
     ringTestNumber: input.ringTestNumber ?? input.calleeNumber,
     state: VState.INITIATED,
+    // Guarded inmate-call mode (softphone caller leg) — drives the live
+    // bridge after verification passes. NULL for legacy sessions.
+    guarded: input.callerClient ? true : null,
   };
   await getDb().insert(schema.verificationSessions).values(session);
   await logEvent(
@@ -795,7 +854,90 @@ export async function onLegBAnswered(
       await redirectCall(session.legACallSid, "leg-a-tone", sessionId);
       console.log(`[verify] Redirected Leg A to DTMF tone loop, sid=${session.legACallSid}`);
     }
+
+    // GUARDED MODE ONLY: arm the merge-detection watch. If no merge fires
+    // within mergeWatchMs() the session has PASSED and the live bridge runs.
+    // Two triggers, both funnelling into the idempotent maybeBridgeGuarded():
+    //  1. this setTimeout (primary path on a long-lived server);
+    //  2. the leg-a-tone TwiML self-redirect loop, which polls
+    //     maybeBridgeGuarded() on every fetch (fallback for runtimes where
+    //     background timers are not guaranteed — see sweepStaleSessions).
+    if (session.guarded) {
+      mergeWatchArmedAt.set(sessionId, Date.now());
+      const watchMs = mergeWatchMs();
+      await logEvent(
+        sessionId,
+        "GUARDED_MERGE_WATCH_ARMED",
+        `merge-detection watch window=${watchMs}ms — live bridge on pass`,
+      );
+      setTimeout(() => {
+        void maybeBridgeGuarded(sessionId).catch((err) =>
+          console.error("[verify] guarded bridge timer error:", err),
+        );
+      }, watchMs).unref?.();
+    }
   }
+}
+
+/**
+ * Guarded pass point: LEG_B_ANSWERED (callee accepted via press-1 AND the
+ * second simultaneous call was answered by a human, i.e. call waiting works
+ * and the line is cellular) + the merge-detection watch window elapsed with
+ * NO merge detected. Idempotent: any later invocation is a no-op because the
+ * session has left LEG_B_ANSWERED. NON-GUARDED sessions return immediately —
+ * their engine behavior is bit-for-bit unchanged.
+ *
+ * Returns true when this call performed the bridge. When `legAInline` is
+ * true the caller of this function is the leg-a-tone TwiML fetch itself and
+ * serves the guarded-bridge TwiML directly — so Leg A is NOT REST-redirected
+ * (a mid-fetch redirect would race the response Twilio is about to execute).
+ * `force` skips the merge-watch timing checks — used when Leg B itself hung
+ * up (the legacy pass signal: call completed normally, no merge leaked).
+ */
+export async function maybeBridgeGuarded(
+  sessionId: string,
+  opts: { legAInline?: boolean; force?: boolean } = {},
+): Promise<boolean> {
+  const session = await findSession(sessionId);
+  if (!session || !session.guarded) return false;
+  if (session.state !== VState.LEG_B_ANSWERED) return false; // merge fired or already bridged/terminal
+  if (!opts.force) {
+    const armedAt = mergeWatchArmedAt.get(sessionId);
+    if (armedAt === undefined) {
+      // Watch timestamp unknown in this process (e.g. fresh instance serving
+      // the leg-a-tone poll fallback) — arm from first sight and defer one
+      // poll cycle rather than bridging before the window has elapsed.
+      mergeWatchArmedAt.set(sessionId, Date.now());
+      return false;
+    }
+    if (Date.now() - armedAt < mergeWatchMs()) return false;
+  }
+
+  if (
+    await transition(
+      session,
+      VState.BRIDGED,
+      "verification passed (callee accepted, no merge) — live guarded bridge",
+    )
+  ) {
+    mergeWatchArmedAt.delete(sessionId);
+    await logEvent(
+      sessionId,
+      "GUARDED_BRIDGED",
+      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A media stream persists`,
+    );
+    // Verification is done: hang up the ring-test leg only; Leg B (answered
+    // by a human) is left to end naturally. Leg A's <Start><Stream> survives
+    // the bridge redirect, so speakerphone detection keeps running in-call.
+    await hangupAll(session, { ringTest: true });
+    // Bridge the two real parties into the same conference (LIVE, two-way).
+    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
+    if (!opts.legAInline) {
+      await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
+    }
+    return true;
+  }
+  return false;
 }
 
 /** Merge detected — Leg A's DTMF tones leaked into Leg B's Gather. */
@@ -974,6 +1116,36 @@ export async function onCallCompleted(
 
   await logEvent(sessionId, `HANGUP_${leg.toUpperCase()}`, `sid=${callSid} ${statusDetail}`);
 
+  // GUARDED MODE ONLY: the live bridge ends when either party hangs up.
+  // endConferenceOnExit=true on both bridge legs makes Twilio drop the other
+  // participant too; the hangups below are belt-and-braces. Leg B / ring
+  // test completions while BRIDGED are expected (ring test was hung up at
+  // bridge time; Leg B is left to end naturally) and fall through untouched.
+  if (session.state === VState.BRIDGED && (leg === "caller" || leg === "legA")) {
+    if (
+      await transition(
+        session,
+        VState.COMPLETED,
+        `${leg} hung up — guarded live call ended`,
+      )
+    ) {
+      session.completedAt = new Date();
+      await save(session);
+      await logEvent(
+        sessionId,
+        "GUARDED_CALL_ENDED",
+        `leg=${leg} sid=${callSid} ${statusDetail}`,
+      );
+      await hangupAll(session, {
+        caller: leg !== "caller",
+        legA: leg !== "legA",
+        legB: true,
+        ringTest: true,
+      });
+    }
+    return;
+  }
+
   if (leg === "caller") {
     if (session.state === VState.LEG_B_ANSWERED) {
       // Caller heard Leg B (likely voicemail) and hung up — call waiting OFF.
@@ -1017,6 +1189,13 @@ export async function onCallCompleted(
   }
 
   if (leg === "legB" && session.state === VState.LEG_B_ANSWERED) {
+    // GUARDED MODE ONLY: Leg B hanging up with no merge leaked is the legacy
+    // PASS signal — bridge caller + callee LIVE (guarded-bridge TwiML)
+    // instead of the notify-completed announcement + hangupAll. Non-guarded
+    // sessions fall through to the unchanged legacy completion below.
+    if (session.guarded && (await maybeBridgeGuarded(sessionId, { force: true }))) {
+      return;
+    }
     if (await transition(session, VState.COMPLETED, "Leg B hung up — call completed normally")) {
       session.completedAt = new Date();
       await save(session);
@@ -1079,7 +1258,13 @@ export async function sweepStaleSessions(): Promise<number> {
     .from(schema.verificationSessions)
     .where(
       and(
-        notInArray(schema.verificationSessions.state, [...TERMINAL_STATES]),
+        // BRIDGED is excluded: a live guarded call legitimately runs longer
+        // than the 10min stale window and ends via hangup status callbacks.
+        // (Non-guarded sessions never reach BRIDGED — behavior unchanged.)
+        notInArray(schema.verificationSessions.state, [
+          ...TERMINAL_STATES,
+          VState.BRIDGED,
+        ]),
         lt(schema.verificationSessions.createdAt, cutoff),
       ),
     );
@@ -1184,6 +1369,15 @@ async function sendSmsOnce(
  * If the session has no legACallSid the announce is skipped (logged) — we do
  * NOT fall back to the caller leg.
  *
+ * REPEAT-SAFE: while outer-speakerphone suspicion persists during the live
+ * (bridged) call, the detector re-invokes this on every suspicious window
+ * (throttled, see SpeakerphoneDetector.refireMs). Each call simply updates
+ * the same conference announce, so repeats are idempotent — Twilio replays
+ * the announcement to the callee (sustained masking). Every injection is
+ * counted; SPEAKERPHONE_SUSPECTED event WRITES are throttled to one per
+ * noiseEventThrottleMs() (default 30s) per session while the announce
+ * re-injection itself is unthrottled.
+ *
  * Best-effort throughout: any failure is logged (and recorded as a
  * verification event) but never thrown back into the media path.
  */
@@ -1194,11 +1388,24 @@ export async function injectChallengeNoise(
   try {
     const session = await findSession(sessionId);
     if (!session) return;
-    await logEvent(
-      sessionId,
-      "SPEAKERPHONE_SUSPECTED",
-      `challenge-noise injection target=legA-callee | ${reason}`.slice(0, 512),
-    );
+    const injection = (noiseInjectionCount.get(sessionId) ?? 0) + 1;
+    noiseInjectionCount.set(sessionId, injection);
+    // Throttle the DB event writes to max 1 per noiseEventThrottleMs() (30s)
+    // — the noise itself re-injects every ~8s while suspicion persists, and
+    // a sustained suspicion must not flood verification_events.
+    const lastEventAt = lastNoiseEventAt.get(sessionId) ?? -Infinity;
+    if (Date.now() - lastEventAt >= noiseEventThrottleMs()) {
+      lastNoiseEventAt.set(sessionId, Date.now());
+      await logEvent(
+        sessionId,
+        "SPEAKERPHONE_SUSPECTED",
+        `challenge-noise injection #${injection} at ${new Date().toISOString()} target=legA-callee | ${reason}`.slice(0, 512),
+      );
+    } else {
+      console.log(
+        `[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} injection #${injection} — event write throttled (re-injecting noise only)`,
+      );
+    }
     if (isTerminal(session)) return;
     if (!session.legACallSid) {
       console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no Leg A (callee) leg, skipping announce`);
@@ -1234,6 +1441,8 @@ export async function injectChallengeNoise(
           sessionId,
           reason,
           target: "legA-callee",
+          injection,
+          at: new Date().toISOString(),
         });
       }
     } catch (err) {

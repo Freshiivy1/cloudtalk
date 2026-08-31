@@ -8,10 +8,16 @@
  * A window counts as suspicious when the verdict pipeline says
  * 'SUSPICIOUS RELAY' or the relay fingerprint on the window is RED.
  *
- * onSuspicious(score, detail) fires only after 2 CONSECUTIVE suspicious
- * windows, then at most once per 30 s cooldown. Detection is advisory — the
- * caller (verification-stream.ts) decides what to do; nothing here ever
- * touches the call legs.
+ * onSuspicious(score, detail) fires after 2 CONSECUTIVE suspicious windows.
+ * Post-fire behavior (SUSTAINED MASKING — replaces the old 30 s cooldown):
+ * while suspicion persists, onSuspicious KEEPS firing on subsequent
+ * suspicious windows, throttled to one emission per refireMs (default 8 s)
+ * so the Twilio conference-announce updates from injectChallengeNoise don't
+ * overlap badly. The detector resets to idle only after a CLEAN
+ * (non-suspicious) window — re-arming then again requires `consecutiveWindows`
+ * consecutive suspicious windows. Detection is advisory — the caller
+ * (verification-stream.ts) decides what to do; nothing here ever touches
+ * the call legs.
  */
 import { analyzeClip, type ClipProfile } from "./features";
 import { compareClips, relayFingerprint, type Verdict } from "./compare";
@@ -24,10 +30,15 @@ const BASELINE_MODE = "poor" as const;
 export interface SpeakerphoneDetectorOptions {
   /** Analysis window in seconds (default 2). */
   windowSec?: number;
-  /** Consecutive suspicious windows required before firing (default 2). */
+  /** Consecutive suspicious windows required before (re-)firing (default 2). */
   consecutiveWindows?: number;
-  /** Minimum wall-clock ms between emissions (default 30_000). */
-  cooldownMs?: number;
+  /**
+   * Minimum wall-clock ms between emissions while suspicion persists
+   * (default 8_000). After the initial trigger the detector keeps emitting
+   * on each suspicious window once this interval has passed (sustained
+   * challenge-noise masking); a clean window resets to idle.
+   */
+  refireMs?: number;
   /** Called when speakerphone use is suspected. score ∈ 0..1 (relay fp). */
   onSuspicious?: (score: number, detail: string) => void;
 }
@@ -35,7 +46,7 @@ export interface SpeakerphoneDetectorOptions {
 export class SpeakerphoneDetector {
   private readonly win: number;
   private readonly need: number;
-  private readonly cooldown: number;
+  private readonly refire: number;
   private readonly onSuspicious?: (score: number, detail: string) => void;
   private buf: number[] = [];
   private baseline: ClipProfile | null = null;
@@ -46,7 +57,7 @@ export class SpeakerphoneDetector {
   constructor(opts: SpeakerphoneDetectorOptions = {}) {
     this.win = Math.round((opts.windowSec ?? 2) * SAMPLE_RATE);
     this.need = opts.consecutiveWindows ?? 2;
-    this.cooldown = opts.cooldownMs ?? 30_000;
+    this.refire = opts.refireMs ?? 8_000;
     this.onSuspicious = opts.onSuspicious;
   }
 
@@ -108,12 +119,17 @@ export class SpeakerphoneDetector {
       const detail =
         `verdict=${verdict} relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
         `weighted=${result.weightedScore.toFixed(2)} confidence=${Math.round(result.confidence)} ` +
-        `flags=${result.flags.join(",") || "none"}`;
-      if (this.streak >= this.need && Date.now() - this.lastFiredAt >= this.cooldown) {
+        `flags=${result.flags.join(",") || "none"} streak=${this.streak}`;
+      // Initial trigger after `need` consecutive suspicious windows; while
+      // suspicion persists, RE-FIRE on each suspicious window once refireMs
+      // has elapsed (sustained masking — no 30s cooldown lockout).
+      if (this.streak >= this.need && Date.now() - this.lastFiredAt >= this.refire) {
         this.lastFiredAt = Date.now();
         this.onSuspicious?.(fp.score, detail);
       }
     } else {
+      // Clean window → back to idle: re-firing needs `need` fresh
+      // consecutive suspicious windows again.
       this.streak = 0;
       // Rolling baseline: clean windows keep the reference fresh, so a slow
       // drift (handset → speakerphone mid-call) still shows up as a change.

@@ -44,6 +44,8 @@ const FLOW_STEPS = [
   { key: 'CALLEE_READY', label: 'Callee ready' },
   { key: 'LEG_B_DIALING', label: 'Leg B dialing' },
   { key: 'LEG_B_ANSWERED', label: 'Leg B answered' },
+  // Guarded mode only: verification passed — caller + callee bridged live.
+  { key: 'BRIDGED', label: 'Live call (bridged)' },
 ] as const;
 
 const TERMINAL_LABEL: Record<string, string> = {
@@ -59,6 +61,7 @@ type Tone = 'amber' | 'signal' | 'violet' | 'sky' | 'danger';
 function stateTone(state: string): Tone {
   switch (state) {
     case 'COMPLETED':
+    case 'BRIDGED':
       return 'signal';
     case 'MERGE_DETECTED':
     case 'VOIP_DETECTED':

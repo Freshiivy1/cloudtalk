@@ -283,6 +283,56 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
     expect(sp?.details).toContain("target=legA-callee");
   });
 
+  it("repeated injections are counted + timestamped in the SPEAKERPHONE_SUSPECTED payload", async () => {
+    process.env.VERIFY_NOISE_EVENT_THROTTLE_MS = "0"; // disable write throttle
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_rn_caller",
+        legACallSid: "CA_rn_legA",
+      });
+      const partBefore = participantUpdates.length;
+      await vs.injectChallengeNoise(s.sessionId, "score=0.90 first");
+      await vs.injectChallengeNoise(s.sessionId, "score=0.91 second");
+      // Sustained masking: each repeat still announces to the callee only.
+      const added = participantUpdates.slice(partBefore);
+      expect(added).toHaveLength(2);
+      expect(added.every((p) => p.participant === "CA_rn_legA")).toBe(true);
+      const sp = (await events(s.sessionId)).filter(
+        (e) => e.eventType === "SPEAKERPHONE_SUSPECTED",
+      );
+      expect(sp).toHaveLength(2);
+      expect(sp[0].details).toContain("injection #1");
+      expect(sp[1].details).toContain("injection #2");
+      expect(sp[1].details).toMatch(/at \d{4}-\d{2}-\d{2}T/);
+    } finally {
+      delete process.env.VERIFY_NOISE_EVENT_THROTTLE_MS;
+    }
+  });
+
+  it("throttles SPEAKERPHONE_SUSPECTED event writes to 1/30s while re-announcing every time", async () => {
+    // Default throttle (30s) applies — VERIFY_NOISE_EVENT_THROTTLE_MS unset.
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_th_caller",
+      legACallSid: "CA_th_legA",
+    });
+    const partBefore = participantUpdates.length;
+    await vs.injectChallengeNoise(s.sessionId, "score=0.90 first");
+    await vs.injectChallengeNoise(s.sessionId, "score=0.91 second");
+    await vs.injectChallengeNoise(s.sessionId, "score=0.92 third");
+    // Noise (conference announce to the callee) re-injects on EVERY call…
+    const added = participantUpdates.slice(partBefore);
+    expect(added).toHaveLength(3);
+    expect(added.every((p) => p.participant === "CA_th_legA")).toBe(true);
+    // …but the DB event stream sees only the first suspicion in the window.
+    const sp = (await events(s.sessionId)).filter(
+      (e) => e.eventType === "SPEAKERPHONE_SUSPECTED",
+    );
+    expect(sp).toHaveLength(1);
+    expect(sp[0].details).toContain("injection #1");
+  });
+
   it("skips (no caller-leg fallback) when legACallSid is missing", async () => {
     const s = await makeSession(vs.VState.CALLER_HOLDING, {
       callerCallSid: "CA_noise_caller2",
@@ -293,6 +343,217 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
     await vs.injectChallengeNoise(s.sessionId, "score=0.90 test");
     expect(participantUpdates.slice(partBefore)).toHaveLength(0);
     expect(updatedCalls.slice(updBefore)).toHaveLength(0);
+  });
+});
+
+describe("guarded live bridge (verification pass → BRIDGED)", () => {
+  it("guarded: bridges caller + Leg A live once the merge watch elapses with no merge", async () => {
+    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
+        guarded: true,
+        callerCallSid: "CA_g_caller",
+        legACallSid: "CA_g_legA",
+        ringTestCallSid: "CA_g_rt",
+      });
+      const updBefore = updatedCalls.length;
+      // Leg B answered by a human → LEG_B_ANSWERED arms the merge watch.
+      await vs.onLegBAnswered(s.sessionId, "CA_g_legB");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
+      // Watch window (0ms here) elapses with no merge → PASS → live bridge.
+      await tick(150);
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.BRIDGED);
+      const added = updatedCalls.slice(updBefore);
+      // Caller + Leg A redirected into the live two-way conference…
+      expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
+      expect(added.some((u) => u.sid === "CA_g_legA" && String(u.url).includes("guarded-bridge"))).toBe(true);
+      // …the ring-test leg is hung up, but Leg B (answered by a human) is
+      // left to end naturally — NOT hung up by the engine.
+      expect(added.some((u) => u.sid === "CA_g_rt" && u.status === "completed")).toBe(true);
+      expect(added.some((u) => u.sid === "CA_g_legB" && u.status === "completed")).toBe(false);
+      // …and the caller is NEVER sent to the legacy verdict announcement.
+      expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("notify-"))).toBe(false);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("GUARDED_MERGE_WATCH_ARMED");
+      expect(types).toContain(vs.VState.BRIDGED);
+      expect(types).toContain("GUARDED_BRIDGED");
+    } finally {
+      delete process.env.VERIFY_MERGE_WATCH_MS;
+    }
+  });
+
+  it("non-guarded: watch never bridges — LEG_B_ANSWERED behavior bit-for-bit unchanged", async () => {
+    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
+        callerCallSid: "CA_ng_caller",
+        legACallSid: "CA_ng_legA",
+      });
+      await vs.onLegBAnswered(s.sessionId, "CA_ng_legB");
+      await tick(200);
+      // No bridge, no guarded events, no hangups — session waits for the
+      // legacy merge/verdict outcomes exactly as before.
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
+      expect(updatedCalls.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).not.toContain("GUARDED_MERGE_WATCH_ARMED");
+      expect(types).not.toContain("GUARDED_BRIDGED");
+    } finally {
+      delete process.env.VERIFY_MERGE_WATCH_MS;
+    }
+  });
+
+  it("maybeBridgeGuarded(legAInline): redirects the caller only (Leg A is served inline)", async () => {
+    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        guarded: true,
+        callerCallSid: "CA_i_caller",
+        legACallSid: "CA_i_legA",
+      });
+      // First sight in this process arms the watch and defers one cycle.
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(false);
+      const updBefore = updatedCalls.length;
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(true);
+      const added = updatedCalls.slice(updBefore);
+      expect(added.some((u) => u.sid === "CA_i_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
+      // Leg A must NOT be REST-redirected — the TwiML fetch serves it inline.
+      expect(added.some((u) => u.sid === "CA_i_legA" && String(u.url).includes("guarded-bridge"))).toBe(false);
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+      // Idempotent: a second pass is a no-op.
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
+    } finally {
+      delete process.env.VERIFY_MERGE_WATCH_MS;
+    }
+  });
+
+  it("guarded: Leg B hangup during LEG_B_ANSWERED bridges (no notify-completed)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_lbh_caller",
+      legACallSid: "CA_lbh_legA",
+      ringTestCallSid: "CA_lbh_rt",
+    });
+    const updBefore = updatedCalls.length;
+    await vs.onCallCompleted(s.sessionId, "legB", "CA_lbh_legB", "duration=12s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.BRIDGED);
+    const added = updatedCalls.slice(updBefore);
+    // BOTH caller and Leg A are redirected into the live conference…
+    expect(added.some((u) => u.sid === "CA_lbh_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
+    expect(added.some((u) => u.sid === "CA_lbh_legA" && String(u.url).includes("guarded-bridge"))).toBe(true);
+    // …the caller is NOT sent to the legacy verdict announcement, Leg A is
+    // NOT hung up, and only the ring-test leg is terminated.
+    expect(added.some((u) => String(u.url).includes("notify-"))).toBe(false);
+    expect(added.some((u) => u.sid === "CA_lbh_legA" && u.status === "completed")).toBe(false);
+    expect(added.some((u) => u.sid === "CA_lbh_rt" && u.status === "completed")).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("GUARDED_BRIDGED");
+    expect(types).toContain(vs.VState.BRIDGED);
+  });
+
+  it("non-guarded: Leg B hangup still completes with notify-completed + hangupAll (legacy)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      callerCallSid: "CA_lgn_caller",
+      legACallSid: "CA_lgn_legA",
+      ringTestCallSid: "CA_lgn_rt",
+    });
+    const updBefore = updatedCalls.length;
+    await vs.onCallCompleted(s.sessionId, "legB", "CA_lgn_legB", "duration=12s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.COMPLETED);
+    const added = updatedCalls.slice(updBefore);
+    // Legacy verdict announcement for the caller + all remaining legs dropped.
+    expect(added.some((u) => u.sid === "CA_lgn_caller" && String(u.url).includes("notify-completed"))).toBe(true);
+    expect(added.some((u) => u.sid === "CA_lgn_legA" && u.status === "completed")).toBe(true);
+    expect(added.some((u) => u.sid === "CA_lgn_rt" && u.status === "completed")).toBe(true);
+    expect(added.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
+  });
+
+  it("BRIDGED: post-bridge merge detection via the stream path still hangs up", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_pm_caller",
+      legACallSid: "CA_pm_legA",
+      ringTestCallSid: "CA_pm_rt",
+    });
+    await vs.onMergeDetected(s.sessionId);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.MERGE_DETECTED);
+    // Existing behavior preserved: caller verdict + Leg A / ring test hangups.
+    expect(updatedCalls.some((u) => u.sid === "CA_pm_caller" && String(u.url).includes("notify-merge"))).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_pm_legA" && u.status === "completed")).toBe(true);
+  });
+
+  it("BRIDGED: caller hangup → COMPLETED with timestamps + Leg A dropped", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_b_caller",
+      legACallSid: "CA_b_legA",
+    });
+    await vs.onCallCompleted(s.sessionId, "caller", "CA_b_caller", "duration=120s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.COMPLETED);
+    expect(after.completedAt).not.toBeNull();
+    expect(updatedCalls.some((u) => u.sid === "CA_b_legA" && u.status === "completed")).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("GUARDED_CALL_ENDED");
+    expect(types).toContain(vs.VState.COMPLETED);
+  });
+
+  it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller dropped", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_b2_caller",
+      legACallSid: "CA_b2_legA",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.COMPLETED);
+    expect(updatedCalls.some((u) => u.sid === "CA_b2_caller" && u.status === "completed")).toBe(true);
+  });
+
+  it("guarded-bridge TwiML joins the live conference (no beep, ends on exit)", async () => {
+    const res = await postForm("/api/verify/twiml/guarded-bridge?sid=abc123");
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("<Dial>");
+    expect(body).toContain("<Conference");
+    expect(body).toContain("verify-abc123");
+    expect(body).toContain('beep="false"');
+    expect(body).toContain('startConferenceOnEnter="true"');
+    expect(body).toContain('endConferenceOnExit="true"');
+    // No verdict announcement, no hangup — this is a LIVE bridge.
+    expect(body).not.toContain("<Say");
+    expect(body).not.toContain("<Hangup");
+  });
+
+  it("leg-a-tone loop serves the bridge inline once a guarded session is BRIDGED", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_t_caller",
+      legACallSid: "CA_t_legA",
+    });
+    const res = await postForm(`/api/verify/twiml/leg-a-tone?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("<Conference");
+    expect(body).toContain(`verify-${s.sessionId}`);
+    expect(body).not.toContain("<Play");
+  });
+
+  it("leg-a-tone loop keeps the guarded merge test on a short (loop=1) poll while watching", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      legACallSid: "CA_w_legA",
+    });
+    const res = await postForm(`/api/verify/twiml/leg-a-tone?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("<Play");
+    expect(body).toContain('loop="1"');
+    // Watch not elapsed → still in the merge test, not bridged.
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
   });
 });
 
