@@ -106,6 +106,14 @@ export const calls = mysqlTable("calls", {
   agentId: bigint("agentId", { mode: "number", unsigned: true }),
   extensionId: bigint("extensionId", { mode: "number", unsigned: true }),
   contactId: bigint("contactId", { mode: "number", unsigned: true }),
+  /** Real-provider correlation IDs (NULL for simulated calls). */
+  twilioSid: varchar("twilioSid", { length: 64 }),
+  clientCallId: varchar("clientCallId", { length: 80 }),
+  /** Speakerphone / listen-live audit flags requested by the user. */
+  speakerphoneAttempted: boolean("speakerphoneAttempted").default(false).notNull(),
+  speakerphoneUsed: boolean("speakerphoneUsed").default(false).notNull(),
+  listenLiveAttempted: boolean("listenLiveAttempted").default(false).notNull(),
+  listenLiveUsed: boolean("listenLiveUsed").default(false).notNull(),
   startedAt: timestamp("startedAt").defaultNow().notNull(),
   answeredAt: timestamp("answeredAt"),
   endedAt: timestamp("endedAt"),
@@ -116,7 +124,10 @@ export const calls = mysqlTable("calls", {
   simAnswerAt: timestamp("simAnswerAt"),
   simEndAt: timestamp("simEndAt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
-});
+}, (table) => ({
+  twilioSidIdx: index("idx_calls_twilio_sid").on(table.twilioSid),
+  clientCallIdIdx: index("idx_calls_client_call_id").on(table.clientCallId),
+}));
 export type Call = typeof calls.$inferSelect;
 export type InsertCall = typeof calls.$inferInsert;
 
