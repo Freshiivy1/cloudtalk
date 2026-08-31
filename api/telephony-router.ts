@@ -393,6 +393,11 @@ export const telephonyRouter = createRouter({
         throw new TRPCError({
           code: "PRECONDITION_FAILED",
           message: "Twilio is not configured",
+        });
+      }
+      return { token: generateVoiceToken(`user-${ctx.user.id}`) };
+    }),
+  }),
   call: authedMutation
     .input(z.object({ to: z.string(), from: z.string().optional() }))
     .mutation(async ({ ctx, input }) => {
@@ -405,9 +410,4 @@ export const telephonyRouter = createRouter({
       });
       return { sid: call.sid, status: call.status };
     }),
-        });
-      }
-      return { token: generateVoiceToken(`user-${ctx.user.id}`) };
-    }),
-  }),
 });
