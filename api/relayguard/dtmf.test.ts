@@ -1,5 +1,5 @@
 /**
- * Merge-probe DTMF tone renderer tests (api/relayguard/dtmf.ts) — pure DSP,
+ * Merge-tone DTMF renderer tests (api/relayguard/dtmf.ts) — pure DSP,
  * no DB, no network. Asserts the rendered burst is a valid WAV whose Goertzel
  * power at the DTMF-'9' pair (852+1336 Hz) dominates every other DTMF
  * frequency, and that the existing MergeToneDetector accepts the burst.

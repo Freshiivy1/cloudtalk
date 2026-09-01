@@ -1,5 +1,5 @@
 /**
- * Merge-probe DTMF tone WAV renderer (BRIDGED in-call merge detection).
+ * Merge-tone DTMF WAV renderer (BRIDGED in-call merge detection).
  *
  * Pre-bridge, Leg A loops the continuous DTMF-'9' tone (852+1336 Hz) so a
  * callee-side 3-way merge leaks it into Leg B's detectors. That tone STOPS at

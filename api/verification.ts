@@ -230,6 +230,7 @@ function cleanupSessionMaps(sessionId: string): void {
   lastNoiseEventAt.delete(sessionId);
   voiceBaselineBySession.delete(sessionId);
   lastVoiceMismatchAt.delete(sessionId);
+  secondCallEngagedSessions.delete(sessionId);
   disarmMergeTone(sessionId);
 }
 
@@ -644,10 +645,22 @@ export function mergeToneEnergyFloor(): number {
 /** Per-session re-announce timers + armed flags for the continuous tone. */
 const mergeToneTimers = new Map<string, NodeJS.Timeout>();
 const mergeToneArmedSessions = new Set<string>();
+/**
+ * Sessions with an ACTIVE HoldDetector second-call engagement. Set by
+ * onSecondCallEngaged(), cleared by onSecondCallDisengaged() and by
+ * cleanupSessionMaps() — while set, the disengage path (not the
+ * speakerphone-cleared path) owns merge-tone disarm.
+ */
+const secondCallEngagedSessions = new Set<string>();
 
 /** True while the continuous merge tone is armed for this session. */
 export function isMergeToneArmed(sessionId: string): boolean {
   return mergeToneArmedSessions.has(sessionId);
+}
+
+/** True while a HoldDetector second-call engagement is active. */
+export function isSecondCallEngaged(sessionId: string): boolean {
+  return secondCallEngagedSessions.has(sessionId);
 }
 
 /** Stop the re-announce timer and drop the armed flag. Always safe to call. */
@@ -738,6 +751,7 @@ export async function onSecondCallEngaged(sessionId: string): Promise<void> {
   try {
     const session = await findSession(sessionId);
     if (!session || session.state !== VState.BRIDGED) return;
+    secondCallEngagedSessions.add(sessionId);
     await logEvent(
       sessionId,
       "SECOND_CALL_ENGAGED",
@@ -760,6 +774,7 @@ export async function onSecondCallDisengaged(sessionId: string): Promise<void> {
   try {
     const session = await findSession(sessionId);
     if (!session || isTerminal(session)) return;
+    secondCallEngagedSessions.delete(sessionId);
     disarmMergeTone(sessionId);
     await logEvent(
       sessionId,
@@ -1868,6 +1883,26 @@ export async function onSpeakerphoneCleared(
     // A later episode is a NEW suspicion, not a continuation of the previous
     // one — reset the event throttle so it is visible immediately.
     lastNoiseEventAt.delete(sessionId);
+    // Suspicion-armed merge-tone backstop (D1): if the tone was armed ONLY by
+    // speakerphone suspicion (no ACTIVE HoldDetector second-call engagement),
+    // the clear transition disarms it — otherwise the callee would keep
+    // hearing the tone for the rest of the call. While an engagement IS
+    // active the tone stays armed: the disengage path owns that disarm.
+    if (
+      session.state === VState.BRIDGED &&
+      isMergeToneArmed(sessionId) &&
+      !secondCallEngagedSessions.has(sessionId)
+    ) {
+      disarmMergeTone(sessionId);
+      console.log(
+        `[verify] MERGE_TONE_DISARMED session=${sessionId} — speakerphone suspicion cleared, no active second-call engagement`,
+      );
+      await logEvent(
+        sessionId,
+        "MERGE_TONE_DISARMED",
+        "speakerphone suspicion cleared with no active second-call engagement — merge tone disarmed",
+      );
+    }
     await logEvent(
       sessionId,
       "SPEAKERPHONE_CLEARED",

@@ -613,6 +613,56 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
     vs.disarmMergeTone(s.sessionId);
   });
 
+  it("suspicion-armed tone disarms on SPEAKERPHONE_CLEARED while BRIDGED", async () => {
+    process.env.VERIFY_MERGE_TONE_REARM_MS = "50";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_sd_caller",
+        legACallSid: "CA_sd_legA",
+      });
+      // Arm via the suspicion backstop ONLY (no HoldDetector engagement).
+      handleSpeakerphoneSuspicious(s.sessionId, 0.9, "clear-disarm test");
+      await tick(150); // let the arm + a few 50ms re-announces settle
+      expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
+      expect(vs.isSecondCallEngaged(s.sessionId)).toBe(false);
+      // Suspicion clears with no active engagement → the backstop disarms.
+      await vs.onSpeakerphoneCleared(s.sessionId, "clear-disarm test");
+      expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
+      const count = participantUpdates.length;
+      await tick(200); // several 50ms rearms would have fired otherwise
+      expect(participantUpdates.length).toBe(count);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_CLEARED");
+      expect(types).toContain("MERGE_TONE_DISARMED");
+    } finally {
+      delete process.env.VERIFY_MERGE_TONE_REARM_MS;
+    }
+  });
+
+  it("SPEAKERPHONE_CLEARED does NOT disarm while a hold engagement is active", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_hd_caller",
+      legACallSid: "CA_hd_legA",
+    });
+    // HoldDetector engagement arms the tone and marks the engagement active.
+    await vs.onSecondCallEngaged(s.sessionId);
+    expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
+    expect(vs.isSecondCallEngaged(s.sessionId)).toBe(true);
+    // Suspicion clearing mid-engagement must NOT disarm — the disengage path
+    // owns that disarm.
+    await vs.onSpeakerphoneCleared(s.sessionId, "hold-active test");
+    expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("SPEAKERPHONE_CLEARED");
+    expect(types).not.toContain("MERGE_TONE_DISARMED");
+    // The disengage path still owns the disarm.
+    await vs.onSecondCallDisengaged(s.sessionId);
+    expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
+    expect(vs.isSecondCallEngaged(s.sessionId)).toBe(false);
+  });
+
   it("non-BRIDGED tone fire keeps the legacy instant verdict (no arm consulted)", async () => {
     const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
       callerCallSid: "CA_lg_caller",
