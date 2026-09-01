@@ -53,6 +53,57 @@ afterEach(() => {
   nowSpy?.mockRestore();
 });
 
+describe("SpeakerphoneDetector arming threshold", () => {
+  it("defaults to 3 consecutive suspicious windows — 2 no longer arms", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    // No consecutiveWindows option → the 3s default applies.
+    const d = new SpeakerphoneDetector({
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+    });
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // baseline seed
+    expect(fires).toHaveLength(0);
+    dsp.suspicious = true;
+    d.pushSamples(WINDOW); // streak 1
+    expect(fires).toHaveLength(0);
+    now += 5_000;
+    d.pushSamples(WINDOW); // streak 2 — below the 3s default, must NOT fire
+    expect(fires).toHaveLength(0);
+    now += 5_000;
+    d.pushSamples(WINDOW); // streak 3 — sustained 3s suspicion → arm
+    expect(fires).toHaveLength(1);
+    expect(fires[0].detail).toContain("streak=3");
+  });
+
+  it("stops emitting the moment a clean window clears the suspicion (no re-announces after onClean)", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    const cleans: string[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 2,
+      refireMs: 9_000,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+      onClean: (detail) => cleans.push(detail),
+    });
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // baseline seed
+    dsp.suspicious = true;
+    d.pushSamples(WINDOW); // streak 1
+    d.pushSamples(WINDOW); // streak 2 → fires
+    expect(fires).toHaveLength(1);
+    now += 60_000; // well past refire — would re-fire if still suspecting
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // clean → onClean, back to idle
+    expect(cleans).toHaveLength(1);
+    // Suspicion cleared: no further emissions without a fresh streak.
+    now += 60_000;
+    d.pushSamples(WINDOW); // another clean window
+    expect(fires).toHaveLength(1);
+    expect(cleans).toHaveLength(1); // onClean fires exactly once per episode
+  });
+});
+
 describe("SpeakerphoneDetector sustained repeat-fire", () => {
   it("fires once after 2 consecutive suspicious windows, not on the first", () => {
     const { fires, push } = setup();

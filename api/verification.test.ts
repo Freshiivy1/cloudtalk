@@ -325,8 +325,8 @@ describe("state machine", () => {
   });
 });
 
-describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
-  it("targets the Leg A (callee) conference participant and never hangs up/redirects", async () => {
+describe("injectChallengeNoise (outer speakerphone → caller leg)", () => {
+  it("targets the CALLER (inmate) conference participant ONLY — never Leg A — and never hangs up/redirects", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_noise_caller",
@@ -335,19 +335,28 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
     const updBefore = updatedCalls.length;
     const partBefore = participantUpdates.length;
     await vs.injectChallengeNoise(s.sessionId, "score=0.90 test");
-    // Exactly one announce, on the verify-<sid> conference, to Leg A only.
+    // Exactly one announce, on the verify-<sid> conference, to the CALLER only.
     const added = participantUpdates.slice(partBefore);
     expect(added).toHaveLength(1);
     expect(added[0].conference).toBe(`verify-${s.sessionId}`);
-    expect(added[0].participant).toBe("CA_noise_legA");
-    expect(added[0].participant).not.toBe("CA_noise_caller");
+    expect(added[0].participant).toBe("CA_noise_caller");
+    expect(added[0].participant).not.toBe("CA_noise_legA");
     expect(added[0].announceUrl).toContain("/api/verify/challenge-noise.wav");
+    // The Leg A (callee) participant NEVER receives the noise announce — its
+    // announce channel belongs to the DTMF merge tone.
+    expect(
+      added.some(
+        (p) =>
+          p.participant === "CA_noise_legA" &&
+          p.announceUrl?.includes("/api/verify/challenge-noise.wav"),
+      ),
+    ).toBe(false);
     // No hangup/redirect of any leg — the call continues.
     expect(updatedCalls.slice(updBefore)).toHaveLength(0);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("SPEAKERPHONE_SUSPECTED");
     const sp = (await events(s.sessionId)).find((e) => e.eventType === "SPEAKERPHONE_SUSPECTED");
-    expect(sp?.details).toContain("target=legA-callee");
+    expect(sp?.details).toContain("target=caller-inmate");
   });
 
   it("repeated injections are counted + timestamped in the SPEAKERPHONE_SUSPECTED payload", async () => {
@@ -361,10 +370,11 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
       const partBefore = participantUpdates.length;
       await vs.injectChallengeNoise(s.sessionId, "score=0.90 first");
       await vs.injectChallengeNoise(s.sessionId, "score=0.91 second");
-      // Sustained masking: each repeat still announces to the callee only.
+      // Sustained masking: each repeat still announces to the caller only.
       const added = participantUpdates.slice(partBefore);
       expect(added).toHaveLength(2);
-      expect(added.every((p) => p.participant === "CA_rn_legA")).toBe(true);
+      expect(added.every((p) => p.participant === "CA_rn_caller")).toBe(true);
+      expect(added.some((p) => p.participant === "CA_rn_legA")).toBe(false);
       const sp = (await events(s.sessionId)).filter(
         (e) => e.eventType === "SPEAKERPHONE_SUSPECTED",
       );
@@ -388,10 +398,11 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
     await vs.injectChallengeNoise(s.sessionId, "score=0.90 first");
     await vs.injectChallengeNoise(s.sessionId, "score=0.91 second");
     await vs.injectChallengeNoise(s.sessionId, "score=0.92 third");
-    // Noise (conference announce to the callee) re-injects on EVERY call…
+    // Noise (conference announce to the caller) re-injects on EVERY call…
     const added = participantUpdates.slice(partBefore);
     expect(added).toHaveLength(3);
-    expect(added.every((p) => p.participant === "CA_th_legA")).toBe(true);
+    expect(added.every((p) => p.participant === "CA_th_caller")).toBe(true);
+    expect(added.some((p) => p.participant === "CA_th_legA")).toBe(false);
     // …but the DB event stream sees only the first suspicion in the window.
     const sp = (await events(s.sessionId)).filter(
       (e) => e.eventType === "SPEAKERPHONE_SUSPECTED",
@@ -400,14 +411,16 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
     expect(sp[0].details).toContain("injection #1");
   });
 
-  it("skips (no caller-leg fallback) when legACallSid is missing", async () => {
-    const s = await makeSession(vs.VState.CALLER_HOLDING, {
-      callerCallSid: "CA_noise_caller2",
-      legACallSid: null,
+  it("skips (no Leg A fallback) when callerCallSid is missing", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: null,
+      legACallSid: "CA_noise_legA2",
     });
     const updBefore = updatedCalls.length;
     const partBefore = participantUpdates.length;
     await vs.injectChallengeNoise(s.sessionId, "score=0.90 test");
+    // No caller leg → skipped (logged) — NEVER falls back to the Leg A leg.
     expect(participantUpdates.slice(partBefore)).toHaveLength(0);
     expect(updatedCalls.slice(updBefore)).toHaveLength(0);
   });
@@ -594,11 +607,12 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
     await tick(150); // both REST paths settle
     expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
     const added = participantUpdates.slice(partBefore);
-    // Challenge noise (callee only) + the armed merge tone (callee only).
+    // Challenge noise → CALLER (inmate) participant ONLY; the armed merge
+    // tone → LEG A (callee) participant ONLY. The two NEVER cross.
     expect(
       added.some(
         (p) =>
-          p.participant === "CA_bb_legA" &&
+          p.participant === "CA_bb_caller" &&
           p.announceUrl?.includes("/api/verify/challenge-noise.wav"),
       ),
     ).toBe(true);
@@ -609,7 +623,22 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
           p.announceUrl?.includes("/api/verify/merge-tone.wav"),
       ),
     ).toBe(true);
-    expect(added.every((p) => p.participant === "CA_bb_legA")).toBe(true);
+    expect(
+      added.some(
+        (p) =>
+          p.participant === "CA_bb_legA" &&
+          p.announceUrl?.includes("/api/verify/challenge-noise.wav"),
+      ),
+    ).toBe(false);
+    expect(
+      added.every(
+        (p) =>
+          (p.participant === "CA_bb_caller" &&
+            p.announceUrl?.includes("/api/verify/challenge-noise.wav")) ||
+          (p.participant === "CA_bb_legA" &&
+            p.announceUrl?.includes("/api/verify/merge-tone.wav")),
+      ),
+    ).toBe(true);
     vs.disarmMergeTone(s.sessionId);
   });
 
@@ -676,6 +705,114 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
       updatedCalls.some((u) => u.sid === "CA_lg_caller" && String(u.url).includes("twiml/notify-merge")),
     ).toBe(true);
     expect(conferenceUpdates.some((u) => u.conference === `verify-${s.sessionId}`)).toBe(false);
+  });
+});
+
+describe("challenge noise / merge system mutual exclusion", () => {
+  it("suspicion while the merge tone is ARMED → NO noise announce + NOISE_SUPPRESSED_MERGE_ACTIVE event; the Leg A merge tone is unaffected", async () => {
+    process.env.VERIFY_MERGE_TONE_REARM_MS = "50"; // fast rearms (fixed at arm time)
+    let armedSid: string | null = null;
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_mx_caller",
+        legACallSid: "CA_mx_legA",
+      });
+      // Merge system already active (second-call engagement path).
+      await vs.armMergeTone(s.sessionId);
+      armedSid = s.sessionId;
+      expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
+      const partBefore = participantUpdates.length;
+      handleSpeakerphoneSuspicious(s.sessionId, 0.9, "suppression test");
+      await tick(200); // let any (suppressed) REST path + several rearms settle
+      const added = participantUpdates.slice(partBefore);
+      // NO challenge-noise announce to ANYONE while the merge system is active.
+      expect(added.some((p) => p.announceUrl?.includes("/api/verify/challenge-noise.wav"))).toBe(
+        false,
+      );
+      // …and the suppression is event-logged.
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
+      expect(types).not.toContain("SPEAKERPHONE_SUSPECTED");
+      // The merge tone keeps re-announcing to the Leg A participant, unaffected.
+      expect(
+        added.some(
+          (p) =>
+            p.participant === "CA_mx_legA" &&
+            p.announceUrl?.includes("/api/verify/merge-tone.wav"),
+        ),
+      ).toBe(true);
+      expect(added.every((p) => p.participant === "CA_mx_legA")).toBe(true);
+    } finally {
+      delete process.env.VERIFY_MERGE_TONE_REARM_MS;
+      if (armedSid) vs.disarmMergeTone(armedSid);
+    }
+  });
+
+  it("suspicion on a MERGE_DETECTED (terminal) session → suppressed, no noise announce", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_mt_caller",
+      legACallSid: "CA_mt_legA",
+    });
+    await vs.onMergeDetected(s.sessionId, { inCall: true }); // terminal
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
+    const partBefore = participantUpdates.length;
+    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "late suspicion after verdict");
+    await tick(150);
+    expect(
+      participantUpdates
+        .slice(partBefore)
+        .some((p) => p.announceUrl?.includes("/api/verify/challenge-noise.wav")),
+    ).toBe(false);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
+    expect(types).not.toContain("SPEAKERPHONE_SUSPECTED");
+  });
+
+  it("merge flow (armed tone fire → notify-conference-merge → teardown) never emits a challenge-noise announce to anyone", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_mf_caller",
+      legACallSid: "CA_mf_legA",
+      legBCallSid: "CA_mf_legB",
+    });
+    const partBefore = participantUpdates.length;
+    await vs.armMergeTone(s.sessionId);
+    expect(await handleMergeToneFire(s.sessionId)).toBe("merge");
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
+    // Every leg routed to the conference-ending announcement; the only
+    // participant announce in the whole flow is the merge tone to Leg A.
+    const added = participantUpdates.slice(partBefore);
+    expect(added.length).toBeGreaterThan(0);
+    expect(added.every((p) => p.announceUrl?.includes("/api/verify/merge-tone.wav"))).toBe(true);
+    expect(added.every((p) => p.participant === "CA_mf_legA")).toBe(true);
+    expect(added.some((p) => p.announceUrl?.includes("/api/verify/challenge-noise.wav"))).toBe(
+      false,
+    );
+  });
+});
+
+describe("speakerphoneArmWindows (3s forensic arming)", () => {
+  it("defaults to 3 consecutive suspicious windows, env-overridable, floored at 1", () => {
+    const saved = process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
+    delete process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
+    try {
+      expect(vs.speakerphoneArmWindows()).toBe(3);
+      process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "5";
+      expect(vs.speakerphoneArmWindows()).toBe(5);
+      process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "1";
+      expect(vs.speakerphoneArmWindows()).toBe(1);
+      process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "0"; // floored to 1
+      expect(vs.speakerphoneArmWindows()).toBe(1);
+      process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "-4"; // floored to 1
+      expect(vs.speakerphoneArmWindows()).toBe(1);
+      process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "bogus"; // safe default
+      expect(vs.speakerphoneArmWindows()).toBe(3);
+    } finally {
+      if (saved === undefined) delete process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
+      else process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = saved;
+    }
   });
 });
 
