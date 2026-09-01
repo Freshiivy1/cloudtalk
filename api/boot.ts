@@ -9,7 +9,7 @@ import { createOAuthCallbackHandler } from "./kimi/auth";
 import { statusCallbackHandler, voiceWebhookHandler } from "./twilio-voice";
 import {
   challengeNoiseHandler,
-  mergeProbeToneHandler,
+  mergeToneHandler,
   verificationGatherHandler,
   verificationGatherLegAAcceptHandler,
   verificationGatherLegAReadyHandler,
@@ -56,9 +56,9 @@ app.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
 app.get("/api/verify/tone.wav", verificationToneHandler);
 // Relayguard challenge-noise probe (conference announce on suspected speakerphone).
 app.get("/api/verify/challenge-noise.wav", challengeNoiseHandler);
-// BRIDGED in-call merge probe burst (Leg A participant announce; echo strikes
-// on the Leg A media stream fire the in-call merge verdict).
-app.get("/api/verify/merge-probe.wav", mergeProbeToneHandler);
+// BRIDGED in-call merge tone (Leg A participant announce while ARMED — the
+// tone crossing a merge fires the in-call verdict on the Leg A media stream).
+app.get("/api/verify/merge-tone.wav", mergeToneHandler);
 app.use("/api/trpc/*", async (c) => {
   return fetchRequestHandler({
     endpoint: "/api/trpc",

@@ -13,7 +13,7 @@ function encodeMulaw(s: number): number {
   const BIAS = 0x84;
   const CLIP = 32604;
   const sign = s < 0 ? 0x80 : 0;
-  let mag = Math.min(Math.abs(Math.round(s)), CLIP) + BIAS;
+  const mag = Math.min(Math.abs(Math.round(s)), CLIP) + BIAS;
   let exponent = 7;
   for (let mask = 0x4000; (mag & mask) === 0 && exponent > 0; mask >>= 1) exponent--;
   const mantissa = (mag >> (exponent + 3)) & 0x0f;
@@ -90,6 +90,34 @@ describe("MergeToneDetector (Goertzel DTMF-9)", () => {
     frames(blip, 4).forEach((f) => d.push(f));
     expect(d.hasFired).toBe(false);
   });
+
+  it("elevated energy floor (armed in-call path) rejects a quiet echo, accepts a loud return", () => {
+    // amp 1200/component → mean-square ≈ 1.44e6: ABOVE the legacy 1e6 floor
+    // but BELOW the elevated 2e6 armed floor — the exact quiet-acoustic-echo
+    // case the armed mid-call path must reject.
+    const armedPath = new MergeToneDetector({ energyFloor: 2e6 });
+    frames(dtmf9(1200), 1).forEach((f) => armedPath.push(f));
+    expect(armedPath.hasFired).toBe(false);
+    const legacyPath = new MergeToneDetector(); // default 1e6
+    frames(dtmf9(1200), 1).forEach((f) => legacyPath.push(f));
+    expect(legacyPath.hasFired).toBe(true);
+    // A genuine merged echo of the announced tone returns LOUD (amp 12000 →
+    // ~1.44e8) and clears the elevated floor easily.
+    const loud = new MergeToneDetector({ energyFloor: 2e6 });
+    frames(dtmf9(12000), 1).forEach((f) => loud.push(f));
+    expect(loud.hasFired).toBe(true);
+  });
+
+  it("dynamic energy floor getter: elevated while armed, legacy otherwise", () => {
+    let armed = true;
+    const d = new MergeToneDetector({ energyFloor: () => (armed ? 2e6 : 1e6) });
+    frames(dtmf9(1200), 1).forEach((f) => d.push(f));
+    expect(d.hasFired).toBe(false); // armed: quiet echo rejected
+    const d2 = new MergeToneDetector({ energyFloor: () => (armed ? 2e6 : 1e6) });
+    armed = false; // disarmed before d2 hears the tone
+    frames(dtmf9(1200), 1).forEach((f) => d2.push(f));
+    expect(d2.hasFired).toBe(true); // legacy floor applies again
+  });
 });
 
 /** Minimal 8 kHz 16-bit mono WAV builder for tests. */
@@ -139,7 +167,7 @@ describe("recording chunk analysis (WAV + Goertzel)", () => {
   });
 
   it("returns -1 for speech-like noise", () => {
-    const pcm = pcmOf((i) => 5000 * (Math.random() - 0.5), 2);
+    const pcm = pcmOf(() => 5000 * (Math.random() - 0.5), 2);
     expect(detectMergeToneMs(wavToPcm16(buildWav(pcm)))).toBe(-1);
   });
 });
