@@ -325,6 +325,16 @@ export function verifyPrompts() {
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
       "Please hold. Your call is being connected. You will hear updates as the line is verified.",
+    // GUARDED MODE ONLY: spoken to Leg A immediately after the second press-1,
+    // before the verification/bridge hold loop.
+    calleeConnectWait:
+      e.VERIFY_PROMPT_CALLEE_CONNECT_WAIT ??
+      "Please wait while we connect your call.",
+    // GUARDED MODE ONLY: played to the remaining caller when the callee's
+    // original (first) call is ended before or during the guarded bridge.
+    firstCallEnded:
+      e.VERIFY_PROMPT_FIRST_CALL_ENDED ??
+      "The first call has ended, so this guarded call will now be terminated. Goodbye.",
     reject:
       e.VERIFY_PROMPT_REJECT ??
       "No response received. This verification call will now end. Goodbye.",
@@ -1299,12 +1309,19 @@ export async function onCallCompleted(
         "GUARDED_CALL_ENDED",
         `leg=${leg} sid=${callSid} ${statusDetail}`,
       );
-      await hangupAll(session, {
-        caller: leg !== "caller",
-        legA: leg !== "legA",
-        legB: true,
-        ringTest: true,
-      });
+      if (session.guarded && leg === "legA") {
+        // Callee ended the first call mid-bridge: tell the caller why the
+        // guarded call is ending before the TwiML hangs them up.
+        await redirectCall(session.callerCallSid, "notify-first-call-ended", sessionId);
+        await hangupAll(session, { legB: true, ringTest: true });
+      } else {
+        await hangupAll(session, {
+          caller: leg !== "caller",
+          legA: leg !== "legA",
+          legB: true,
+          ringTest: true,
+        });
+      }
     }
     return;
   }
@@ -1335,17 +1352,27 @@ export async function onCallCompleted(
 
   if (
     leg === "legA" &&
-    session.state !== VState.LEG_B_ANSWERED &&
-    session.state !== VState.LEG_B_DIALING
+    (session.guarded ||
+      (session.state !== VState.LEG_B_ANSWERED && session.state !== VState.LEG_B_DIALING))
   ) {
-    // Callee hung up during the Leg A IVR (during LEG_B_DIALING a Leg A drop
-    // is expected — the carrier releases the first call when the second connects).
+    // Callee hung up during the Leg A IVR. GUARDED MODE: the first call is the
+    // anchor of the whole guarded flow — if the callee ends it at ANY point
+    // before or during the bridge (including LEG_B_DIALING / LEG_B_ANSWERED,
+    // which legacy non-guarded flow tolerates because the carrier may release
+    // the first call when the second connects), the guarded call must be
+    // terminated and the caller explicitly told why.
     console.warn(`[verify] LEG_A_HANGUP_IVR — callee hung up during ${session.state}`);
     if (await transition(session, VState.FAILED, `Callee hung up during ${session.state}`)) {
-      session.failureReason = "Callee hung up during IVR";
+      session.failureReason = session.guarded
+        ? "Callee ended the first call"
+        : "Callee hung up during IVR";
       session.completedAt = new Date();
       await save(session);
-      await redirectCall(session.callerCallSid, "notify-failed", sessionId);
+      await redirectCall(
+        session.callerCallSid,
+        session.guarded ? "notify-first-call-ended" : "notify-failed",
+        sessionId,
+      );
       await hangupAll(session, { legB: true, ringTest: true });
     }
     return;

@@ -513,7 +513,7 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(types).toContain(vs.VState.COMPLETED);
   });
 
-  it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller dropped", async () => {
+  it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller told the first call ended", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_b2_caller",
@@ -522,7 +522,76 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.COMPLETED);
-    expect(updatedCalls.some((u) => u.sid === "CA_b2_caller" && u.status === "completed")).toBe(true);
+    // The caller is NOT silently dropped — they're redirected to the
+    // "first call ended" announcement, whose TwiML then hangs up.
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_b2_caller" && String(u.url).includes("notify-first-call-ended"),
+      ),
+    ).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_b2_caller" && u.status === "completed")).toBe(
+      false,
+    );
+  });
+
+  it("guarded: callee ends the first call during LEG_B_DIALING → FAILED + caller told", async () => {
+    const s = await makeSession(vs.VState.LEG_B_DIALING, {
+      guarded: true,
+      callerCallSid: "CA_lbd_caller",
+      legACallSid: "CA_lbd_legA",
+      legBCallSid: "CA_lbd_legB",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_lbd_legA", "duration=20s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.FAILED);
+    expect(after.failureReason).toBe("Callee ended the first call");
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_lbd_caller" && String(u.url).includes("notify-first-call-ended"),
+      ),
+    ).toBe(true);
+    // The second call is torn down too.
+    expect(updatedCalls.some((u) => u.sid === "CA_lbd_legB" && u.status === "completed")).toBe(
+      true,
+    );
+  });
+
+  it("guarded: callee ends the first call during LEG_B_ANSWERED → FAILED + caller told", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_lba_caller",
+      legACallSid: "CA_lba_legA",
+      legBCallSid: "CA_lba_legB",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_lba_legA", "duration=35s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.FAILED);
+    expect(after.failureReason).toBe("Callee ended the first call");
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_lba_caller" && String(u.url).includes("notify-first-call-ended"),
+      ),
+    ).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_lba_legB" && u.status === "completed")).toBe(
+      true,
+    );
+  });
+
+  it("non-guarded: Leg A drop during LEG_B_DIALING is still tolerated (legacy)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_DIALING, {
+      callerCallSid: "CA_ng_caller",
+      legACallSid: "CA_ng_legA",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_ng_legA", "duration=10s");
+    const after = (await vs.findSession(s.sessionId))!;
+    // Legacy: the carrier may release the first call when the second connects —
+    // non-guarded sessions keep going and let Leg B decide.
+    expect(after.state).toBe(vs.VState.LEG_B_DIALING);
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_ng_caller" && String(u.url).includes("notify-first-call-ended"),
+      ),
+    ).toBe(false);
   });
 
   it("guarded-bridge TwiML joins the live conference (no beep, ends on exit)", async () => {
@@ -1358,12 +1427,24 @@ describe("guarded single-call flow", () => {
     });
     const body = await res.text();
     expect(res.status).toBe(200);
+    // The callee is told the bridge is being set up before being parked.
+    expect(body).toContain("Please wait while we connect your call.");
     expect(body).toContain("<Pause");
     expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_DIALING);
     expect(
       createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
     ).toBe(true);
+  });
+
+  it("notify-first-call-ended TwiML explains the termination and hangs up", async () => {
+    const res = await postForm("/api/verify/twiml/notify-first-call-ended?sid=abc123");
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain(
+      "The first call has ended, so this guarded call will now be terminated. Goodbye.",
+    );
+    expect(body).toContain("<Hangup");
   });
 
   it("guarded callee no-answer still fails the session (status callback → FAILED)", async () => {

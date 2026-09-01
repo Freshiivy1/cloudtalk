@@ -2,7 +2,7 @@
  * SpeakerphoneDetector sustained-masking logic (post-fire repeat emissions).
  *
  * The DSP layer (analyzeClip / compareClips / relayFingerprint) is mocked so
- * each 2s window's suspiciousness is controlled directly; the logic under
+ * each 1s window's suspiciousness is controlled directly; the logic under
  * test is the streak / refire / reset-to-idle state machine in
  * speakerphone-detector.ts. No DB or network involved.
  */
@@ -26,8 +26,8 @@ vi.mock("./compare", () => ({
 
 import { SpeakerphoneDetector } from "./speakerphone-detector";
 
-/** 2s window of 8 kHz PCM (non-silent so peak-normalization is exercised). */
-const WINDOW = new Array(16000).fill(1000);
+/** 1s window of 8 kHz PCM (non-silent so peak-normalization is exercised). */
+const WINDOW = new Array(8000).fill(1000);
 
 let now = 1_000_000;
 let nowSpy: ReturnType<typeof vi.spyOn>;

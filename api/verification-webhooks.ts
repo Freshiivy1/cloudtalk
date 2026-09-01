@@ -436,6 +436,12 @@ export async function verificationTwimlHandler(c: Context) {
         break;
       }
 
+      case "notify-first-call-ended": {
+        vr.say(P.firstCallEnded);
+        vr.hangup();
+        break;
+      }
+
       case "notify-failed": {
         vr.say(P.failed);
         vr.hangup();
@@ -597,7 +603,10 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
       // Non-guarded sessions may already have Leg B airborne from the legacy
       // pre-origination path; onCalleeReady is idempotent either way. Leg A
       // then waits on a long-pause hold loop that keeps the call alive.
+      const P = vs.verifyPrompts();
       await vs.onCalleeReady(sid);
+      // Tell the callee the bridge is being set up before parking them.
+      vr.say(P.calleeConnectWait);
       vr.pause({ length: 60 });
       vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
     } else {
