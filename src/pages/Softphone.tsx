@@ -178,13 +178,19 @@ function GuardedLivePanel({
     if (el) el.scrollTop = el.scrollHeight;
   }, [events.length]);
 
-  // Latest speakerphone suspicion: "… target=legA-callee | score=0.90
-  // verdict=SUSPICIOUS RELAY relayState=RED …" → score + verdict.
+  // Latest speakerphone state: suspicion events show score/verdict; a later
+  // SPEAKERPHONE_CLEARED event flips the panel back to normal quickly.
   const spEvents = events.filter((e) => e.eventType === 'SPEAKERPHONE_SUSPECTED');
-  const latestSp = spEvents[spEvents.length - 1];
-  const spScore = latestSp?.details?.match(/score=([\d.]+)/)?.[1] ?? null;
-  const spVerdict =
-    latestSp?.details?.match(/verdict=([A-Z][A-Z_ ]*?)(?:\s+relayState|\s+weighted|$)/)?.[1] ?? null;
+  const spTimeline = events.filter(
+    (e) => e.eventType === 'SPEAKERPHONE_SUSPECTED' || e.eventType === 'SPEAKERPHONE_CLEARED'
+  );
+  const latestSp = spTimeline[spTimeline.length - 1];
+  const spActive = latestSp?.eventType === 'SPEAKERPHONE_SUSPECTED';
+  const spCleared = latestSp?.eventType === 'SPEAKERPHONE_CLEARED';
+  const spScore = spActive ? latestSp?.details?.match(/score=([\d.]+)/)?.[1] ?? null : null;
+  const spVerdict = spActive
+    ? latestSp?.details?.match(/verdict=([A-Z][A-Z_ ]*?)(?:\s+relayState|\s+weighted|$)/)?.[1] ?? null
+    : null;
   const voiceMismatches = events.filter((e) => e.eventType === 'VOICE_MISMATCH').length;
   const voiceprintCaptured = events.some((e) => e.eventType === 'VOICEPRINT_CAPTURED');
   const voiceprintMissed = events.some((e) => e.eventType === 'VOICEPRINT_MISSED');
@@ -192,13 +198,19 @@ function GuardedLivePanel({
   const rows: Array<{ label: string; value: string; cls: string }> = [
     {
       label: 'Speakerphone',
-      value: spScore ? `score ${spScore} · ${spVerdict ?? 'suspected'}` : 'no suspicion detected',
-      cls: spScore ? 'text-amber' : 'text-text-low',
+      value: spActive && spScore
+        ? `score ${spScore} · ${spVerdict ?? 'suspected'}`
+        : spCleared
+          ? 'normal · cleared'
+          : 'no suspicion detected',
+      cls: spActive ? 'text-amber' : spCleared ? 'text-signal' : 'text-text-low',
     },
     {
       label: 'Challenge noise',
-      value: `${spEvents.length} injection${spEvents.length === 1 ? '' : 's'}`,
-      cls: spEvents.length > 0 ? 'text-amber' : 'text-text-low',
+      value: spActive
+        ? `${spEvents.length} injection${spEvents.length === 1 ? '' : 's'} · active`
+        : `${spEvents.length} injection${spEvents.length === 1 ? '' : 's'}`,
+      cls: spActive ? 'text-amber' : 'text-text-low',
     },
     {
       label: 'Voiceprint',
@@ -326,11 +338,11 @@ export default function Softphone() {
   // Live analysis polling — only while a guarded session is in flight.
   const guardedSessionQ = trpc.verification.get.useQuery(
     { sessionId: guardedSessionId ?? '00000000' },
-    { enabled: guardedSessionId != null, refetchInterval: 2000 }
+    { enabled: guardedSessionId != null, refetchInterval: 1000 }
   );
   const guardedEventsQ = trpc.verification.events.useQuery(
     { sessionId: guardedSessionId ?? '00000000' },
-    { enabled: guardedSessionId != null, refetchInterval: 2000 }
+    { enabled: guardedSessionId != null, refetchInterval: 1000 }
   );
   const now = useNow();
   const prevState = useRef(callState);
@@ -622,7 +634,7 @@ export default function Softphone() {
                       <ShieldCheck className={cn('h-4 w-4', guarded ? 'text-signal' : 'text-text-low')} />
                       <div>
                         <p className="text-xs font-medium text-text-hi">Guarded inmate call</p>
-                        <p className="text-[10px] text-text-low">Press-1 verify · voice ID · merge guard</p>
+                        <p className="text-[10px] text-text-low">2× press-1 · voice ID · merge guard</p>
                       </div>
                     </div>
                     <Switch

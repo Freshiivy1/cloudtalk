@@ -3,12 +3,19 @@
  *
  * Renders the deterministic probe loop from probe.ts to an 8 kHz mono
  * 16-bit PCM WAV buffer — the exact format Twilio accepts for <Play> and
- * conference participant announcements (`announceUrl`). The buffer is
+ * conference participant announcements (`announceUrl`). The production probe
+ * is the 4-second seamless loop, seed 0x5eed, bass-free 500 Hz–6 kHz band,
+ * +4 dB presence at 2 kHz, at relayguard slider level 70. The buffer is
  * deterministic (seeded PRNG) and cached after the first render.
  */
-import { generateProbeLoop } from "./probe";
+import { generateProbeLoop, probeGain, PROBE_SEED } from "./probe";
 
 const WAV_SAMPLE_RATE = 8000;
+
+/** Exact in-call probe requested for CloudTalk: 4s seamless loop at slider 70. */
+export const CHALLENGE_NOISE_LOOP_SEC = 4;
+export const CHALLENGE_NOISE_LEVEL = 70;
+export const CHALLENGE_NOISE_SEED = PROBE_SEED; // 0x5eed
 
 /** Encode float samples (-1..1) as a mono 16-bit PCM WAV buffer. */
 export function encodeWavPcm16(samples: Float32Array, sampleRate = WAV_SAMPLE_RATE): Buffer {
@@ -59,14 +66,19 @@ function probeLoop8k(loopSec: number): Float32Array {
 
 /**
  * Probe-loop challenge noise as a WAV buffer, ready to serve to Twilio.
- * Samples are scaled by `level / 100` (default level 40 → 0.4 = 40% gain,
- * ≈ −20 dBFS against the probe's normalized 0.25 RMS).
+ * Samples use the relayguard slider gain (`probeGain`): level 70 → 0.35
+ * linear gain against the probe's normalized 0.25 RMS. The default is the
+ * exact production probe contract: seed 0x5eed, 500 Hz–6 kHz, +4 dB at
+ * 2 kHz, 4-second seamless loop, 70% slider level.
  */
-export function challengeNoiseWav(loopSec = 3, level = 40): Buffer {
+export function challengeNoiseWav(
+  loopSec = CHALLENGE_NOISE_LOOP_SEC,
+  level = CHALLENGE_NOISE_LEVEL,
+): Buffer {
   const key = `${loopSec}:${level}`;
   const hit = cache.get(key);
   if (hit) return hit;
-  const gain = Math.max(0, Math.min(100, level)) / 100;
+  const gain = probeGain(level);
   const loop = probeLoop8k(loopSec);
   const scaled = new Float32Array(loop.length);
   for (let i = 0; i < loop.length; i++) scaled[i] = loop[i] * gain;

@@ -2,9 +2,10 @@
  * TEST-ONLY scripted callee for end-to-end guarded-call self-tests.
  *
  * Point a spare Twilio number's voice webhook at /api/test/callee-bot, then
- * run a guarded call to that number. The restored guarded flow expects the
- * callee to press 1 and then speak the explicit voice-ID phrase. The bot:
- *   1. presses 1 and speaks "my voice identifies me" (~4-5s of speech) so the
+ * run a guarded call to that number. The guarded flow expects the callee to
+ * press 1, speak the explicit voice-ID phrase, then press 1 again for Leg B.
+ * The bot:
+ *   1. speaks "my voice identifies me" (~4-5s of speech) so the
  *      /api/verify/voiceprint webhook gets usable audio,
  *   2. RECORDS 25s of call audio (exactly what a real callee hears:
  *      caller audio + challenge-noise announces) and posts it to

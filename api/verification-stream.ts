@@ -282,6 +282,12 @@ async function legASpeakerphoneDetector(
           .injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`)
           .catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
       },
+      onClean: (detail) => {
+        console.log(`[verify-stream] SPEAKERPHONE CLEARED sid=${sid} ${detail}`);
+        void vs
+          .onSpeakerphoneCleared(sid, detail)
+          .catch((err) => console.error("[verify-stream] onSpeakerphoneCleared error:", err));
+      },
     });
   } catch (err) {
     console.error(`[verify-stream] Leg A session lookup failed callSid=${callSid}:`, err);

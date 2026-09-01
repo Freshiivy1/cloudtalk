@@ -10,12 +10,13 @@
  *   POST /api/verify/status/:leg?sid=…         → status callbacks drive the FSM
  *   POST /api/verify/gather/merge?sid=…        → Leg B <Gather> result
  *   POST /api/verify/gather/leg-a-accept?sid=… → Leg A IVR step 1 (press 1 to accept)
- *   POST /api/verify/gather/leg-a-ready?sid=…  → Leg A IVR step 2 (press 1 when ready)
+ *   POST /api/verify/gather/leg-a-ready?sid=…  → guarded second press-1 (receive second call)
  *
  * Leg A callee IVR (CALL-FLOW.md Phase 2): the callee answers and hears
- * "Press 1 to accept" (DTMF during playback allowed) → CALL_ACCEPTED, then
- * "Press 1 when ready to proceed" → CALLEE_READY, then Leg A holds (long
- * <Pause> self-redirect loop) while Leg B + the ring test are originated.
+ * "Press 1 to accept" (DTMF during playback allowed) → CALL_ACCEPTED. Guarded
+ * sessions then capture the explicit voice-ID phrase and require a SECOND
+ * press-1 to originate Leg B; Leg A holds (long <Pause> self-redirect loop)
+ * while second-call/merge verification runs.
  * Each step re-prompts on timeout/wrong digit; after LEG_A_MAX_ATTEMPTS the
  * callee is treated as rejecting the call → FAILED.
  *
@@ -29,7 +30,12 @@ import fs from "fs";
 import path from "path";
 import * as vs from "./verification";
 import { legAStreamUrl, relayStreamUrl } from "./verification-stream";
-import { challengeNoiseWav } from "./relayguard/noise";
+import {
+  CHALLENGE_NOISE_LEVEL,
+  CHALLENGE_NOISE_LOOP_SEC,
+  CHALLENGE_NOISE_SEED,
+  challengeNoiseWav,
+} from "./relayguard/noise";
 import { wavToPcm16 } from "./verification-record";
 import { analyzeClip, type ClipProfile } from "./relayguard/features";
 
@@ -62,21 +68,43 @@ export async function verificationToneHandler(c: Context) {
 }
 
 /**
- * GET /api/verify/challenge-noise.wav — serves the relayguard probe-loop
- * challenge noise (8 kHz mono 16-bit PCM WAV) with a proper audio/wav
- * Content-Type. Used as the conference announceUrl for the OUTER
- * speakerphone case: Twilio plays it to the CALLEE (Leg A) participant only,
- * so the callee is prompted to get off speakerphone to hear clearly (the
- * call continues — no hangup). Generated in-process and cached, so no static
- * file.
+ * GET /api/verify/challenge-noise.wav — serves the EXACT relayguard
+ * challenge-noise probe used by the detector: seed 0x5eed, bass-free
+ * 500 Hz–6 kHz band, +4 dB presence at 2 kHz, 70% relayguard slider level,
+ * 4-second seamless loop. The production callee path uses the telephony-grade
+ * 16 kHz WAV asset; an in-process 8 kHz render is kept as a fallback. Used as
+ * the conference announceUrl for the OUTER speakerphone case: Twilio plays it
+ * to the CALLEE (Leg A) participant only, so the callee is prompted to get
+ * off speakerphone to hear clearly (the call continues — no hangup).
  */
 export async function challengeNoiseHandler(c: Context) {
+  const candidates = [
+    path.resolve(import.meta.dirname, "public", "relayguard-challenge-noise-70pct-16k.wav"),
+    path.resolve(import.meta.dirname, "..", "dist", "public", "relayguard-challenge-noise-70pct-16k.wav"),
+    path.resolve(import.meta.dirname, "..", "public", "relayguard-challenge-noise-70pct-16k.wav"),
+    path.resolve(process.cwd(), "dist", "public", "relayguard-challenge-noise-70pct-16k.wav"),
+    path.resolve(process.cwd(), "public", "relayguard-challenge-noise-70pct-16k.wav"),
+  ];
+  for (const p of candidates) {
+    try {
+      const buf = await fs.promises.readFile(p);
+      return c.body(new Uint8Array(buf), 200, {
+        "Content-Type": "audio/wav",
+        "Content-Length": String(buf.byteLength),
+        "Cache-Control": "no-store",
+        "X-Relayguard-Probe": `seed=0x${CHALLENGE_NOISE_SEED.toString(16)};level=${CHALLENGE_NOISE_LEVEL};loop=${CHALLENGE_NOISE_LOOP_SEC}s;band=500-6000Hz;presence=+4dB@2kHz`,
+      });
+    } catch {
+      // try next candidate
+    }
+  }
   try {
     const buf = challengeNoiseWav();
     return c.body(new Uint8Array(buf), 200, {
       "Content-Type": "audio/wav",
       "Content-Length": String(buf.byteLength),
       "Cache-Control": "no-store",
+      "X-Relayguard-Probe": `seed=0x${CHALLENGE_NOISE_SEED.toString(16)};level=${CHALLENGE_NOISE_LEVEL};loop=${CHALLENGE_NOISE_LOOP_SEC}s;band=500-6000Hz;presence=+4dB@2kHz`,
     });
   } catch (err) {
     console.error("[verify] challenge-noise render failed:", err);
@@ -194,7 +222,8 @@ export async function verificationTwimlHandler(c: Context) {
       }
 
       case "leg-a-ready": {
-        // Phase 2, step 2: "Press 1 when ready to proceed".
+        // Phase 2, guarded step 3: after voice-ID, "Press 1 to receive the
+        // second verification call". This press is the only guarded Leg B trigger.
         const a = attemptFrom(c);
         if (a >= vs.LEG_A_MAX_ATTEMPTS) {
           void vs
@@ -456,8 +485,8 @@ export async function verificationStatusHandler(c: Context) {
         } else if (leg === "legA") {
           // Answer ≠ acceptance: CALL_ACCEPTED is driven by the press-1 IVR
           // (gather/leg-a-accept). This callback only records the answer.
-          // (Leg B origination happens at the first press-1 — the callee must
-          // hear prompt 1 before the second call arrives.)
+          // (Guarded Leg B origination waits for voice-ID plus the second
+          // press-1 — the callee explicitly controls when the next call arrives.)
           await vs.logEvent(sid, "ANSWERED_LEGA", `sid=${callSid} — awaiting press-1 accept`);
         } else if (leg === "legB") {
           // AMD: anything not MACHINE (human/unknown/notsure/empty) → human path.
@@ -512,18 +541,16 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
     const digits = String(body.Digits ?? "");
 
     if (digits === "1") {
-      // Callee accepted → CALL_ACCEPTED. SINGLE press-1 flow (per user
-      // request): no second "ready" press — onCallAccepted pre-originates
-      // Leg B itself, so we acknowledge and park Leg A on the hold loop
-      // immediately. The leg-a-ready step remains in code for reference but
-      // is no longer reachable from this flow.
+      // Callee accepted → CALL_ACCEPTED. Guarded sessions then require TWO
+      // more explicit actions: the voice-ID phrase and a second press-1.
+      // Leg B is originated only by that second press (leg-a-ready).
       const session = await vs.onCallAccepted(sid, String(body.CallSid ?? ""));
       if (session?.guarded) {
         // GUARDED MODE ONLY: press-1 → explicit voice-ID phrase. The
-        // /api/verify/voiceprint action processes the recording, announces the
-        // second call, starts Leg B via onCalleeReady(), and parks Leg A on the
-        // hold loop until merge verification passes. (Verbs after <Record> are
-        // a fallback for a failed action fetch.)
+        // /api/verify/voiceprint action processes the recording and serves the
+        // second press-1 gather. The verbs after <Record> are only a fallback
+        // for a failed action fetch, so they mirror that same second-press
+        // gather rather than originating Leg B or parking the call early.
         const P = vs.verifyPrompts();
         vr.say(P.voiceId);
         vr.record({
@@ -533,9 +560,14 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
           action: vs.voiceprintUrl(sid),
           method: "POST",
         });
-        vr.say(P.secondCall);
-        vr.pause({ length: 60 });
-        vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
+        const ready = vr.gather({
+          numDigits: 1,
+          timeout: IVR_GATHER_TIMEOUT,
+          action: vs.gatherLegAReadyUrl(sid, 0),
+          method: "POST",
+        });
+        ready.say(P.secondCall);
+        vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), 1));
       } else {
         vr.say("Thank you. Please stay on the line while your call is connected.");
         vr.pause({ length: 60 });
@@ -560,10 +592,11 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
     const digits = String(body.Digits ?? "");
 
     if (digits === "1") {
-      // Callee ready. Leg B was PRE-ORIGINATED at the first press-1 so the
-      // second call is already ringing (effectively instant); onCalleeReady
-      // just confirms (or originates as a fallback). Leg A then waits on a
-      // long-pause hold loop that keeps the call alive.
+      // Callee ready. GUARDED MODE: this second press-1 is the explicit
+      // second-call trigger — Leg B is originated here, after voice-ID.
+      // Non-guarded sessions may already have Leg B airborne from the legacy
+      // pre-origination path; onCalleeReady is idempotent either way. Leg A
+      // then waits on a long-pause hold loop that keeps the call alive.
       await vs.onCalleeReady(sid);
       vr.pause({ length: 60 });
       vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
@@ -583,10 +616,10 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
 /**
  * POST /api/verify/voiceprint?sid=… — action of the guarded voice-ID
  * <Record> ("my voice identifies me"). The recording is processed
- * fire-and-forget into the relayguard baseline; the callee is then told that
- * the second verification call is coming, must keep the current call alive,
- * and must accept that next call. onCalleeReady() starts Leg B immediately;
- * Leg A is parked on the non-blocking hold loop until the merge watch passes.
+ * fire-and-forget into the relayguard baseline; the callee is then asked to
+ * press 1 AGAIN to receive the second verification call. Leg B is originated
+ * only by that second press through gather/leg-a-ready → onCalleeReady(); the
+ * recording callback itself never originates the next call.
  */
 export async function verificationVoiceprintHandler(c: Context) {
   const sid = c.req.query("sid") ?? "";
@@ -606,10 +639,14 @@ export async function verificationVoiceprintHandler(c: Context) {
     void processVoiceprint(sid, { recordingUrl, durationSec, callSid }).catch((err) =>
       console.error("[verify] voiceprint processing error:", err),
     );
-    vr.say(P.secondCall);
-    await vs.onCalleeReady(sid);
-    vr.pause({ length: 60 });
-    vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
+    const ready = vr.gather({
+      numDigits: 1,
+      timeout: IVR_GATHER_TIMEOUT,
+      action: vs.gatherLegAReadyUrl(sid, 0),
+      method: "POST",
+    });
+    ready.say(P.secondCall);
+    vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), 1));
   } catch (err) {
     console.error("[verify] voiceprint handler error:", err);
     try {

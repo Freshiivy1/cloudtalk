@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils';
 import { formatPhoneDisplay } from '@/lib/telephony';
 import { trpc } from '@/providers/trpc';
 
-const POLL_MS = 2000;
+const POLL_MS = 1000;
 
 type VerificationEventRow = {
   id: number;
@@ -57,13 +57,20 @@ function StateBadge({ state }: { state: string | null }) {
 }
 
 function latestSpeakerphone(events: VerificationEventRow[]) {
-  const rows = events.filter((e) => e.eventType === 'SPEAKERPHONE_SUSPECTED');
-  const latest = rows[rows.length - 1];
+  const suspected = events.filter((e) => e.eventType === 'SPEAKERPHONE_SUSPECTED');
+  const relevant = events.filter(
+    (e) => e.eventType === 'SPEAKERPHONE_SUSPECTED' || e.eventType === 'SPEAKERPHONE_CLEARED'
+  );
+  const latest = relevant[relevant.length - 1];
+  const active = latest?.eventType === 'SPEAKERPHONE_SUSPECTED';
   return {
-    count: rows.length,
-    score: latest?.details?.match(/score=([\d.]+)/)?.[1] ?? null,
-    verdict:
-      latest?.details?.match(/verdict=([A-Z][A-Z_ ]*?)(?:\s+relayState|\s+weighted|$)/)?.[1] ?? null,
+    count: suspected.length,
+    active,
+    cleared: latest?.eventType === 'SPEAKERPHONE_CLEARED',
+    score: active ? latest?.details?.match(/score=([\d.]+)/)?.[1] ?? null : null,
+    verdict: active
+      ? latest?.details?.match(/verdict=([A-Z][A-Z_ ]*?)(?:\s+relayState|\s+weighted|$)/)?.[1] ?? null
+      : null,
   };
 }
 
@@ -158,10 +165,11 @@ function SessionLiveView({ sessionId }: { sessionId: string }) {
       <div className="rounded-[14px] border border-signal/30 bg-signal/10 px-4 py-3 text-sm text-text-mid">
         Guarded inmate call: the callee hears the inmate-call warning and presses{' '}
         <span className="text-text-hi">1</span>, says{' '}
-        <span className="text-text-hi">“my voice identifies me”</span>, then keeps the current call
-        alive and accepts the second verification call. If the calls are merged, the in-band tone
-        leaks into the second call and the session ends; if no merge is detected, the caller and
-        callee bridge and live speakerphone/voice-match forensics continue.
+        <span className="text-text-hi">“my voice identifies me”</span>, then presses{' '}
+        <span className="text-text-hi">1</span> again to receive the second verification call while
+        keeping the current call alive. If the calls are merged, the in-band tone leaks into the
+        second call and the session ends; if no merge is detected, the caller and callee bridge and
+        live speakerphone/voice-match forensics continue.
       </div>
 
       {sessionQ.isLoading ? (
@@ -182,15 +190,23 @@ function SessionLiveView({ sessionId }: { sessionId: string }) {
             />
             <MetricCard
               label="Speakerphone"
-              value={sp.score ? `score ${sp.score}` : 'no suspicion'}
-              hint={sp.verdict ?? (sp.count > 0 ? 'suspected window logged' : 'detector runs every ~2s while bridged')}
-              tone={sp.score ? 'text-amber' : 'text-text-hi'}
+              value={sp.active && sp.score ? `score ${sp.score}` : sp.cleared ? 'normal' : 'no suspicion'}
+              hint={
+                sp.active
+                  ? sp.verdict ?? 'suspected window logged'
+                  : sp.cleared
+                    ? 'clean 1s window; challenge noise stopped'
+                    : sp.count > 0
+                      ? 'suspected window logged'
+                      : 'detector runs every ~1s while bridged'
+              }
+              tone={sp.active ? 'text-amber' : sp.cleared ? 'text-signal' : 'text-text-hi'}
             />
             <MetricCard
               label="Challenge noise"
               value={`${sp.count}`}
-              hint="callee-only injections; call never hangs up"
-              tone={sp.count > 0 ? 'text-amber' : 'text-text-hi'}
+              hint={sp.active ? '70% probe loop active; callee-only, no hangup' : 'callee-only 4s probe loop; stops on clean audio'}
+              tone={sp.active ? 'text-amber' : 'text-text-hi'}
             />
             <MetricCard
               label="Merge guard"

@@ -158,7 +158,7 @@ const noiseInjectionCount = new Map<string, number>();
 
 /**
  * Per-session wall-clock of the last SPEAKERPHONE_SUSPECTED event WRITE.
- * The noise itself re-injects every refire interval (~8s) but the DB event
+ * The noise itself re-injects every refire interval (~4s) but the DB event
  * stream is throttled to one row per noiseEventThrottleMs() so a sustained
  * suspicion doesn't flood verification_events.
  */
@@ -309,10 +309,11 @@ export function verifyPrompts() {
     voiceId:
       e.VERIFY_PROMPT_VOICE_ID ??
       "Please identify your voice. After the beep, say: my voice identifies me.",
-    // GUARDED MODE ONLY: spoken after the voice-ID recording, before Leg B.
+    // GUARDED MODE ONLY: spoken after the voice-ID recording; the SECOND
+    // press-1 is the explicit trigger that originates Leg B.
     secondCall:
       e.VERIFY_PROMPT_SECOND_CALL ??
-      "Thank you. You will receive another call shortly. Do not end this current call. Accept the next call to continue.",
+      "Thank you. Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
@@ -320,7 +321,7 @@ export function verifyPrompts() {
       "Please wait while we connect your call.",
     ready:
       e.VERIFY_PROMPT_READY ??
-      "Thank you. Press 1 when you are ready to proceed.",
+      "Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
       "Please hold. Your call is being connected. You will hear updates as the line is verified.",
@@ -785,11 +786,11 @@ export async function onGuardedCallerConnected(
 }
 
 /**
- * Leg A's phone was picked up (Twilio status in-progress) — pre-originate
- * Leg B RIGHT NOW. PSTN origination to a busy line takes ~5-15s, so firing
- * here means the second call arrives around the first press-1 and is
- * guaranteed to be ringing/answered by the second "ready" press — zero
- * perceived ring latency, exactly like the Asterisk original.
+ * Leg A's phone was picked up (Twilio status in-progress). NON-GUARDED flow:
+ * pre-originate Leg B RIGHT NOW (PSTN origination takes ~5-15s, so the second
+ * call is airborne by the ready press — zero perceived ring latency, exactly
+ * like the Asterisk original). GUARDED flow deliberately returns here: Leg B
+ * waits for voice-ID plus the callee's second explicit press-1.
  * No FSM transition: CALL_ACCEPTED is still driven by the press-1 IVR.
  */
 export async function onLegAAnswered(
@@ -848,17 +849,17 @@ export async function onCallAccepted(
     session.legACallSid = callSid;
     await save(session);
     // Non-guarded sessions keep the legacy behavior: Leg B is originated as
-    // soon as the callee accepts. Guarded sessions intentionally wait until
-    // the explicit voice-ID <Record> action announces the second call and
-    // invokes onCalleeReady(), so the callee is told to keep the current call
-    // alive before the next call arrives.
+    // soon as the callee accepts. Guarded sessions intentionally wait through
+    // TWO more explicit callee actions: the voice-ID <Record>, then a second
+    // press-1. Only that second press invokes onCalleeReady(), so the callee
+    // controls exactly when the next call arrives.
     if (!session.guarded) {
       await originateLegB(sessionId);
     } else {
       await logEvent(
         sessionId,
         "GUARDED_VOICEPRINT_STEP",
-        "callee accepted — voice-ID phrase recording next; second-call verification starts after the recording callback",
+        "callee accepted — voice-ID phrase recording next; second-call verification starts only after the second press-1",
       );
     }
   }
@@ -866,9 +867,10 @@ export async function onCallAccepted(
 }
 
 /**
- * Second press-1 ("ready"). Leg B was already pre-originated at the first
- * press, so this is just a confirmation — originate only as a fallback if the
- * pre-origination didn't happen (e.g. racing webhook ordering).
+ * Second press-1 ("ready"). Guarded sessions originate Leg B HERE — after
+ * voice-ID, never automatically from the recording callback. Non-guarded Leg B
+ * may already be airborne from the legacy pre-origination path; in that case
+ * this confirms and drains the buffered answer without a duplicate call.
  */
 export async function onCalleeReady(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
@@ -897,9 +899,9 @@ async function originateLegB(sessionId: string): Promise<void> {
 
   // Non-guarded Leg B is normally ALREADY AIRBORNE here — pre-originated when
   // Leg A was answered (onLegAAnswered) so the callee never waits for the
-  // second call. Guarded Leg B starts here, immediately after the voice-ID
-  // recording callback tells the callee to keep the current call alive and
-  // accept the next call. Originate only as a fallback when not airborne.
+  // second call. Guarded Leg B starts here, only after the voice-ID recording
+  // AND the callee's second explicit press-1. Originate only as a fallback
+  // when not airborne.
   const alreadyAirborne = Boolean(session.legBCallSid);
 
   if (
@@ -1540,6 +1542,52 @@ async function sendSmsOnce(
 }
 
 /**
+ * OUTER SPEAKERPHONE clear transition — the media-stream detector saw a clean
+ * window after a fired suspicion. Challenge noise is finite (the exact 4s
+ * probe loop) and is only re-announced while suspicion persists, so the clear
+ * path is simply to STOP re-injecting; the live page gets an explicit event on
+ * the next poll. Any in-progress announce can finish naturally (≤4s).
+ */
+export async function onSpeakerphoneCleared(
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session)) return;
+    // A later episode is a NEW suspicion, not a continuation of the previous
+    // one — reset the event throttle so it is visible immediately.
+    lastNoiseEventAt.delete(sessionId);
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_CLEARED",
+      `callee audio returned to normal; no further challenge-noise injections | ${reason}`.slice(0, 512),
+    );
+    try {
+      const { logCallEvent } = await import("./simulator");
+      const rows = await getDb()
+        .select({ id: schema.calls.id })
+        .from(schema.calls)
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`))
+        .limit(1);
+      const callId = Number(rows.at(0)?.id ?? 0);
+      if (callId) {
+        await logCallEvent(callId, "speakerphone_cleared", {
+          sessionId,
+          reason,
+          target: "legA-callee",
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.warn("[verify] logCallEvent speakerphone_cleared mirror failed:", (err as Error).message);
+    }
+  } catch (err) {
+    console.error(`[verify] onSpeakerphoneCleared failed session=${sessionId}:`, err);
+  }
+}
+
+/**
  * OUTER SPEAKERPHONE case — inject the relayguard challenge noise toward the
  * CALLEE (Leg A, the dialed party) participant ONLY via a Twilio conference
  * announce. With the noise on the callee's downlink they can't hear the
@@ -1552,12 +1600,14 @@ async function sendSmsOnce(
  * NOT fall back to the caller leg.
  *
  * REPEAT-SAFE: while outer-speakerphone suspicion persists during the live
- * (bridged) call, the detector re-invokes this on every suspicious window
- * (throttled, see SpeakerphoneDetector.refireMs). Each call simply updates
- * the same conference announce, so repeats are idempotent — Twilio replays
- * the announcement to the callee (sustained masking). Every injection is
- * counted; SPEAKERPHONE_SUSPECTED event WRITES are throttled to one per
- * noiseEventThrottleMs() (default 30s) per session while the announce
+ * (bridged) call, the detector re-invokes this every refireMs (default 4s —
+ * the exact length of the seamless probe loop). Each call simply updates the
+ * same conference announce, so repeats are idempotent — Twilio replays the
+ * announcement to the callee (sustained masking). When audio returns to
+ * normal, re-injection stops on the next clean 1s window and any in-progress
+ * 4s loop finishes naturally. Every injection is counted;
+ * SPEAKERPHONE_SUSPECTED event WRITES are throttled to one per
+ * noiseEventThrottleMs() (default 30s) per episode while the announce
  * re-injection itself is unthrottled.
  *
  * Best-effort throughout: any failure is logged (and recorded as a
@@ -1583,7 +1633,7 @@ export async function injectChallengeNoise(
     const injection = (noiseInjectionCount.get(sessionId) ?? 0) + 1;
     noiseInjectionCount.set(sessionId, injection);
     // Throttle the DB event writes to max 1 per noiseEventThrottleMs() (30s)
-    // — the noise itself re-injects every ~8s while suspicion persists, and
+    // — the noise itself re-injects every ~4s while suspicion persists, and
     // a sustained suspicion must not flood verification_events.
     const lastEventAt = lastNoiseEventAt.get(sessionId) ?? -Infinity;
     if (Date.now() - lastEventAt >= noiseEventThrottleMs()) {

@@ -6,14 +6,14 @@ import { compareClips, relayFingerprint } from "./compare";
 import { SpeakerphoneDetector } from "./speakerphone-detector";
 
 describe("relayguard vendored DSP (Node)", () => {
-  it("challengeNoiseWav renders a valid 8kHz mono PCM16 WAV and caches", () => {
+  it("challengeNoiseWav renders the exact 4s 70% probe as a valid 8kHz WAV and caches", () => {
     const wav = challengeNoiseWav();
     expect(wav.subarray(0, 4).toString("ascii")).toBe("RIFF");
     expect(wav.subarray(8, 12).toString("ascii")).toBe("WAVE");
     expect(wav.readUInt32LE(24)).toBe(8000);
     expect(wav.readUInt16LE(22)).toBe(1);
     expect(wav.readUInt16LE(34)).toBe(16);
-    expect(wav.length).toBe(44 + 3 * 8000 * 2);
+    expect(wav.length).toBe(44 + 4 * 8000 * 2);
     expect(challengeNoiseWav()).toBe(wav); // cached identity
     // non-silent
     let peak = 0;
@@ -23,8 +23,8 @@ describe("relayguard vendored DSP (Node)", () => {
 
   it("probe helpers work at 8kHz", () => {
     expect(generateProbe(1, 8000).length).toBe(8000);
-    expect(generateProbeLoop(3, 8000).length).toBe(24000);
-    expect(probeGain(40)).toBeCloseTo(0.2);
+    expect(generateProbeLoop(4, 8000).length).toBe(32000);
+    expect(probeGain(70)).toBeCloseTo(0.35);
   });
 
   it("analyzeClip + compareClips + relayFingerprint run on 8kHz windows", () => {

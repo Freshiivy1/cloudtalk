@@ -881,7 +881,7 @@ describe("Leg A press-1 IVR", () => {
       (c) => String(c.url).includes("/twiml/leg-b") && String(c.url).includes(s.sessionId),
     );
     expect(legB?.timeout).toBe(15);
-    expect(body).toContain("Press 1 when you are ready to proceed");
+    expect(body).toContain("Press 1 to receive the second verification call");
     expect(body).toContain("/api/verify/gather/leg-a-ready?sid=");
   });
 
@@ -1301,13 +1301,16 @@ describe("guarded single-call flow", () => {
       "Please identify your voice. After the beep, say: my voice identifies me.",
     );
     expect(body).toContain(
-      "Thank you. You will receive another call shortly. Do not end this current call. Accept the next call to continue.",
+      "Thank you. Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
     );
     expect(body).toContain("<Record");
     expect(body).toContain(`/api/verify/voiceprint?sid=${s.sessionId}`);
-    expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
+    // Failed-action fallback: ask for the second press-1; do NOT park/hold or
+    // originate Leg B from the initial accept press.
+    expect(body).toContain("/api/verify/gather/leg-a-ready?sid=");
+    expect(body).not.toContain("/api/verify/twiml/leg-a-hold?sid=");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
-    // Leg B starts from the voiceprint action, not from the initial press-1.
+    // Leg B starts only from the SECOND press-1 after voice-ID, not here.
     expect(
       createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
     ).toBe(false);
@@ -1316,7 +1319,7 @@ describe("guarded single-call flow", () => {
     expect(types).toContain("GUARDED_VOICEPRINT_STEP");
   });
 
-  it("voiceprint action announces the second call and originates Leg B", async () => {
+  it("voiceprint action asks for a second press-1 and does NOT originate Leg B", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vp_caller",
@@ -1331,8 +1334,31 @@ describe("guarded single-call flow", () => {
     const body = await res.text();
     expect(res.status).toBe(200);
     expect(body).toContain(
-      "Thank you. You will receive another call shortly. Do not end this current call. Accept the next call to continue.",
+      "Thank you. Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
     );
+    expect(body).toContain("<Gather");
+    expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}&a=0`);
+    expect(body).not.toContain("/api/verify/twiml/leg-a-hold?sid=");
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
+    expect(
+      createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
+    ).toBe(false);
+  });
+
+  it("guarded second press-1 after voice-ID originates Leg B and parks Leg A", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vp2_caller",
+      legACallSid: "CA_vp2_legA",
+    });
+    const before = createdCalls.length;
+    const res = await postForm(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}&a=0`, {
+      CallSid: "CA_vp2_legA",
+      Digits: "1",
+    });
+    const body = await res.text();
+    expect(res.status).toBe(200);
+    expect(body).toContain("<Pause");
     expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_DIALING);
     expect(
