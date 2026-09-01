@@ -212,7 +212,7 @@ export class TwilioTelephonyProvider implements TelephonyProvider {
   }
 
   /* --------------------------- contract methods -------------------------- */
-  dial(number: string): void {
+  dial(number: string, extraParams?: Record<string, string>): void {
     if (!this.device || (this.state !== "idle" && this.state !== "ended")) return;
     const n = normalizePhoneNumber(number);
     if (!n) return;
@@ -229,8 +229,11 @@ export class TwilioTelephonyProvider implements TelephonyProvider {
     this.dtmfLog = [];
     this.state = "dialing";
     this.emitAll();
+    // extraParams ride along as custom connect params → POST body fields on
+    // the TwiML App voice webhook (e.g. guarded=<sessionId> for guarded
+    // inmate calls, which the webhook branches on before using `To`).
     this.device
-      .connect({ params: { To: n } })
+      .connect({ params: { To: n, ...extraParams } })
       .then((call) => {
         this.activeCall = call;
         this.wireCallEvents(call);

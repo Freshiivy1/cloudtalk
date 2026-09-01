@@ -167,11 +167,13 @@ export default function Softphone() {
   }, []);
   const [guardedStatus, setGuardedStatus] = useState<string | null>(null);
   const initiateGuarded = trpc.verification.initiateGuarded.useMutation({
-    onSuccess: () => {
-      setPending(null);
-      setGuardedStatus(
-        'Guarded call starting — answer the incoming call on this softphone, then follow the prompts.'
-      );
+    onSuccess: (data, vars) => {
+      // Guarded inmate call: NO incoming call. Place the outbound SDK call
+      // immediately, carrying the sessionId as the `guarded` custom param —
+      // the TwiML App voice webhook parks this leg in the session conference
+      // and starts the verification engine (Leg A dial).
+      setGuardedStatus('Please wait while we connect your call…');
+      t.dial(vars.calleeNumber, { guarded: data.sessionId });
     },
     onError: (err) => {
       setGuardedStatus(null);
@@ -246,8 +248,9 @@ export default function Softphone() {
       return;
     }
     if (guarded) {
-      // Guarded inmate call: route through the verification engine — the
-      // caller leg rings THIS softphone as an incoming Twilio Voice call.
+      // Guarded inmate call: create the verification session, then place an
+      // OUTBOUND softphone call (see the mutation's onSuccess) — the caller
+      // is parked in the guarded conference while the callee is verified.
       setPending('call');
       setGuardedStatus(null);
       initiateGuarded.mutate({ calleeNumber: n });

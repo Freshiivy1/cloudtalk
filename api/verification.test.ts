@@ -589,7 +589,9 @@ import { verificationStreamDetectedHandler, relayStreamUrl } from "./verificatio
 import {
   verificationStatusHandler,
   verificationTwimlHandler,
+  verificationVoiceprintHandler,
 } from "./verification-webhooks";
+import { voiceWebhookHandler } from "./twilio-voice";
 
 const hookApp = new Hono();
 hookApp.post("/api/verify/twiml/:kind", verificationTwimlHandler);
@@ -600,6 +602,10 @@ hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandle
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
 hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
 hookApp.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
+hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
+// TwiML App voice webhook (SDK outbound calls — guarded branch keys off the
+// `guarded` custom param).
+hookApp.post("/api/voice/twiml", voiceWebhookHandler);
 
 function postForm(url: string, data: Record<string, string> = {}) {
   return hookApp.request(url, {
@@ -1161,3 +1167,231 @@ describe("full flows (mocked Twilio)", () => {
   });
 });
 
+
+/* -------------------------------------------------------------------------- */
+/* Guarded single-call flow: outbound SDK caller, voice-ID prompt, voiceprint  */
+/* -------------------------------------------------------------------------- */
+
+describe("guarded single-call flow", () => {
+  it("initiate(callerClient) creates the session only — NO REST caller leg", async () => {
+    const before = createdCalls.length;
+    const s = await vs.initiate({ calleeNumber: "+61400000000", callerClient: "user-1" });
+    createdIds.push(s.sessionId);
+    expect(s.state).toBe(vs.VState.INITIATED);
+    expect(s.guarded).toBe(true);
+    expect(s.callerCallSid).toBeNull();
+    // No outbound REST call at all — the browser dials in via the SDK.
+    expect(
+      createdCalls.slice(before).some((c) => String(c.url).includes(s.sessionId)),
+    ).toBe(false);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("GUARDED_AWAITING_CALLER");
+  });
+
+  it("onGuardedCallerConnected: INITIATED → Leg A dialed, callerCallSid stored", async () => {
+    const s = await makeSession(vs.VState.INITIATED, { guarded: true });
+    expect(await vs.onGuardedCallerConnected(s.sessionId, "CA_sdk_caller")).toBe(true);
+    const after = (await vs.findSession(s.sessionId))!;
+    // CALLER_HOLDING then straight into Leg A origination.
+    expect(after.state).toBe(vs.VState.LEG_A_DIALING);
+    expect(after.callerCallSid).toBe("CA_sdk_caller");
+    expect(after.legACallSid).toMatch(/^CA_mock_/);
+    const legA = createdCalls.find(
+      (c) => String(c.url).includes("/twiml/leg-a?") && String(c.url).includes(s.sessionId),
+    );
+    expect(legA?.timeout).toBe(30);
+  });
+
+  it("onGuardedCallerConnected rejects non-guarded and wrong-state sessions", async () => {
+    const plain = await makeSession(vs.VState.INITIATED);
+    expect(await vs.onGuardedCallerConnected(plain.sessionId, "CA_x")).toBe(false);
+    expect((await vs.findSession(plain.sessionId))!.state).toBe(vs.VState.INITIATED);
+    const already = await makeSession(vs.VState.BRIDGED, { guarded: true });
+    expect(await vs.onGuardedCallerConnected(already.sessionId, "CA_y")).toBe(false);
+    expect((await vs.findSession(already.sessionId))!.state).toBe(vs.VState.BRIDGED);
+  });
+
+  it("voice webhook guarded branch parks the caller in the session conference", async () => {
+    const s = await makeSession(vs.VState.INITIATED, { guarded: true });
+    const res = await postForm("/api/voice/twiml", {
+      guarded: s.sessionId,
+      CallSid: "CA_sdk_wh",
+      To: "+61400000000",
+    });
+    const body = await res.text();
+    expect(res.status).toBe(200);
+    expect(body).toContain("Please wait while we connect your call.");
+    expect(body).toContain("<Conference");
+    expect(body).toContain(`verify-${s.sessionId}`);
+    expect(body).toContain('startConferenceOnEnter="false"');
+    // Engine advanced: caller stored, Leg A airborne.
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.callerCallSid).toBe("CA_sdk_wh");
+    expect(after.state).toBe(vs.VState.LEG_A_DIALING);
+  });
+
+  it("voice webhook guarded branch fails closed for unknown sessions", async () => {
+    const res = await postForm("/api/voice/twiml", {
+      guarded: "no-such-session",
+      CallSid: "CA_bad",
+    });
+    const body = await res.text();
+    expect(body).toContain("Verification failed");
+    expect(body).toContain("<Hangup");
+  });
+
+  it("voice webhook without the guarded param keeps the normal PSTN dial", async () => {
+    const res = await postForm("/api/voice/twiml", { To: "+61400000000" });
+    const body = await res.text();
+    expect(body).toContain("<Dial");
+    expect(body).toContain("+61400000000");
+    expect(body).not.toContain("<Conference");
+  });
+
+  it("guarded leg-a TwiML uses the monitored prompt; non-guarded keeps accept", async () => {
+    const g = await makeSession(vs.VState.LEG_A_DIALING, { guarded: true });
+    const gBody = await (
+      await postForm(`/api/verify/twiml/leg-a?sid=${g.sessionId}`)
+    ).text();
+    expect(gBody).toContain(
+      "This call is being monitored. Do not make any attempt of conference call. Press 1 to be connected to the inmate.",
+    );
+    expect(gBody).not.toContain("You are about to receive a call from an inmate");
+
+    const p = await makeSession(vs.VState.LEG_A_DIALING);
+    const pBody = await (
+      await postForm(`/api/verify/twiml/leg-a?sid=${p.sessionId}`)
+    ).text();
+    expect(pBody).toContain("You are about to receive a call from an inmate");
+    expect(pBody).not.toContain("This call is being monitored");
+  });
+
+  it("guarded press-1: voice-ID prompt + <Record> to /api/verify/voiceprint, NO Leg B", async () => {
+    const s = await makeSession(vs.VState.LEG_A_DIALING, { guarded: true });
+    const before = createdCalls.length;
+    const res = await postForm(`/api/verify/gather/leg-a-accept?sid=${s.sessionId}&a=0`, {
+      CallSid: "CA_lega_g",
+      Digits: "1",
+    });
+    const body = await res.text();
+    expect(res.status).toBe(200);
+    expect(body).toContain(
+      "Please identify your voice. After the beep, say: my name identifies me.",
+    );
+    expect(body).toContain("<Record");
+    expect(body).toContain(`/api/verify/voiceprint?sid=${s.sessionId}`);
+    expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
+    // No probe call in guarded mode.
+    expect(
+      createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
+    ).toBe(false);
+    expect((await vs.findSession(s.sessionId))!.legBCallSid).toBeNull();
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("GUARDED_VOICEPRINT_STEP");
+  });
+
+  it("voiceprint webhook keeps Leg A on hold and bridges after capture", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vp_caller",
+      legACallSid: "CA_vp_legA",
+    });
+    const pcm = new Int16Array(8000 * 2);
+    for (let i = 0; i < pcm.length; i++) {
+      pcm[i] = Math.round(8000 * Math.sin((2 * Math.PI * 200 * i) / 8000));
+    }
+    vi.stubGlobal(
+      "fetch",
+      async () => new Response(new Uint8Array(buildWav(pcm)), { status: 200 }),
+    );
+    try {
+      const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+        CallSid: "CA_vp_legA",
+        RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_vp",
+        RecordingDuration: "4",
+      });
+      const body = await res.text();
+      expect(res.status).toBe(200);
+      // The webhook ALWAYS keeps the leg on the hold loop.
+      expect(body).toContain("<Pause");
+      expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
+      await tick(600); // fire-and-forget capture + bridge
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.BRIDGED);
+      expect(vs.getVoiceBaseline(s.sessionId)).not.toBeNull();
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("VOICEPRINT_CAPTURED");
+      expect(types).toContain("GUARDED_BRIDGED");
+      // Both parties redirected into the live conference.
+      expect(
+        updatedCalls.some(
+          (u) => u.sid === "CA_vp_caller" && String(u.url).includes("guarded-bridge"),
+        ),
+      ).toBe(true);
+      expect(
+        updatedCalls.some(
+          (u) => u.sid === "CA_vp_legA" && String(u.url).includes("guarded-bridge"),
+        ),
+      ).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("voiceprint webhook with empty recording: VOICEPRINT_MISSED, bridges anyway", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vm_caller",
+      legACallSid: "CA_vm_legA",
+    });
+    const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+      CallSid: "CA_vm_legA",
+      RecordingDuration: "0",
+    });
+    expect(res.status).toBe(200);
+    await tick(300);
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+    expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("VOICEPRINT_MISSED");
+    expect(types).toContain("GUARDED_BRIDGED");
+  });
+
+  it("voiceprint capture failure: VOICEPRINT_MISSED, bridges anyway", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vf_caller",
+      legACallSid: "CA_vf_legA",
+    });
+    vi.stubGlobal("fetch", async () => new Response("nope", { status: 404 }));
+    try {
+      const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+        CallSid: "CA_vf_legA",
+        RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_gone",
+        RecordingDuration: "3",
+      });
+      expect(res.status).toBe(200);
+      await tick(2000); // 4 fetch attempts with 250ms backoff, then bridge
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("VOICEPRINT_MISSED");
+      expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("sweep fails guarded INITIATED sessions whose caller never connected (>2min)", async () => {
+    const staleGuarded = await makeSession(vs.VState.INITIATED, {
+      guarded: true,
+      createdAt: new Date(Date.now() - 3 * 60 * 1000),
+    });
+    const freshGuarded = await makeSession(vs.VState.INITIATED, { guarded: true });
+    await vs.sweepStaleSessions();
+    const after = (await vs.findSession(staleGuarded.sessionId))!;
+    expect(after.state).toBe(vs.VState.FAILED);
+    expect(after.failureReason).toContain("never connected");
+    expect((await vs.findSession(freshGuarded.sessionId))!.state).toBe(vs.VState.INITIATED);
+  });
+});

@@ -30,6 +30,8 @@ import path from "path";
 import * as vs from "./verification";
 import { legAStreamUrl, relayStreamUrl } from "./verification-stream";
 import { challengeNoiseWav } from "./relayguard/noise";
+import { wavToPcm16 } from "./verification-record";
+import { analyzeClip, type ClipProfile } from "./relayguard/features";
 
 /**
  * GET /api/verify/tone.wav — serves the in-band DTMF verification tone with a
@@ -171,7 +173,18 @@ export async function verificationTwimlHandler(c: Context) {
           action: vs.gatherLegAAcceptUrl(sid, a),
           method: "POST",
         });
-        gather.say(P.accept);
+        // GUARDED MODE ONLY: the monitored-call warning replaces the legacy
+        // accept prompt (single-call flow — no merge is possible by design,
+        // and any conference attempt breaks the bridge). Non-guarded keeps
+        // the exact legacy accept prompt. Best-effort lookup: any failure
+        // falls back to the legacy accept prompt rather than breaking the IVR.
+        let legAGuarded = false;
+        try {
+          legAGuarded = Boolean(sid && (await vs.findSession(sid))?.guarded);
+        } catch {
+          legAGuarded = false;
+        }
+        gather.say(legAGuarded ? P.monitored : P.accept);
         vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a", sid), a + 1));
         break;
       }
@@ -500,10 +513,29 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
       // Leg B itself, so we acknowledge and park Leg A on the hold loop
       // immediately. The leg-a-ready step remains in code for reference but
       // is no longer reachable from this flow.
-      await vs.onCallAccepted(sid, String(body.CallSid ?? ""));
-      vr.say("Thank you. Please stay on the line while your call is connected.");
-      vr.pause({ length: 60 });
-      vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
+      const session = await vs.onCallAccepted(sid, String(body.CallSid ?? ""));
+      if (session?.guarded) {
+        // GUARDED MODE ONLY: NO Leg B. Voice-ID prompt, then record the
+        // callee saying "my name identifies me" for the voice baseline; the
+        // /api/verify/voiceprint action webhook keeps the leg on the hold
+        // loop and bridges caller + callee once the recording is processed.
+        // (Verbs after <Record> are a fallback for a failed action fetch.)
+        const P = vs.verifyPrompts();
+        vr.say(P.voiceId);
+        vr.record({
+          maxLength: 8,
+          timeout: 3,
+          playBeep: true,
+          action: vs.voiceprintUrl(sid),
+          method: "POST",
+        });
+        vr.pause({ length: 60 });
+        vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
+      } else {
+        vr.say("Thank you. Please stay on the line while your call is connected.");
+        vr.pause({ length: 60 });
+        vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
+      }
     } else {
       // Wrong/partial digit → re-prompt (counts as an attempt).
       vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a", sid), a + 1));
@@ -537,6 +569,119 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
     console.error("[verify] leg-a-ready gather error:", err);
   }
   return xml(c, vr);
+}
+
+/* -------------------------------------------------------------------------- */
+/* GUARDED MODE ONLY: voiceprint <Record> action                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/verify/voiceprint?sid=… — action of the guarded voice-ID
+ * <Record> ("my name identifies me"). ALWAYS answers with the hold-loop
+ * TwiML so Leg A stays alive; the recording is then processed fire-and-forget
+ * (never blocking the webhook): fetch the WAV from Twilio, build the callee
+ * voice baseline (session-scoped, in-memory), log VOICEPRINT_CAPTURED, and
+ * bridge caller + Leg A into the conference. On any failure the event is
+ * VOICEPRINT_MISSED and the bridge still happens — the voiceprint is
+ * best-effort and never blocks the call.
+ */
+export async function verificationVoiceprintHandler(c: Context) {
+  const sid = c.req.query("sid") ?? "";
+  const vr = new VoiceResponse();
+  // Hold-loop TwiML FIRST so the leg is kept alive no matter what happens
+  // with the recording processing below (the bridge redirect arrives via REST).
+  try {
+    if (sid) {
+      vr.pause({ length: 60 });
+      vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
+    } else {
+      vr.hangup();
+    }
+  } catch (err) {
+    console.error("[verify] voiceprint hold-twiml error:", err);
+  }
+  try {
+    const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
+    const recordingUrl = String(body.RecordingUrl ?? "");
+    const durationSec = Number(body.RecordingDuration ?? 0);
+    const callSid = String(body.CallSid ?? "");
+    if (sid) {
+      void captureVoiceprintAndBridge(sid, recordingUrl, durationSec, callSid).catch(
+        (err) => console.error("[verify] voiceprint capture error:", err),
+      );
+    }
+  } catch (err) {
+    console.error("[verify] voiceprint handler error:", err);
+  }
+  return xml(c, vr);
+}
+
+/** Fetch + analyze the voiceprint recording, store the baseline, then bridge. */
+async function captureVoiceprintAndBridge(
+  sid: string,
+  recordingUrl: string,
+  durationSec: number,
+  callSid: string,
+): Promise<void> {
+  const session = await vs.findSession(sid);
+  if (!session || !session.guarded || vs.isTerminal(session)) return;
+  let captured = false;
+  if (recordingUrl && Number.isFinite(durationSec) && durationSec >= 1) {
+    try {
+      const profile = await fetchVoiceProfile(recordingUrl);
+      vs.setVoiceBaseline(sid, profile);
+      await vs.logEvent(
+        sid,
+        "VOICEPRINT_CAPTURED",
+        `recording=${recordingUrl} duration=${durationSec}s callSid=${callSid} ` +
+          `speechFrames=${profile.vad.speechFrames.length} voicedFrames=${profile.voicePrint.voicedFrames}`,
+      );
+      captured = true;
+    } catch (err) {
+      console.error(`[verify] VOICEPRINT_MISSED session=${sid}:`, err);
+    }
+  }
+  if (!captured) {
+    await vs.logEvent(
+      sid,
+      "VOICEPRINT_MISSED",
+      `recording=${recordingUrl || "(none)"} duration=${durationSec}s — bridging anyway (voiceprint is best-effort)`,
+    );
+  }
+  await vs.bridgeGuardedAfterVoiceprint(sid);
+}
+
+/** Download the Twilio recording as 8 kHz WAV and profile it (relayguard). */
+async function fetchVoiceProfile(recordingUrl: string): Promise<ClipProfile> {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID ?? "";
+  const authToken = process.env.TWILIO_AUTH_TOKEN ?? "";
+  const auth = `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`;
+  // Twilio sometimes lags making media available after the callback — retry
+  // briefly (same policy as the Leg B recording-chunk analysis).
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(`${recordingUrl}.wav`, {
+        headers: { Authorization: auth },
+      });
+      if (!res.ok) throw new Error(`recording fetch failed: ${res.status}`);
+      const pcm = wavToPcm16(Buffer.from(await res.arrayBuffer()));
+      // int16 → float, peak-normalized (same convention as SpeakerphoneDetector).
+      let peak = 0;
+      for (const s of pcm) {
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      const scale = peak > 0 ? 0.9 / peak : 1;
+      const samples = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i++) samples[i] = pcm[i] * scale;
+      return analyzeClip(samples, 8000);
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  throw lastErr;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -15,6 +15,7 @@ import {
   verificationStatusHandler,
   verificationToneHandler,
   verificationTwimlHandler,
+  verificationVoiceprintHandler,
 } from "./verification-webhooks";
 import { verificationRecordingHandler } from "./verification-record";
 import { verificationStreamDetectedHandler } from "./verification-stream";
@@ -34,6 +35,8 @@ app.post("/api/verify/gather/merge", verificationGatherHandler);
 app.post("/api/verify/gather/leg-a-accept", verificationGatherLegAAcceptHandler);
 app.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandler);
 app.post("/api/verify/recording/merge", verificationRecordingHandler);
+// GUARDED MODE ONLY: voice-ID <Record> action (voice baseline + bridge).
+app.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 app.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
 // Serve the in-band DTMF verification tone with a proper audio/wav Content-Type
 // (the generic static server returns octet-stream; Twilio refuses it — error 12300).

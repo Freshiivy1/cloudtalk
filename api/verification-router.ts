@@ -69,11 +69,13 @@ export const verificationRouter = createRouter({
 
   /**
    * Guarded inmate call (softphone mode): the agent dials a callee through
-   * the full verification engine, but the CALLER leg rings the agent's own
-   * browser softphone (Twilio Client) instead of a PSTN number. Speakerphone
-   * suspicion during the call triggers a caller-only challenge-noise
-   * announce — never a hangup. Any authed agent may use this (same auth as
-   * the softphone telephony router).
+   * the verification engine. This mutation ONLY creates the guarded session
+   * (state INITIATED) — the browser then places the caller leg itself as an
+   * OUTBOUND Twilio Voice SDK call carrying the sessionId as the `guarded`
+   * custom param, and the TwiML App voice webhook parks the caller in the
+   * session conference and starts Leg A. Speakerphone suspicion during the
+   * call triggers a callee-only challenge-noise announce — never a hangup.
+   * Any authed agent may use this (same auth as the softphone telephony router).
    */
   initiateGuarded: authedQuery
     .input(z.object({ calleeNumber: z.string().min(3).max(32) }))

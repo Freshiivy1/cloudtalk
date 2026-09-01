@@ -115,7 +115,12 @@ export type TelephonyHandler = (payload: unknown) => void;
  * a server-backed implementation of this same interface.
  */
 export interface TelephonyProvider {
-  dial(number: string): void;
+  /**
+   * Place an outbound call. `extraParams` are merged into the Twilio
+   * device.connect params (e.g. { guarded: sessionId } for guarded inmate
+   * calls); the simulated provider ignores them.
+   */
+  dial(number: string, extraParams?: Record<string, string>): void;
   answer(): void;
   hangup(): void;
   toggleMute(): void;
@@ -728,7 +733,7 @@ export interface UseTelephony {
   snapshot: TelephonySnapshot;
   provider: AnyTelephonyProvider;
   /** The exact TelephonyProvider contract methods, bound. */
-  dial: (number: string) => void;
+  dial: (number: string, extraParams?: Record<string, string>) => void;
   answer: () => void;
   hangup: () => void;
   toggleMute: () => void;
@@ -795,7 +800,7 @@ export function useTelephony(): UseTelephony {
   return {
     snapshot,
     provider,
-    dial: (n) => provider.dial(n),
+    dial: (n, extra) => provider.dial(n, extra),
     answer: () => provider.answer(),
     hangup: () => provider.hangup(),
     toggleMute: () => provider.toggleMute(),

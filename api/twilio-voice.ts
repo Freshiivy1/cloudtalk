@@ -109,6 +109,40 @@ export async function voiceWebhookHandler(c: Context) {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const vr = new VoiceResponse();
 
+  // GUARDED INMATE CALL: the softphone placed an OUTBOUND SDK call carrying
+  // the verification sessionId as the `guarded` custom param (the `To` param
+  // is unused in this branch). Validate + advance the engine (stores the
+  // caller CallSid, INITIATED → CALLER_HOLDING, originates Leg A), then park
+  // the caller in the session conference exactly like the caller-hold TwiML.
+  // Dynamic import: verification.ts already imports this module statically.
+  const guardedSid = String(body.guarded ?? "").trim();
+  if (guardedSid) {
+    const vs = await import("./verification");
+    try {
+      vs.setRuntimeBaseUrl(new URL(c.req.url).origin);
+    } catch {
+      /* ignore */
+    }
+    let ok = false;
+    try {
+      ok = await vs.onGuardedCallerConnected(guardedSid, String(body.CallSid ?? ""));
+    } catch (err) {
+      console.error("[twilio] guarded caller connect error:", err);
+    }
+    if (ok) {
+      const P = vs.verifyPrompts();
+      vr.say(P.callerConnect);
+      vr.dial().conference(
+        { beep: "false", startConferenceOnEnter: false, endConferenceOnExit: false },
+        vs.conferenceName(guardedSid),
+      );
+    } else {
+      vr.say(vs.verifyPrompts().failed);
+      vr.hangup();
+    }
+    return c.text(vr.toString(), 200, { "Content-Type": "text/xml" });
+  }
+
   if (/^\+?\d{7,15}$/.test(to)) {
     vr.dial({ callerId: callerId || undefined, answerOnBridge: true }).number(
       to.startsWith("+") ? to : `+${to}`,

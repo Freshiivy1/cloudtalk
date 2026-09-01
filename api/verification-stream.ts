@@ -26,6 +26,8 @@ import { WebSocketServer, WebSocket } from "ws";
 import * as vs from "./verification";
 import { getTwilioClient } from "./twilio-voice";
 import { SpeakerphoneDetector } from "./relayguard/speakerphone-detector";
+import { analyzeClip } from "./relayguard/features";
+import { compareVoicePanel } from "./relayguard/voice";
 
 /**
  * POST /api/verify/stream-detected?sid=… — called by the EXTERNAL relay
@@ -167,6 +169,72 @@ export class MergeToneDetector {
   }
 }
 
+/**
+ * GUARDED MODE ONLY: in-call voice comparison against the callee voiceprint
+ * baseline captured by the /api/verify/voiceprint webhook. Buffers a rolling
+ * 6 s window of decoded PCM; every ~10 s of incoming audio it profiles the
+ * window (whole-clip extraction — the vendored panel has no incremental API)
+ * and runs compareVoicePanel(baseline, live). A 'different' consensus fires
+ * vs.onVoiceMismatch (VOICE_MISMATCH event, throttled 30 s, feeding the
+ * existing challenge-noise suspicion path). DETECTION ONLY — never hangs up.
+ * Entirely inert until a baseline exists for the session.
+ */
+class VoiceMatchMonitor {
+  /** Rolling analysis window: 6 s @ 8 kHz. */
+  private static readonly WINDOW_SAMPLES = 48_000;
+  /** Compare cadence: every ~10 s of incoming audio. */
+  private static readonly CHECK_EVERY_SAMPLES = 80_000;
+  private buf: number[] = [];
+  private sinceCheck = 0;
+
+  constructor(private readonly sid: string) {}
+
+  /** Feed one Twilio media payload (base64 μ-law, 8 kHz mono). */
+  push(payloadB64: string): void {
+    if (!this.sid || !vs.getVoiceBaseline(this.sid)) return; // no baseline yet
+    const bytes = Buffer.from(payloadB64, "base64");
+    for (const b of bytes) this.buf.push(decodeMulaw(b));
+    if (this.buf.length > VoiceMatchMonitor.WINDOW_SAMPLES) {
+      this.buf = this.buf.slice(-VoiceMatchMonitor.WINDOW_SAMPLES);
+    }
+    this.sinceCheck += bytes.length;
+    if (this.sinceCheck < VoiceMatchMonitor.CHECK_EVERY_SAMPLES) return;
+    this.sinceCheck = 0;
+    this.check();
+  }
+
+  private check(): void {
+    try {
+      const baseline = vs.getVoiceBaseline(this.sid);
+      if (!baseline) return;
+      const window = this.buf;
+      // int16 → float, peak-normalized (same convention as capture time).
+      let peak = 0;
+      for (const s of window) {
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      const scale = peak > 0 ? 0.9 / peak : 1;
+      const samples = new Float32Array(window.length);
+      for (let i = 0; i < window.length; i++) samples[i] = window[i] * scale;
+      const live = analyzeClip(samples, SAMPLE_RATE);
+      const panel = compareVoicePanel(baseline, live);
+      if (panel.consensus === "different") {
+        const detail =
+          `VOICE_MISMATCH consensus=different same=${panel.sameCount} ` +
+          `different=${panel.differentCount} abstain=${panel.abstainCount} — ` +
+          `live Leg A voice differs from the voiceprint baseline`;
+        void vs
+          .onVoiceMismatch(this.sid, detail)
+          .catch((err) => console.error("[verify-stream] onVoiceMismatch error:", err));
+      }
+    } catch (err) {
+      // DSP must never break the media path.
+      console.warn("[verify-stream] voice comparison failed:", (err as Error).message);
+    }
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* WebSocket server                                                             */
 /* -------------------------------------------------------------------------- */
@@ -250,6 +318,9 @@ export function attachVerificationStreamServer(server: HttpServer): void {
     // from here. Leg B merge detection runs on the external relay
     // (VERIFY_STREAM_URL), so no speakerphone detector attaches there.
     let spDetector: SpeakerphoneDetector | null = null;
+    // GUARDED MODE ONLY: voiceprint comparison — inert until the voice-ID
+    // recording sets a baseline for this session.
+    const voiceMonitor = new VoiceMatchMonitor(sid);
     let frames = 0;
     console.log(`[verify-stream] connected sid=${sid}`);
 
@@ -281,6 +352,7 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       if (msg.media.track && msg.media.track !== "inbound") return;
       frames++;
       spDetector?.push(msg.media.payload);
+      voiceMonitor.push(msg.media.payload);
       if (detector.push(msg.media.payload)) {
         console.log(
           `[verify-stream] MERGE TONE DETECTED sid=${sid} after ${frames} frames (~${frames * 20}ms of audio)`,

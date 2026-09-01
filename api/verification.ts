@@ -15,11 +15,13 @@
  *   POST {PUBLIC_BASE_URL}/api/verify/gather/merge?sid=...
  *   POST {PUBLIC_BASE_URL}/api/verify/gather/leg-a-accept?sid=...
  *   POST {PUBLIC_BASE_URL}/api/verify/gather/leg-a-ready?sid=...
+ *   POST {PUBLIC_BASE_URL}/api/verify/voiceprint?sid=...        (guarded only)
  */
 import { TRPCError } from "@trpc/server";
-import { and, eq, lt, notInArray } from "drizzle-orm";
+import { and, eq, lt, notInArray, or } from "drizzle-orm";
 import * as schema from "@db/schema";
 import type { VerificationSession } from "@db/schema";
+import type { ClipProfile } from "./relayguard/features";
 import { getDb } from "./queries/connection";
 import {
   getTwilioClient,
@@ -72,7 +74,11 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
   // is now pre-originated when Leg A is ANSWERED (zero ring latency) — so a
   // Leg B busy/fail/voicemail verdict can legitimately arrive before press-1.
   LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.CALL_WAITING_OFF, VState.FAILED],
-  CALL_ACCEPTED: [VState.CALLEE_READY, VState.CALL_WAITING_OFF, VState.FAILED],
+  // BRIDGED from CALL_ACCEPTED is GUARDED MODE ONLY (single-call flow: no
+  // Leg B, bridge right after the voiceprint step). Non-guarded sessions
+  // still only reach BRIDGED via LEG_B_ANSWERED — nothing invokes this edge
+  // for them, so their behavior is unchanged.
+  CALL_ACCEPTED: [VState.CALLEE_READY, VState.BRIDGED, VState.CALL_WAITING_OFF, VState.FAILED],
   CALLEE_READY: [VState.LEG_B_DIALING, VState.CALL_WAITING_OFF, VState.FAILED],
   LEG_B_DIALING: [
     VState.LEG_B_ANSWERED,
@@ -114,6 +120,8 @@ const SMS_WINDOW_SECONDS = 15;
  */
 export const MERGE_TONE_DIGIT = "9";
 const STALE_TIMEOUT_MS = 10 * 60 * 1000; // mirrors StaleSessionCleanupJob (10min)
+/** Guarded INITIATED sessions whose caller SDK call never arrived (2min). */
+const GUARDED_CALLER_TIMEOUT_MS = 2 * 60 * 1000;
 
 /**
  * Early Leg B answer buffer. Leg B is pre-originated the moment Leg A is
@@ -165,6 +173,47 @@ export function noiseEventThrottleMs(): number {
 }
 
 /**
+ * GUARDED MODE ONLY: session-scoped callee voice baseline. Captured from the
+ * post-press-1 voiceprint <Record> ("my name identifies me") by the
+ * /api/verify/voiceprint webhook and compared against live Leg A audio
+ * in-call (verification-stream.ts). In-memory only — the recording itself
+ * persists on Twilio and is referenced by the VOICEPRINT_CAPTURED event.
+ */
+const voiceBaselineBySession = new Map<string, ClipProfile>();
+
+/** Per-session wall-clock of the last VOICE_MISMATCH event write (throttle). */
+const lastVoiceMismatchAt = new Map<string, number>();
+
+/** Min ms between VOICE_MISMATCH event writes (default 30s). */
+export function voiceMismatchThrottleMs(): number {
+  const v = Number(process.env.VERIFY_VOICE_MISMATCH_THROTTLE_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 30_000;
+}
+
+export function setVoiceBaseline(sessionId: string, profile: ClipProfile): void {
+  voiceBaselineBySession.set(sessionId, profile);
+}
+
+export function getVoiceBaseline(sessionId: string): ClipProfile | null {
+  return voiceBaselineBySession.get(sessionId) ?? null;
+}
+
+/**
+ * In-call voice comparison fired on a 'different' consensus. Detection only —
+ * NEVER hangs up. Throttled to one event write per voiceMismatchThrottleMs();
+ * the detail carries VOICE_MISMATCH so it also feeds the existing
+ * challenge-noise suspicion path (injectChallengeNoise is BRIDGED-gated).
+ */
+export async function onVoiceMismatch(sessionId: string, detail: string): Promise<void> {
+  const last = lastVoiceMismatchAt.get(sessionId) ?? -Infinity;
+  if (Date.now() - last < voiceMismatchThrottleMs()) return;
+  lastVoiceMismatchAt.set(sessionId, Date.now());
+  console.warn(`[verify] VOICE_MISMATCH session=${sessionId} | ${detail}`);
+  await logEvent(sessionId, "VOICE_MISMATCH", detail);
+  await injectChallengeNoise(sessionId, `VOICE_MISMATCH ${detail}`);
+}
+
+/**
  * Drop all per-session in-process map entries. Call whenever a session reaches
  * a terminal state so these short-lived Maps can't grow unboundedly over the
  * process lifetime. Safe to call for unknown/already-cleaned sessionIds.
@@ -174,6 +223,8 @@ function cleanupSessionMaps(sessionId: string): void {
   mergeWatchArmedAt.delete(sessionId);
   noiseInjectionCount.delete(sessionId);
   lastNoiseEventAt.delete(sessionId);
+  voiceBaselineBySession.delete(sessionId);
+  lastVoiceMismatchAt.delete(sessionId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -233,6 +284,11 @@ export function gatherLegAReadyUrl(sessionId: string, attempt: number): string {
   return `${requirePublicBaseUrl()}/api/verify/gather/leg-a-ready?sid=${sessionId}&a=${attempt}`;
 }
 
+/** GUARDED MODE ONLY: voiceprint <Record> action — keeps the leg on hold. */
+export function voiceprintUrl(sessionId: string): string {
+  return `${requirePublicBaseUrl()}/api/verify/voiceprint?sid=${sessionId}`;
+}
+
 /** Self-redirecting hold TwiML that keeps Leg A alive after CALLEE_READY. */
 export function legAHoldUrl(sessionId: string): string {
   return twimlUrl("leg-a-hold", sessionId);
@@ -251,6 +307,19 @@ export function verifyPrompts() {
     accept:
       e.VERIFY_PROMPT_ACCEPT ??
       "You are about to receive a call from an inmate. Do not merge or transfer this call. Press 1 to accept.",
+    // GUARDED MODE ONLY (single-call flow): replaces `accept` on Leg A.
+    monitored:
+      e.VERIFY_PROMPT_MONITORED ??
+      "This call is being monitored. Do not make any attempt of conference call. Press 1 to be connected to the inmate.",
+    // GUARDED MODE ONLY: spoken after press-1, before the voiceprint <Record>.
+    voiceId:
+      e.VERIFY_PROMPT_VOICE_ID ??
+      "Please identify your voice. After the beep, say: my name identifies me.",
+    // GUARDED MODE ONLY: the softphone caller hears this after the outbound
+    // SDK call connects (parked in the conference while Leg A is verified).
+    callerConnect:
+      e.VERIFY_PROMPT_CALLER_CONNECT ??
+      "Please wait while we connect your call.",
     ready:
       e.VERIFY_PROMPT_READY ??
       "Thank you. Press 1 when you are ready to proceed.",
@@ -577,19 +646,19 @@ export async function initiate(
   const created = (await findSession(sessionId))!;
 
   if (input.callerClient) {
-    // Guarded inmate call: the caller leg rings the agent's browser softphone
-    // (Twilio Client address) and parks it in the same caller-hold flow.
-    const to = `client:${input.callerClient}`;
-    await logEvent(sessionId, "ORIGINATING_CALLER", `Originating caller (guarded, Twilio Client): ${to}`);
-    const callSid = await originate(created, "caller", to, "caller-hold", {
-      timeoutSec: 30,
-    });
-    if (!callSid) {
-      await failSession(created, "Caller origination failed");
-    } else {
-      created.callerCallSid = callSid;
-      await save(created);
-    }
+    // Guarded inmate call: NO REST-originated caller leg. The browser
+    // softphone places the OUTBOUND Twilio Voice SDK call itself right after
+    // this mutation returns, carrying the sessionId as the `guarded` custom
+    // param; the TwiML App voice webhook (voiceWebhookHandler) then calls
+    // onGuardedCallerConnected() which stores the caller CallSid, moves
+    // INITIATED → CALLER_HOLDING and originates Leg A. Until that connect
+    // arrives the session stays INITIATED — the stale sweep fails guarded
+    // INITIATED sessions whose caller never connects (>2 min).
+    await logEvent(
+      sessionId,
+      "GUARDED_AWAITING_CALLER",
+      `Guarded session created for Twilio Client ${input.callerClient} — awaiting outbound SDK connect`,
+    );
   } else if (input.callerNumber) {
     // Caller leg: park the caller in a conference with instructions.
     // CALL-FLOW.md originate timeouts: caller = 30s.
@@ -656,6 +725,79 @@ export async function onCallerAnswered(
 }
 
 /**
+ * GUARDED MODE ONLY: the caller's browser softphone placed the OUTBOUND
+ * Twilio Voice SDK call (device.connect with the `guarded` custom param =
+ * sessionId) and the TwiML App voice webhook handed it here. Validates the
+ * session, stores the caller CallSid, transitions INITIATED → CALLER_HOLDING
+ * and originates Leg A (exactly what onCallerAnswered did for the old
+ * REST-originated caller leg). Returns false when the session is not a
+ * guarded INITIATED session — the webhook then plays the failure prompt.
+ */
+export async function onGuardedCallerConnected(
+  sessionId: string,
+  callSid: string,
+): Promise<boolean> {
+  const session = await findSession(sessionId);
+  if (!session || !session.guarded) {
+    console.warn(`[verify] GUARDED_CALLER_REJECTED sessionId=${sessionId} — unknown or non-guarded session`);
+    return false;
+  }
+  if (session.state !== VState.INITIATED) {
+    console.warn(
+      `[verify] GUARDED_CALLER_REJECTED sessionId=${sessionId} state=${session.state} — expected INITIATED (duplicate or stale connect)`,
+    );
+    return false;
+  }
+  if (
+    await transition(
+      session,
+      VState.CALLER_HOLDING,
+      `Guarded caller connected via outbound SDK call, sid=${callSid}`,
+    )
+  ) {
+    session.callerCallSid = callSid;
+    await save(session);
+    await originateAndDialLegA(session);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * GUARDED MODE ONLY: bridge after the voiceprint step. In the single-call
+ * guarded flow there is NO Leg B (merge/leg-a-tone machinery unreachable);
+ * the callee pressed 1 (CALL_ACCEPTED) and recorded the voice-ID prompt, so
+ * the caller + Leg A are bridged into conference verify-<sid> right away.
+ * Idempotent: any later invocation is a no-op because the session has left
+ * CALL_ACCEPTED. NON-GUARDED sessions return immediately.
+ */
+export async function bridgeGuardedAfterVoiceprint(sessionId: string): Promise<boolean> {
+  const session = await findSession(sessionId);
+  if (!session || !session.guarded) return false;
+  if (session.state !== VState.CALL_ACCEPTED) return false; // already bridged/terminal
+  if (
+    await transition(
+      session,
+      VState.BRIDGED,
+      "voiceprint step complete — live guarded bridge (single-call flow)",
+    )
+  ) {
+    await logEvent(
+      sessionId,
+      "GUARDED_BRIDGED",
+      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A media stream persists`,
+    );
+    // Bridge the two real parties into the same conference (LIVE, two-way).
+    // Leg A's <Start><Stream> survives the redirect, so speakerphone/voice
+    // detection keeps running in-call.
+    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
+    await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
+    return true;
+  }
+  return false;
+}
+
+/**
  * Leg A's phone was picked up (Twilio status in-progress) — pre-originate
  * Leg B RIGHT NOW. PSTN origination to a busy line takes ~5-15s, so firing
  * here means the second call arrives around the first press-1 and is
@@ -680,6 +822,8 @@ export async function onLegAAnswered(
   );
 
   if (session.legBCallSid) return; // already airborne (e.g. retry)
+  // GUARDED MODE ONLY: no probe call — single callee call, then voiceprint.
+  if (session.guarded) return;
   const legBSid = await originate(session, "legB", session.legBNumber ?? session.calleeNumber, "leg-b", {
     timeoutSec: 15,
     machineDetection: true,
@@ -700,13 +844,17 @@ export async function onLegAAnswered(
   }
 }
 
-/** First press-1 (callee accepted the inmate call) → CALL_ACCEPTED. */
+/**
+ * First press-1 (callee accepted the inmate call) → CALL_ACCEPTED.
+ * Returns the session row (callers may ignore it) so webhook handlers can
+ * branch on `guarded` without a second DB read.
+ */
 export async function onCallAccepted(
   sessionId: string,
   callSid: string,
-): Promise<void> {
+): Promise<VerificationSession | null> {
   const session = await findSession(sessionId);
-  if (!session) return;
+  if (!session) return null;
   if (
     await transition(session, VState.CALL_ACCEPTED, `Callee accepted, legA=${callSid}`)
   ) {
@@ -716,8 +864,19 @@ export async function onCallAccepted(
     // rings during prompt 2 and arrives at the second "ready" press. (Firing
     // earlier — at answer — made the second call arrive before the callee had
     // accepted, which is not the intended flow.)
-    await originateLegB(sessionId);
+    // GUARDED MODE ONLY: NO Leg B — the single-call flow plays the voice-ID
+    // prompt + voiceprint <Record> instead, then bridges from CALL_ACCEPTED.
+    if (!session.guarded) {
+      await originateLegB(sessionId);
+    } else {
+      await logEvent(
+        sessionId,
+        "GUARDED_VOICEPRINT_STEP",
+        "callee accepted — voice-ID prompt + recording next (Leg B skipped in guarded mode)",
+      );
+    }
   }
+  return session;
 }
 
 /**
@@ -746,6 +905,9 @@ export async function onCalleeReady(sessionId: string): Promise<void> {
 async function originateLegB(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
   if (!session) return;
+  // GUARDED MODE ONLY: Leg B / merge-detect machinery is unreachable — the
+  // single-call flow bridges from CALL_ACCEPTED after the voiceprint step.
+  if (session.guarded) return;
   if (session.state === VState.LEG_B_DIALING || session.state === VState.LEG_B_ANSWERED) {
     return;
   }
@@ -1268,6 +1430,12 @@ export async function terminate(sessionId: string): Promise<void> {
  */
 export async function sweepStaleSessions(): Promise<number> {
   const cutoff = new Date(Date.now() - STALE_TIMEOUT_MS);
+  // Guarded sessions whose caller never connected: the browser places the
+  // outbound SDK call immediately after initiateGuarded returns, so a
+  // guarded session still INITIATED after ~2 min means the connect never
+  // arrived (tab closed, SDK failure) — fail it fast instead of waiting out
+  // the 10-minute generic window.
+  const guardedCallerCutoff = new Date(Date.now() - GUARDED_CALLER_TIMEOUT_MS);
   const stale = await getDb()
     .select()
     .from(schema.verificationSessions)
@@ -1280,14 +1448,28 @@ export async function sweepStaleSessions(): Promise<number> {
           ...TERMINAL_STATES,
           VState.BRIDGED,
         ]),
-        lt(schema.verificationSessions.createdAt, cutoff),
+        or(
+          lt(schema.verificationSessions.createdAt, cutoff),
+          and(
+            eq(schema.verificationSessions.guarded, true),
+            eq(schema.verificationSessions.state, VState.INITIATED),
+            lt(schema.verificationSessions.createdAt, guardedCallerCutoff),
+          ),
+        ),
       ),
     );
   for (const s of stale) {
+    const neverConnected =
+      s.guarded && s.state === VState.INITIATED && s.createdAt < guardedCallerCutoff;
     console.warn(
       `[verify] STALE_CLEANUP terminating sessionId=${s.sessionId} state=${s.state} created=${s.createdAt.toISOString()}`,
     );
-    await failSession(s, "Stale session cleanup (>10min)");
+    await failSession(
+      s,
+      neverConnected
+        ? "Guarded caller never connected (>2min)"
+        : "Stale session cleanup (>10min)",
+    );
   }
   return stale.length;
 }
