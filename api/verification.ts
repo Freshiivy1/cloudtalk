@@ -284,6 +284,11 @@ export function gatherLegAReadyUrl(sessionId: string, attempt: number): string {
   return `${requirePublicBaseUrl()}/api/verify/gather/leg-a-ready?sid=${sessionId}&a=${attempt}`;
 }
 
+/** GUARDED MODE ONLY: # confirmation gather after the voice-ID recording. */
+export function voiceConfirmUrl(sessionId: string, attempt: number): string {
+  return `${requirePublicBaseUrl()}/api/verify/gather/voice-confirm?sid=${sessionId}&a=${attempt}`;
+}
+
 /** GUARDED MODE ONLY: voiceprint <Record> action — keeps the leg on hold. */
 export function voiceprintUrl(sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/voiceprint?sid=${sessionId}`;
@@ -315,6 +320,9 @@ export function verifyPrompts() {
     voiceId:
       e.VERIFY_PROMPT_VOICE_ID ??
       "Please identify your voice. After the beep, say: my name identifies me.",
+    voiceConfirm:
+      e.VERIFY_PROMPT_VOICE_CONFIRM ??
+      "Thank you. Press hash to be connected to the inmate.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
@@ -577,19 +585,27 @@ async function waitForConferenceParticipant(
 ): Promise<string | null> {
   if (!callSid) return null;
   const deadline = Date.now() + timeoutMs;
+  let consecutiveErrors = 0;
   while (Date.now() < deadline) {
-    const confSid = await liveConferenceSid(sessionId);
-    if (confSid) {
-      try {
+    try {
+      const confs = await getTwilioClient().conferences.list({
+        friendlyName: conferenceName(sessionId),
+        status: "in-progress",
+        limit: 5,
+      });
+      for (const conf of confs) {
         const parts = await getTwilioClient()
-          .conferences(confSid)
+          .conferences(conf.sid)
           .participants.list({ limit: 20 });
-        if (parts.some((p) => p.callSid === callSid)) return confSid;
-      } catch {
-        /* retry */
+        if (parts.some((p) => p.callSid === callSid)) return conf.sid;
       }
+      consecutiveErrors = 0;
+    } catch {
+      // API path broken (or mocked) — don't stall the bridge on it.
+      consecutiveErrors++;
+      if (consecutiveErrors >= 3) return null;
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 750));
   }
   return null;
 }
@@ -819,7 +835,17 @@ export async function onGuardedCallerConnected(
  * Idempotent: any later invocation is a no-op because the session has left
  * CALL_ACCEPTED. NON-GUARDED sessions return immediately.
  */
-export async function bridgeGuardedAfterVoiceprint(sessionId: string): Promise<boolean> {
+/**
+ * GUARDED MODE ONLY: callee pressed # after the voice-ID recording.
+ * Transitions CALL_ACCEPTED → BRIDGED. Leg A joins the conference INLINE
+ * via the confirm handler's own TwiML response (single conference creator —
+ * avoids the duplicate-friendly-name race entirely); this function then
+ * polls until Twilio confirms Leg A's participation and REST-redirects the
+ * caller leg (parked in the non-blocking caller-wait pause loop) into the
+ * bridge. The poll+redirect runs fire-and-forget so the webhook can answer
+ * Leg A immediately.
+ */
+export async function confirmAndBridgeGuarded(sessionId: string): Promise<boolean> {
   const session = await findSession(sessionId);
   if (!session || !session.guarded) return false;
   if (session.state !== VState.CALL_ACCEPTED) return false; // already bridged/terminal
@@ -827,36 +853,25 @@ export async function bridgeGuardedAfterVoiceprint(sessionId: string): Promise<b
     await transition(
       session,
       VState.BRIDGED,
-      "voiceprint step complete — live guarded bridge (single-call flow)",
+      "voiceprint confirmed (#) — live guarded bridge (single-call flow)",
     )
   ) {
     await logEvent(
       sessionId,
       "GUARDED_BRIDGED",
-      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A media stream persists`,
+      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A joins inline, caller via REST redirect after participant confirmation`,
     );
-    // Bridge the two real parties into the same conference (LIVE, two-way)
-    // SEQUENTIALLY — firing both redirects at once races Twilio's
-    // friendly-name matching and can spawn TWO conferences with the same
-    // name (observed in prod: each party alone in its own conference).
-    // 1) Leg A joins first and creates the single in-progress conference
-    //    (guarded-bridge TwiML uses startConferenceOnEnter=true).
-    // 2) Only once Twilio confirms Leg A is a participant do we move the
-    //    caller — joining an IN-PROGRESS conference by name is reliable.
-    // Leg A's <Start><Stream> survives the redirect, so speakerphone/voice
-    // detection keeps running in-call.
-    await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
-    const confSid = await waitForConferenceParticipant(
-      sessionId,
-      session.legACallSid,
-      12_000,
-    );
-    if (!confSid) {
-      console.warn(
-        `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within 12s; redirecting caller anyway`,
-      );
-    }
-    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
+    const callerSid = session.callerCallSid;
+    const legASid = session.legACallSid;
+    void (async () => {
+      const confSid = await waitForConferenceParticipant(sessionId, legASid, 20_000);
+      if (!confSid) {
+        console.warn(
+          `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within 20s; redirecting caller anyway`,
+        );
+      }
+      await redirectCall(callerSid, "guarded-bridge", sessionId);
+    })().catch((err) => console.error("[verify] guarded caller bridge error:", err));
     return true;
   }
   return false;

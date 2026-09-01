@@ -52,18 +52,27 @@ vi.mock("twilio", async (importOriginal) => {
         },
       },
     ),
-    conferences: (name: string) => ({
-      participants: (participantSid: string) => ({
-        update: async (opts: { announceUrl?: string; announceMethod?: string }) => {
-          twilioMock.participantUpdates.push({
-            conference: name,
-            participant: participantSid,
-            ...opts,
-          });
-          return {};
-        },
+    conferences: Object.assign(
+      (name: string) => ({
+        participants: (participantSid: string) => ({
+          update: async (opts: { announceUrl?: string; announceMethod?: string }) => {
+            twilioMock.participantUpdates.push({
+              conference: name,
+              participant: participantSid,
+              ...opts,
+            });
+            return {};
+          },
+        }),
       }),
-    }),
+      {
+        // Engine resolves the live conference SID by friendly name first
+        // (conferences are addressable by SID only on the real API).
+        list: async (opts?: { friendlyName?: string }) => [
+          { sid: opts?.friendlyName ?? "CF_mock" },
+        ],
+      },
+    ),
   };
   const factory = (() => fakeClient) as unknown as typeof realTwilio;
   // verification-webhooks.ts uses twilio.twiml.VoiceResponse for real TwiML.
@@ -261,7 +270,8 @@ describe("state machine", () => {
 
 describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
   it("targets the Leg A (callee) conference participant and never hangs up/redirects", async () => {
-    const s = await makeSession(vs.VState.CALLER_HOLDING, {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
       callerCallSid: "CA_noise_caller",
       legACallSid: "CA_noise_legA",
     });
@@ -589,6 +599,7 @@ import { verificationStreamDetectedHandler, relayStreamUrl } from "./verificatio
 import {
   verificationStatusHandler,
   verificationTwimlHandler,
+  verificationVoiceConfirmHandler,
   verificationVoiceprintHandler,
 } from "./verification-webhooks";
 import { voiceWebhookHandler } from "./twilio-voice";
@@ -599,10 +610,11 @@ hookApp.post("/api/verify/status/:leg", verificationStatusHandler);
 hookApp.post("/api/verify/gather/merge", verificationGatherHandler);
 hookApp.post("/api/verify/gather/leg-a-accept", verificationGatherLegAAcceptHandler);
 hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandler);
+hookApp.post("/api/verify/gather/voice-confirm", verificationVoiceConfirmHandler);
+hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
 hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
 hookApp.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
-hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 // TwiML App voice webhook (SDK outbound calls — guarded branch keys off the
 // `guarded` custom param).
 hookApp.post("/api/voice/twiml", voiceWebhookHandler);
@@ -1291,7 +1303,7 @@ describe("guarded single-call flow", () => {
     expect(types).toContain("GUARDED_VOICEPRINT_STEP");
   });
 
-  it("voiceprint webhook keeps Leg A on hold and bridges after capture", async () => {
+  it("voiceprint webhook stashes audio + serves # gather; confirm saves baseline and bridges", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vp_caller",
@@ -1313,17 +1325,30 @@ describe("guarded single-call flow", () => {
       });
       const body = await res.text();
       expect(res.status).toBe(200);
-      // The webhook ALWAYS keeps the leg on the hold loop.
-      expect(body).toContain("<Pause");
-      expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
-      await tick(600); // fire-and-forget capture + bridge
+      // The webhook asks for # (finishOnKey disabled so hash is a digit)…
+      expect(body).toContain("/api/verify/gather/voice-confirm");
+      expect(body).toContain('finishOnKey=""');
+      // …and NOTHING is saved or bridged before the # press.
+      expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
+
+      // Callee presses # → audio saved, session bridged, Leg A joins inline.
+      const res2 = await postForm(
+        `/api/verify/gather/voice-confirm?sid=${s.sessionId}`,
+        { Digits: "#" },
+      );
+      const body2 = await res2.text();
+      expect(res2.status).toBe(200);
+      expect(body2).toContain(`verify-${s.sessionId}`); // inline <Dial><Conference>
+      await tick(3500); // capture + participant-poll breaker + caller redirect
       const after = (await vs.findSession(s.sessionId))!;
       expect(after.state).toBe(vs.VState.BRIDGED);
       expect(vs.getVoiceBaseline(s.sessionId)).not.toBeNull();
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).toContain("VOICEPRINT_CAPTURED");
       expect(types).toContain("GUARDED_BRIDGED");
-      // Both parties redirected into the live conference.
+      // Caller is REST-redirected into the live conference after participant
+      // confirmation; Leg A joined via its own TwiML (no REST redirect).
       expect(
         updatedCalls.some(
           (u) => u.sid === "CA_vp_caller" && String(u.url).includes("guarded-bridge"),
@@ -1333,24 +1358,27 @@ describe("guarded single-call flow", () => {
         updatedCalls.some(
           (u) => u.sid === "CA_vp_legA" && String(u.url).includes("guarded-bridge"),
         ),
-      ).toBe(true);
+      ).toBe(false);
     } finally {
       vi.unstubAllGlobals();
     }
   });
 
-  it("voiceprint webhook with empty recording: VOICEPRINT_MISSED, bridges anyway", async () => {
+  it("voiceprint with empty recording: # confirm → VOICEPRINT_MISSED, bridges anyway", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vm_caller",
       legACallSid: "CA_vm_legA",
     });
-    const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+    await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
       CallSid: "CA_vm_legA",
       RecordingDuration: "0",
     });
+    const res = await postForm(`/api/verify/gather/voice-confirm?sid=${s.sessionId}`, {
+      Digits: "#",
+    });
     expect(res.status).toBe(200);
-    await tick(300);
+    await tick(500);
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
     expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
     const types = (await events(s.sessionId)).map((e) => e.eventType);
@@ -1358,7 +1386,7 @@ describe("guarded single-call flow", () => {
     expect(types).toContain("GUARDED_BRIDGED");
   });
 
-  it("voiceprint capture failure: VOICEPRINT_MISSED, bridges anyway", async () => {
+  it("voiceprint fetch failure: # confirm → VOICEPRINT_MISSED, bridges anyway", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vf_caller",
@@ -1366,13 +1394,16 @@ describe("guarded single-call flow", () => {
     });
     vi.stubGlobal("fetch", async () => new Response("nope", { status: 404 }));
     try {
-      const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+      await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
         CallSid: "CA_vf_legA",
         RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_gone",
         RecordingDuration: "3",
       });
+      const res = await postForm(`/api/verify/gather/voice-confirm?sid=${s.sessionId}`, {
+        Digits: "#",
+      });
       expect(res.status).toBe(200);
-      await tick(2000); // 4 fetch attempts with 250ms backoff, then bridge
+      await tick(2500); // 4 fetch attempts with 250ms backoff
       expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).toContain("VOICEPRINT_MISSED");
