@@ -211,6 +211,22 @@ export const verificationSessions = mysqlTable(
     toneDetectedAt: timestamp("toneDetectedAt"),
     /** true once an SMS has been dispatched — prevents duplicate sends */
     smsSent: boolean("smsSent").default(false).notNull(),
+    /**
+     * GUARDED MODE ONLY: the explicit voice-ID <Record> clip ("my voice
+     * identifies me") — Twilio recording URL (auth-protected) + duration so
+     * the call-review UI can play it back through the audio proxy.
+     */
+    voiceRecordingUrl: varchar("voiceRecordingUrl", { length: 512 }),
+    voiceRecordingDurationSec: int("voiceRecordingDurationSec"),
+    voiceRecordedAt: timestamp("voiceRecordedAt"),
+    /**
+     * GUARDED MODE ONLY: the live bridge conference recording (record-from-
+     * start) — the full two-way conversation for call review.
+     */
+    bridgeRecordingSid: varchar("bridgeRecordingSid", { length: 64 }),
+    bridgeRecordingUrl: varchar("bridgeRecordingUrl", { length: 512 }),
+    bridgeRecordingDurationSec: int("bridgeRecordingDurationSec"),
+    bridgeRecordedAt: timestamp("bridgeRecordedAt"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     completedAt: timestamp("completedAt"),
     failureReason: varchar("failureReason", { length: 512 }),

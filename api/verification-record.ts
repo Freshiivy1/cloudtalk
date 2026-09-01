@@ -13,6 +13,8 @@ import type { Context } from "hono";
 import { goertzelPower, windowEnergy } from "./verification-stream";
 import * as vs from "./verification";
 import { getTwilioClient } from "./twilio-voice";
+import { authenticateRequest } from "./kimi/auth";
+import { isAuthDisabled } from "./local-auth";
 
 /* -------------------------------------------------------------------------- */
 /* WAV + tone analysis (pure, unit-tested)                                      */
@@ -102,6 +104,73 @@ export async function verificationRecordingHandler(c: Context) {
     console.error("[verify-record] handler error:", err);
   }
   return c.text("ok", 200); // Twilio must always get 200
+}
+
+/* -------------------------------------------------------------------------- */
+/* Call review — bridge recording callback + authenticated playback proxy       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/verify/recording/bridge?sid=… — Twilio posts the finished
+ * guarded-bridge conference recording here when the live call ends
+ * (record-from-start on the guarded-bridge Conference noun).
+ */
+export async function verificationBridgeRecordingHandler(c: Context) {
+  try {
+    const sid = c.req.query("sid") ?? "";
+    const body = await c.req.parseBody();
+    const recordingSid = String(body.RecordingSid ?? "");
+    const recordingUrl = String(body.RecordingUrl ?? "");
+    const durationSec = Number(body.RecordingDuration ?? 0);
+    if (sid && recordingUrl) {
+      await vs.storeBridgeRecording(sid, { recordingSid, recordingUrl, durationSec });
+    }
+  } catch (err) {
+    console.error("[verify-record] bridge recording handler error:", err);
+  }
+  return c.text("ok", 200); // Twilio must always get 200
+}
+
+/**
+ * GET /api/verify/recording/:sid/:kind — authenticated playback proxy for
+ * call review (kind = "voice" | "bridge"). Twilio recording media requires
+ * account basic-auth the browser does not have, so this streams the MP3
+ * through under the app's own session cookie. Admin-only, matching the
+ * verification tRPC router; open-access mode (AUTH_DISABLED) passes through.
+ */
+export async function verificationRecordingAudioHandler(c: Context) {
+  if (!isAuthDisabled()) {
+    const user = await authenticateRequest(c.req.raw.headers).catch(() => undefined);
+    if (!user || user.role !== "admin") return c.text("forbidden", 403);
+  }
+  const sid = c.req.param("sid") ?? "";
+  const kind = c.req.param("kind") ?? "";
+  const session = sid ? await vs.findSession(sid).catch(() => null) : null;
+  const url =
+    kind === "voice"
+      ? session?.voiceRecordingUrl
+      : kind === "bridge"
+        ? session?.bridgeRecordingUrl
+        : null;
+  if (!url) return c.text("not found", 404);
+
+  const accountSid = process.env.TWILIO_ACCOUNT_SID ?? "";
+  const authToken = process.env.TWILIO_AUTH_TOKEN ?? "";
+  const auth = `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString("base64")}`;
+  try {
+    const res = await fetch(`${url}.mp3`, { headers: { Authorization: auth } });
+    if (!res.ok || !res.body) return c.text("recording unavailable", 502);
+    const headers: Record<string, string> = {
+      "Content-Type": "audio/mpeg",
+      "Cache-Control": "private, max-age=3600",
+    };
+    const len = res.headers.get("content-length");
+    if (len) headers["Content-Length"] = len;
+    return new Response(res.body, { status: 200, headers });
+  } catch (err) {
+    console.error("[verify-record] audio proxy error:", err);
+    return c.text("recording unavailable", 502);
+  }
 }
 
 /** Download a Twilio recording as WAV and scan it for the merge tone. */

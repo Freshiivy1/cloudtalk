@@ -145,6 +145,21 @@ describe("normalizeE164", () => {
   });
 });
 
+describe("merge watch window", () => {
+  it("defaults to 60s so the callee has time to merge (env-overridable)", () => {
+    const saved = process.env.VERIFY_MERGE_WATCH_MS;
+    delete process.env.VERIFY_MERGE_WATCH_MS;
+    try {
+      expect(vs.mergeWatchMs()).toBe(60_000);
+      process.env.VERIFY_MERGE_WATCH_MS = "5000";
+      expect(vs.mergeWatchMs()).toBe(5_000);
+    } finally {
+      if (saved === undefined) delete process.env.VERIFY_MERGE_WATCH_MS;
+      else process.env.VERIFY_MERGE_WATCH_MS = saved;
+    }
+  });
+});
+
 describe("state machine", () => {
   it("COMPLETED: Leg B hangs up during LEG_B_ANSWERED", async () => {
     const s = await makeSession(vs.VState.LEG_B_ANSWERED);
@@ -188,6 +203,40 @@ describe("state machine", () => {
     expect(after.state).toBe(vs.VState.CALL_WAITING_OFF);
     // no caller leg → detection treated as confirmed, SMS queued once
     expect(after.smsSent).toBe(true);
+  });
+
+  it("guarded: late async-AMD machine verdict after Leg B answer is log-only", async () => {
+    // With asyncAmd the machine verdict arrives AFTER the answer callback took
+    // the human path — and the call-waiting switch beep is a classic AMD
+    // false positive. The second call must NOT be killed mid-verification.
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_amd_caller",
+      legACallSid: "CA_amd_legA",
+      legBCallSid: "CA_amd_legB",
+    });
+    await vs.onVoicemailDetected(s.sessionId, "machine_end_beep");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.LEG_B_ANSWERED);
+    // Leg B stays up — no hangup, no redirect, no call-waiting announcements.
+    expect(updatedCalls.some((u) => u.sid === "CA_amd_legB")).toBe(false);
+    expect(updatedCalls.some((u) => u.sid === "CA_amd_legA")).toBe(false);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("AMD_LATE_MACHINE_IGNORED");
+  });
+
+  it("non-guarded: AMD machine verdict still ends the call (legacy)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      callerCallSid: "CA_amdn_caller",
+      legACallSid: "CA_amdn_legA",
+      legBCallSid: "CA_amdn_legB",
+    });
+    await vs.onVoicemailDetected(s.sessionId, "machine_end_beep");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.CALL_WAITING_OFF);
+    expect(updatedCalls.some((u) => u.sid === "CA_amdn_legB" && u.status === "completed")).toBe(
+      true,
+    );
   });
 
   it("CALL_WAITING_OFF: caller hangs up during LEG_B_ANSWERED (SMS queued)", async () => {
@@ -609,6 +658,13 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(body).not.toContain("<Hangup");
   });
 
+  it("guarded-bridge TwiML records the conference for call review", async () => {
+    const res = await postForm("/api/verify/twiml/guarded-bridge?sid=abc123");
+    const body = await res.text();
+    expect(body).toContain('record="record-from-start"');
+    expect(body).toContain("/api/verify/recording/bridge?sid=abc123");
+  });
+
   it("leg-a-tone loop serves the bridge inline once a guarded session is BRIDGED", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
@@ -663,7 +719,11 @@ import {
   verificationGatherLegAReadyHandler,
   verificationToneHandler,
 } from "./verification-webhooks";
-import { verificationRecordingHandler } from "./verification-record";
+import {
+  verificationBridgeRecordingHandler,
+  verificationRecordingAudioHandler,
+  verificationRecordingHandler,
+} from "./verification-record";
 import { verificationStreamDetectedHandler, relayStreamUrl } from "./verification-stream";
 import {
   verificationStatusHandler,
@@ -681,6 +741,8 @@ hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandle
 hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
 hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
+hookApp.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
+hookApp.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
 hookApp.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
 // TwiML App voice webhook (SDK outbound calls — guarded branch keys off the
 // `guarded` custom param).
@@ -950,7 +1012,7 @@ describe("Leg A press-1 IVR", () => {
       (c) => String(c.url).includes("/twiml/leg-b") && String(c.url).includes(s.sessionId),
     );
     expect(legB?.timeout).toBe(15);
-    expect(body).toContain("Press 1 to receive the second verification call");
+    expect(body).toContain("Do not end this call. You will receive a second call. Please press 1.");
     expect(body).toContain("/api/verify/gather/leg-a-ready?sid=");
   });
 
@@ -1370,7 +1432,7 @@ describe("guarded single-call flow", () => {
       "Please identify your voice. After the beep, say: my voice identifies me.",
     );
     expect(body).toContain(
-      "Thank you. Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
+      "Do not end this call. You will receive a second call. Please press 1.",
     );
     expect(body).toContain("<Record");
     expect(body).toContain(`/api/verify/voiceprint?sid=${s.sessionId}`);
@@ -1403,7 +1465,7 @@ describe("guarded single-call flow", () => {
     const body = await res.text();
     expect(res.status).toBe(200);
     expect(body).toContain(
-      "Thank you. Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
+      "Do not end this call. You will receive a second call. Please press 1.",
     );
     expect(body).toContain("<Gather");
     expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}&a=0`);
@@ -1475,5 +1537,71 @@ describe("guarded single-call flow", () => {
     expect(after.state).toBe(vs.VState.FAILED);
     expect(after.failureReason).toContain("never connected");
     expect((await vs.findSession(freshGuarded.sessionId))!.state).toBe(vs.VState.INITIATED);
+  });
+});
+
+describe("call review recordings", () => {
+  it("bridge recording callback stores the conference recording on the session", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, { guarded: true });
+    const res = await postForm(`/api/verify/recording/bridge?sid=${s.sessionId}`, {
+      RecordingSid: "RE_bridge_1",
+      RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_bridge_1",
+      RecordingDuration: "87",
+    });
+    expect(res.status).toBe(200);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.bridgeRecordingSid).toBe("RE_bridge_1");
+    expect(after.bridgeRecordingUrl).toContain("RE_bridge_1");
+    expect(after.bridgeRecordingDurationSec).toBe(87);
+    expect(after.bridgeRecordedAt).not.toBeNull();
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("BRIDGE_RECORDING_STORED");
+  });
+
+  it("voice recording is stored even when relayguard profiling fails", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vr_caller",
+      legACallSid: "CA_vr_legA",
+    });
+    // Unreachable recording URL → profiling throws, but the clip is still
+    // persisted for call-review playback.
+    const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+      CallSid: "CA_vr_legA",
+      RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_voice_1",
+      RecordingDuration: "3",
+    });
+    expect(res.status).toBe(200);
+    // processVoiceprint runs fire-and-forget — give it a beat.
+    await tick(1500);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceRecordingUrl).toContain("RE_voice_1");
+    expect(after.voiceRecordingDurationSec).toBe(3);
+    expect(after.voiceRecordedAt).not.toBeNull();
+  });
+
+  it("audio proxy rejects anonymous requests (no session cookie)", async () => {
+    const res = await hookApp.request(
+      "/api/verify/recording/somesid/bridge",
+      { method: "GET" },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("audio proxy 404s for authed-looking requests on unknown sessions", async () => {
+    // AUTH_DISABLED open-access mode skips the cookie check, then the unknown
+    // session yields 404 (no Twilio network call is made).
+    const saved = process.env.AUTH_DISABLED;
+    process.env.AUTH_DISABLED = "true";
+    try {
+      const res = await hookApp.request(
+        "/api/verify/recording/definitely-not-a-session/bridge",
+        { method: "GET" },
+      );
+      expect(res.status).toBe(404);
+    } finally {
+      if (saved === undefined) delete process.env.AUTH_DISABLED;
+      else process.env.AUTH_DISABLED = saved;
+    }
   });
 });

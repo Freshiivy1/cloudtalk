@@ -139,10 +139,17 @@ const pendingLegBAnswer = new Map<string, string>();
  * leak. The engine otherwise has no "no merge" pass point (COMPLETED only
  * fires when Leg B hangs up), so this window defines it cleanly.
  * Env-overridable via VERIFY_MERGE_WATCH_MS (mainly for tests).
+ *
+ * Default 60s: the callee must be able to reach their phone's merge button
+ * and have the tone leak across BEFORE the watch elapses — 15s proved too
+ * short in live testing (the bridge fired and the second call became
+ * irrelevant before a merge could be attempted). The tone keeps playing on
+ * Leg A for the whole window; a detected merge still terminates everything
+ * within ~3-4s.
  */
 export function mergeWatchMs(): number {
   const v = Number(process.env.VERIFY_MERGE_WATCH_MS);
-  return Number.isFinite(v) && v >= 0 ? v : 15_000;
+  return Number.isFinite(v) && v >= 0 ? v : 60_000;
 }
 
 /**
@@ -273,6 +280,11 @@ export function recordingMergeUrl(sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/recording/merge?sid=${sessionId}`;
 }
 
+/** Twilio → app: guarded bridge conference recording status callback. */
+export function recordingBridgeUrl(sessionId: string): string {
+  return `${requirePublicBaseUrl()}/api/verify/recording/bridge?sid=${sessionId}`;
+}
+
 /** Leg A callee-IVR gather endpoints (CALL-FLOW.md Phase 2). */
 export function gatherLegAAcceptUrl(sessionId: string, attempt: number): string {
   return `${requirePublicBaseUrl()}/api/verify/gather/leg-a-accept?sid=${sessionId}&a=${attempt}`;
@@ -313,7 +325,7 @@ export function verifyPrompts() {
     // press-1 is the explicit trigger that originates Leg B.
     secondCall:
       e.VERIFY_PROMPT_SECOND_CALL ??
-      "Thank you. Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
+      "Do not end this call. You will receive a second call. Please press 1.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
@@ -321,7 +333,7 @@ export function verifyPrompts() {
       "Please wait while we connect your call.",
     ready:
       e.VERIFY_PROMPT_READY ??
-      "Press 1 to receive the second verification call. Do not end this current call. Accept the next call to continue.",
+      "Do not end this call. You will receive a second call. Please press 1.",
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
       "Please hold. Your call is being connected. You will hear updates as the line is verified.",
@@ -1200,6 +1212,28 @@ export async function onVoicemailDetected(
 ): Promise<void> {
   const session = await findSession(sessionId);
   if (!session || isTerminal(session)) return;
+  // GUARDED MODE ONLY: Leg B is originated with asyncAmd, so the machine
+  // verdict ALWAYS arrives a few seconds AFTER the answer callback already
+  // took the human path (LEG_B_ANSWERED). Answering a call-waiting call plays
+  // a switch beep that Twilio AMD routinely misreads as a voicemail beep —
+  // the false positive then killed the second call mid-verification. Once a
+  // guarded session is LEG_B_ANSWERED or later, a late machine verdict is
+  // log-only: the callee provably answered (they requested this exact call
+  // via the second press-1 seconds earlier).
+  if (
+    session.guarded &&
+    (session.state === VState.LEG_B_ANSWERED || session.state === VState.BRIDGED)
+  ) {
+    console.warn(
+      `[verify] AMD_LATE_MACHINE_IGNORED amd=${amdStatus} state=${session.state} — guarded second call stays up`,
+    );
+    await logEvent(
+      sessionId,
+      "AMD_LATE_MACHINE_IGNORED",
+      `amd=${amdStatus} arrived after Leg B answer (state=${session.state}) — async-AMD false positive guard, call continues`,
+    );
+    return;
+  }
   console.warn(`[verify] VOICEMAIL_DETECTED — call waiting OFF. amd=${amdStatus}`);
   await onCallWaitingOff(sessionId, `Leg B voicemail — amd=${amdStatus}`);
 }
@@ -1743,4 +1777,46 @@ export async function storeCallSid(
     await save(session);
     console.log(`[verify] SID_STORED leg=${leg} sessionId=${sessionId} sid=${callSid}`);
   }
+}
+
+/**
+ * GUARDED MODE ONLY: persist the explicit voice-ID recording ("my voice
+ * identifies me") so the call-review UI can play it back. Stored even when
+ * relayguard profiling failed — playback does not depend on the baseline.
+ */
+export async function storeVoiceRecording(
+  sessionId: string,
+  recordingUrl: string,
+  durationSec: number,
+): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session) return;
+  session.voiceRecordingUrl = recordingUrl;
+  session.voiceRecordingDurationSec = Math.max(0, Math.round(durationSec));
+  session.voiceRecordedAt = new Date();
+  await save(session);
+  await logEvent(
+    sessionId,
+    "VOICE_RECORDING_STORED",
+    `url=${recordingUrl} duration=${Math.round(durationSec)}s`,
+  );
+}
+
+/** GUARDED MODE ONLY: persist the live bridge conference recording. */
+export async function storeBridgeRecording(
+  sessionId: string,
+  rec: { recordingSid: string; recordingUrl: string; durationSec: number },
+): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session) return;
+  session.bridgeRecordingSid = rec.recordingSid;
+  session.bridgeRecordingUrl = rec.recordingUrl;
+  session.bridgeRecordingDurationSec = Math.max(0, Math.round(rec.durationSec));
+  session.bridgeRecordedAt = new Date();
+  await save(session);
+  await logEvent(
+    sessionId,
+    "BRIDGE_RECORDING_STORED",
+    `sid=${rec.recordingSid} url=${rec.recordingUrl} duration=${Math.round(rec.durationSec)}s`,
+  );
 }

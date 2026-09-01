@@ -304,8 +304,19 @@ export async function verificationTwimlHandler(c: Context) {
         // other is dropped and the status callback marks the session
         // COMPLETED. Leg A's <Start><Stream> persists across the redirect
         // into this TwiML, so speakerphone detection continues in-call.
+        // record-from-start captures the whole conversation for call review;
+        // Twilio posts the finished recording to /api/verify/recording/bridge
+        // when the conference ends.
         vr.dial().conference(
-          { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
+          {
+            beep: "false",
+            startConferenceOnEnter: true,
+            endConferenceOnExit: true,
+            record: "record-from-start",
+            recordingStatusCallback: vs.recordingBridgeUrl(sid),
+            recordingStatusCallbackMethod: "POST",
+            recordingStatusCallbackEvent: ["completed"],
+          },
           vs.conferenceName(sid),
         );
         break;
@@ -678,6 +689,12 @@ async function processVoiceprint(
 ): Promise<void> {
   const session = await vs.findSession(sid);
   if (!session || !session.guarded || vs.isTerminal(session)) return;
+  // Persist the clip for call review regardless of profiling outcome.
+  if (pending.recordingUrl) {
+    await vs
+      .storeVoiceRecording(sid, pending.recordingUrl, pending.durationSec || 0)
+      .catch((err) => console.error("[verify] store voice recording error:", err));
+  }
   let captured = false;
   if (pending.recordingUrl && Number.isFinite(pending.durationSec) && pending.durationSec >= 1) {
     try {

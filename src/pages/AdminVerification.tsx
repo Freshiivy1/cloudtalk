@@ -257,6 +257,12 @@ type SessionRow = {
   toneDetected: boolean;
   toneDetectedAt: Date | null;
   smsSent: boolean;
+  voiceRecordingUrl: string | null;
+  voiceRecordingDurationSec: number | null;
+  voiceRecordedAt: Date | null;
+  bridgeRecordingUrl: string | null;
+  bridgeRecordingDurationSec: number | null;
+  bridgeRecordedAt: Date | null;
   createdAt: Date;
   completedAt: Date | null;
   failureReason: string | null;
@@ -454,6 +460,33 @@ function EventTimeline({ events }: { events: Array<{ id: number; eventType: stri
   );
 }
 
+/** Call-review player — streams through the authenticated audio proxy. */
+function RecordingPlayer({
+  label,
+  hint,
+  src,
+  durationSec,
+}: {
+  label: string;
+  hint: string;
+  src: string;
+  durationSec: number | null;
+}) {
+  return (
+    <div className="rounded-[10px] border border-line bg-ink-800 px-3 py-2.5">
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <span className="text-xs font-medium text-text-hi">{label}</span>
+        <span className="font-mono text-[11px] text-text-low">
+          {durationSec != null ? formatCallDuration(durationSec) : ''}
+        </span>
+      </div>
+      {/* eslint-disable-next-line jsx-a11y/media-has-caption -- call audio, no captions exist */}
+      <audio controls preload="none" src={src} className="h-9 w-full" />
+      <div className="mt-1 text-[11px] text-text-low">{hint}</div>
+    </div>
+  );
+}
+
 function SessionDrawer({ sessionId, onClose }: { sessionId: string | null; onClose: () => void }) {
   const enabled = sessionId != null;
   const utils = trpc.useUtils();
@@ -594,6 +627,31 @@ function SessionDrawer({ sessionId, onClose }: { sessionId: string | null; onClo
               })}
             </div>
           </div>
+
+          {/* Call review — voice-ID clip + full bridge recording */}
+          {(s.voiceRecordingUrl || s.bridgeRecordingUrl) && (
+            <div>
+              <div className="label-caps mb-2">Call recordings</div>
+              <div className="space-y-2">
+                {s.voiceRecordingUrl && (
+                  <RecordingPlayer
+                    label="Voice ID"
+                    hint="The callee's “my voice identifies me” clip from the acceptance step."
+                    src={`/api/verify/recording/${s.sessionId}/voice`}
+                    durationSec={s.voiceRecordingDurationSec}
+                  />
+                )}
+                {s.bridgeRecordingUrl && (
+                  <RecordingPlayer
+                    label="Full call"
+                    hint="The complete two-way conversation, captured from bridge start."
+                    src={`/api/verify/recording/${s.sessionId}/bridge`}
+                    durationSec={s.bridgeRecordingDurationSec}
+                  />
+                )}
+              </div>
+            </div>
+          )}
 
           <EventTimeline events={events} />
         </div>

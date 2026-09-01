@@ -17,7 +17,11 @@ import {
   verificationTwimlHandler,
   verificationVoiceprintHandler,
 } from "./verification-webhooks";
-import { verificationRecordingHandler } from "./verification-record";
+import {
+  verificationBridgeRecordingHandler,
+  verificationRecordingAudioHandler,
+  verificationRecordingHandler,
+} from "./verification-record";
 import { testCalleeBotHandler, testCalleeBotRecordHandler } from "./test-bot";
 import { verificationStreamDetectedHandler } from "./verification-stream";
 import { Paths } from "@contracts/constants";
@@ -36,6 +40,9 @@ app.post("/api/verify/gather/merge", verificationGatherHandler);
 app.post("/api/verify/gather/leg-a-accept", verificationGatherLegAAcceptHandler);
 app.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandler);
 app.post("/api/verify/recording/merge", verificationRecordingHandler);
+// GUARDED MODE ONLY: bridge conference recording callback + call-review playback.
+app.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
+app.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
 // GUARDED MODE ONLY: voice-ID <Record> action (baseline + second-call handoff).
 app.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 // TEST-ONLY scripted callee for end-to-end guarded-call self-tests.
