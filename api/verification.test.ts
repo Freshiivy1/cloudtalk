@@ -1260,25 +1260,103 @@ describe("guarded single-call flow", () => {
     expect(body).not.toContain("<Conference");
   });
 
-  it("guarded leg-a TwiML uses the monitored prompt; non-guarded keeps accept", async () => {
+  it("guarded leg-a TwiML is DIRECT-CONNECT: bridge conference + stream, NO IVR (no Gather/Record/prompts)", async () => {
     const g = await makeSession(vs.VState.LEG_A_DIALING, { guarded: true });
-    const gBody = await (
-      await postForm(`/api/verify/twiml/leg-a?sid=${g.sessionId}`)
-    ).text();
-    expect(gBody).toContain(
-      "This call is being monitored. Do not make any attempt of conference call. Press 1 to be connected to the inmate.",
-    );
-    expect(gBody).not.toContain("You are about to receive a call from an inmate");
+    const gRes = await postForm(`/api/verify/twiml/leg-a?sid=${g.sessionId}`);
+    expect(gRes.status).toBe(200);
+    const gBody = await gRes.text();
+    // Inline bridge: Leg A dials straight into the session conference.
+    expect(gBody).toContain("<Dial>");
+    expect(gBody).toContain("<Conference");
+    expect(gBody).toContain(`verify-${g.sessionId}`);
+    expect(gBody).toContain('beep="false"');
+    expect(gBody).toContain('startConferenceOnEnter="true"');
+    expect(gBody).toContain('endConferenceOnExit="true"');
+    // Media stream attached on the first fetch (inbound callee uplink).
+    expect(gBody).toContain("<Start>");
+    expect(gBody).toContain(`/api/verify/stream?sid=${g.sessionId}`);
+    expect(gBody).toContain('track="inbound_track"');
+    // NO callee IVR at all: no monitored warning, no press-1 gather, no
+    // voice-ID record, no press-#.
+    expect(gBody).not.toContain("<Gather");
+    expect(gBody).not.toContain("<Record");
+    expect(gBody).not.toContain("<Say");
+    expect(gBody).not.toContain("This call is being monitored");
+    // The fetch fire-and-forgets bridgeGuardedDirect → BRIDGED.
+    await tick(300);
+    expect((await vs.findSession(g.sessionId))!.state).toBe(vs.VState.BRIDGED);
+    const gTypes = (await events(g.sessionId)).map((e) => e.eventType);
+    expect(gTypes).toContain("GUARDED_BRIDGED");
 
+    // Non-guarded keeps the exact legacy accept IVR.
     const p = await makeSession(vs.VState.LEG_A_DIALING);
     const pBody = await (
       await postForm(`/api/verify/twiml/leg-a?sid=${p.sessionId}`)
     ).text();
+    expect(pBody).toContain("<Gather");
     expect(pBody).toContain("You are about to receive a call from an inmate");
     expect(pBody).not.toContain("This call is being monitored");
+    expect((await vs.findSession(p.sessionId))!.state).toBe(vs.VState.LEG_A_DIALING);
   });
 
-  it("guarded press-1: voice-ID prompt + <Record> to /api/verify/voiceprint, NO Leg B", async () => {
+  it("bridgeGuardedDirect: LEG_A_DIALING → BRIDGED, caller redirected after participant confirmation", async () => {
+    const s = await makeSession(vs.VState.LEG_A_DIALING, {
+      guarded: true,
+      callerCallSid: "CA_d_caller",
+      legACallSid: "CA_d_legA",
+    });
+    const updBefore = updatedCalls.length;
+    expect(await vs.bridgeGuardedDirect(s.sessionId)).toBe(true);
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("GUARDED_BRIDGED");
+    // Idempotent: a second invocation is a no-op.
+    expect(await vs.bridgeGuardedDirect(s.sessionId)).toBe(false);
+    // Participant confirmation poll: the mock has conferences.list → [{sid}]
+    // but participants has no .list, so the 3-error breaker fires after
+    // ~1.5-2s and the caller is redirected anyway.
+    await tick(3000);
+    const added = updatedCalls.slice(updBefore);
+    expect(
+      added.some((u) => u.sid === "CA_d_caller" && String(u.url).includes("guarded-bridge")),
+    ).toBe(true);
+    // Leg A must NOT be REST-redirected — it dialed into the conference inline.
+    expect(
+      added.some((u) => u.sid === "CA_d_legA" && String(u.url).includes("guarded-bridge")),
+    ).toBe(false);
+  });
+
+  it("bridgeGuardedDirect: non-guarded and wrong-state sessions are no-ops", async () => {
+    const plain = await makeSession(vs.VState.LEG_A_DIALING);
+    expect(await vs.bridgeGuardedDirect(plain.sessionId)).toBe(false);
+    expect((await vs.findSession(plain.sessionId))!.state).toBe(vs.VState.LEG_A_DIALING);
+    const bridged = await makeSession(vs.VState.BRIDGED, { guarded: true });
+    expect(await vs.bridgeGuardedDirect(bridged.sessionId)).toBe(false);
+  });
+
+  it("guarded callee no-answer still fails the session (status callback → FAILED)", async () => {
+    const s = await makeSession(vs.VState.LEG_A_DIALING, {
+      guarded: true,
+      callerCallSid: "CA_na_caller",
+    });
+    await postForm(`/api/verify/status/legA?sid=${s.sessionId}`, {
+      CallSid: "CA_na_legA",
+      CallStatus: "no-answer",
+    });
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.FAILED);
+    expect(after.failureReason).toContain("Callee not available");
+    expect(
+      updatedCalls.some((u) => u.sid === "CA_na_caller" && String(u.url).includes("notify-failed")),
+    ).toBe(true);
+  });
+
+  // LEGACY: the press-1 → voiceprint gather handler below is unreachable in
+  // the direct-connect guarded flow (leg-a TwiML serves no Gather anymore).
+  // The handler stays in code as legacy/reference, so its unit contract is
+  // still exercised here. The /api/verify/voiceprint + voice-confirm bridging
+  // tests were removed — those endpoints are legacy-unreachable too.
+  it("guarded press-1 (LEGACY handler): voice-ID prompt + <Record> to /api/verify/voiceprint, NO Leg B", async () => {
     const s = await makeSession(vs.VState.LEG_A_DIALING, { guarded: true });
     const before = createdCalls.length;
     const res = await postForm(`/api/verify/gather/leg-a-accept?sid=${s.sessionId}&a=0`, {
@@ -1301,116 +1379,6 @@ describe("guarded single-call flow", () => {
     expect((await vs.findSession(s.sessionId))!.legBCallSid).toBeNull();
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("GUARDED_VOICEPRINT_STEP");
-  });
-
-  it("voiceprint webhook stashes audio + serves # gather; confirm saves baseline and bridges", async () => {
-    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
-      guarded: true,
-      callerCallSid: "CA_vp_caller",
-      legACallSid: "CA_vp_legA",
-    });
-    const pcm = new Int16Array(8000 * 2);
-    for (let i = 0; i < pcm.length; i++) {
-      pcm[i] = Math.round(8000 * Math.sin((2 * Math.PI * 200 * i) / 8000));
-    }
-    vi.stubGlobal(
-      "fetch",
-      async () => new Response(new Uint8Array(buildWav(pcm)), { status: 200 }),
-    );
-    try {
-      const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
-        CallSid: "CA_vp_legA",
-        RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_vp",
-        RecordingDuration: "4",
-      });
-      const body = await res.text();
-      expect(res.status).toBe(200);
-      // The webhook asks for # (finishOnKey disabled so hash is a digit)…
-      expect(body).toContain("/api/verify/gather/voice-confirm");
-      expect(body).toContain('finishOnKey=""');
-      // …and NOTHING is saved or bridged before the # press.
-      expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
-      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
-
-      // Callee presses # → audio saved, session bridged, Leg A joins inline.
-      const res2 = await postForm(
-        `/api/verify/gather/voice-confirm?sid=${s.sessionId}`,
-        { Digits: "#" },
-      );
-      const body2 = await res2.text();
-      expect(res2.status).toBe(200);
-      expect(body2).toContain(`verify-${s.sessionId}`); // inline <Dial><Conference>
-      await tick(3500); // capture + participant-poll breaker + caller redirect
-      const after = (await vs.findSession(s.sessionId))!;
-      expect(after.state).toBe(vs.VState.BRIDGED);
-      expect(vs.getVoiceBaseline(s.sessionId)).not.toBeNull();
-      const types = (await events(s.sessionId)).map((e) => e.eventType);
-      expect(types).toContain("VOICEPRINT_CAPTURED");
-      expect(types).toContain("GUARDED_BRIDGED");
-      // Caller is REST-redirected into the live conference after participant
-      // confirmation; Leg A joined via its own TwiML (no REST redirect).
-      expect(
-        updatedCalls.some(
-          (u) => u.sid === "CA_vp_caller" && String(u.url).includes("guarded-bridge"),
-        ),
-      ).toBe(true);
-      expect(
-        updatedCalls.some(
-          (u) => u.sid === "CA_vp_legA" && String(u.url).includes("guarded-bridge"),
-        ),
-      ).toBe(false);
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it("voiceprint with empty recording: # confirm → VOICEPRINT_MISSED, bridges anyway", async () => {
-    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
-      guarded: true,
-      callerCallSid: "CA_vm_caller",
-      legACallSid: "CA_vm_legA",
-    });
-    await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
-      CallSid: "CA_vm_legA",
-      RecordingDuration: "0",
-    });
-    const res = await postForm(`/api/verify/gather/voice-confirm?sid=${s.sessionId}`, {
-      Digits: "#",
-    });
-    expect(res.status).toBe(200);
-    await tick(500);
-    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
-    expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
-    const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("VOICEPRINT_MISSED");
-    expect(types).toContain("GUARDED_BRIDGED");
-  });
-
-  it("voiceprint fetch failure: # confirm → VOICEPRINT_MISSED, bridges anyway", async () => {
-    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
-      guarded: true,
-      callerCallSid: "CA_vf_caller",
-      legACallSid: "CA_vf_legA",
-    });
-    vi.stubGlobal("fetch", async () => new Response("nope", { status: 404 }));
-    try {
-      await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
-        CallSid: "CA_vf_legA",
-        RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_gone",
-        RecordingDuration: "3",
-      });
-      const res = await postForm(`/api/verify/gather/voice-confirm?sid=${s.sessionId}`, {
-        Digits: "#",
-      });
-      expect(res.status).toBe(200);
-      await tick(2500); // 4 fetch attempts with 250ms backoff
-      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
-      const types = (await events(s.sessionId)).map((e) => e.eventType);
-      expect(types).toContain("VOICEPRINT_MISSED");
-      expect(vs.getVoiceBaseline(s.sessionId)).toBeNull();
-    } finally {
-      vi.unstubAllGlobals();
-    }
   });
 
   it("sweep fails guarded INITIATED sessions whose caller never connected (>2min)", async () => {

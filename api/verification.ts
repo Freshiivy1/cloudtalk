@@ -73,7 +73,10 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
   // CALL_WAITING_OFF is reachable from the dialing/accept states because Leg B
   // is now pre-originated when Leg A is ANSWERED (zero ring latency) — so a
   // Leg B busy/fail/voicemail verdict can legitimately arrive before press-1.
-  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.CALL_WAITING_OFF, VState.FAILED],
+  // BRIDGED from LEG_A_DIALING is GUARDED MODE ONLY (direct-connect flow: the
+  // callee answers and is dialed straight into the bridge conference — no IVR,
+  // no press-1, no voiceprint Record). See bridgeGuardedDirect().
+  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.BRIDGED, VState.CALL_WAITING_OFF, VState.FAILED],
   // BRIDGED from CALL_ACCEPTED is GUARDED MODE ONLY (single-call flow: no
   // Leg B, bridge right after the voiceprint step). Non-guarded sessions
   // still only reach BRIDGED via LEG_B_ANSWERED — nothing invokes this edge
@@ -845,6 +848,50 @@ export async function onGuardedCallerConnected(
  * bridge. The poll+redirect runs fire-and-forget so the webhook can answer
  * Leg A immediately.
  */
+/**
+ * GUARDED MODE ONLY: direct-connect bridge — the CURRENT guarded callee flow.
+ * The leg-a TwiML (fetched when the callee answers) dials Leg A straight into
+ * conference verify-<sid> inline (single conference creator, beep=false,
+ * startConferenceOnEnter + endConferenceOnExit) — NO monitored warning, NO
+ * press-1, NO voiceprint Record. This function performs the matching engine
+ * half: LEG_A_DIALING → BRIDGED, then fire-and-forget it polls until Twilio
+ * confirms Leg A's conference participation and REST-redirects the caller leg
+ * (parked in the non-blocking caller-wait pause loop) into the bridge.
+ * Idempotent: any invocation after the session has left LEG_A_DIALING is a
+ * no-op. NON-GUARDED sessions return immediately.
+ */
+export async function bridgeGuardedDirect(sessionId: string): Promise<boolean> {
+  const session = await findSession(sessionId);
+  if (!session || !session.guarded) return false;
+  if (session.state !== VState.LEG_A_DIALING) return false; // already bridged/terminal
+  if (
+    await transition(
+      session,
+      VState.BRIDGED,
+      "direct-connect guarded bridge (no IVR)",
+    )
+  ) {
+    await logEvent(
+      sessionId,
+      "GUARDED_BRIDGED",
+      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; direct-connect (no IVR), Leg A dialed in inline, caller via REST redirect after participant confirmation`,
+    );
+    const callerSid = session.callerCallSid;
+    const legASid = session.legACallSid;
+    void (async () => {
+      const confSid = await waitForConferenceParticipant(sessionId, legASid, 20_000);
+      if (!confSid) {
+        console.warn(
+          `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within 20s; redirecting caller anyway`,
+        );
+      }
+      await redirectCall(callerSid, "guarded-bridge", sessionId);
+    })().catch((err) => console.error("[verify] guarded direct caller bridge error:", err));
+    return true;
+  }
+  return false;
+}
+
 export async function confirmAndBridgeGuarded(sessionId: string): Promise<boolean> {
   const session = await findSession(sessionId);
   if (!session || !session.guarded) return false;

@@ -21,6 +21,7 @@ import {
   RotateCcw,
   Loader2,
   ShieldCheck,
+  Activity,
 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router';
 import AppShell, { PRESENCE_OPTIONS, presenceDotClass, presenceLabel } from '@/components/AppShell';
@@ -134,6 +135,135 @@ function Ellipsis() {
 }
 
 // ---------------------------------------------------------------------------
+// Guarded live analysis panel — polls the verification engine while a guarded
+// call is in flight. Deliberately quiet/secondary to the call controls.
+// ---------------------------------------------------------------------------
+
+interface GuardedEventRow {
+  id: number;
+  eventType: string;
+  details: string | null;
+  timestamp: Date | string;
+}
+
+/** Muted badge palette per session state (mirrors api/verification.ts). */
+const GUARDED_STATE_BADGE: Record<string, string> = {
+  INITIATED: 'border-amber/40 bg-amber/10 text-amber',
+  CALLER_HOLDING: 'border-amber/40 bg-amber/10 text-amber',
+  LEG_A_DIALING: 'border-amber/40 bg-amber/10 text-amber',
+  BRIDGED: 'border-signal/40 bg-signal/10 text-signal',
+  COMPLETED: 'border-sky/40 bg-sky/10 text-sky',
+  FAILED: 'border-danger/40 bg-danger/10 text-danger',
+};
+
+function GuardedLivePanel({
+  sessionState,
+  events,
+  onOpenMonitor,
+}: {
+  sessionState: string | null;
+  events: GuardedEventRow[];
+  onOpenMonitor: () => void;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [events.length]);
+
+  // Latest speakerphone suspicion: "… target=legA-callee | score=0.90
+  // verdict=SUSPICIOUS RELAY relayState=RED …" → score + verdict.
+  const spEvents = events.filter((e) => e.eventType === 'SPEAKERPHONE_SUSPECTED');
+  const latestSp = spEvents[spEvents.length - 1];
+  const spScore = latestSp?.details?.match(/score=([\d.]+)/)?.[1] ?? null;
+  const spVerdict =
+    latestSp?.details?.match(/verdict=([A-Z][A-Z_ ]*?)(?:\s+relayState|\s+weighted|$)/)?.[1] ?? null;
+  const voiceMismatches = events.filter((e) => e.eventType === 'VOICE_MISMATCH').length;
+  const voiceprintCaptured = events.some((e) => e.eventType === 'VOICEPRINT_CAPTURED');
+  const voiceprintMissed = events.some((e) => e.eventType === 'VOICEPRINT_MISSED');
+
+  const rows: Array<{ label: string; value: string; cls: string }> = [
+    {
+      label: 'Speakerphone',
+      value: spScore ? `score ${spScore} · ${spVerdict ?? 'suspected'}` : 'no suspicion detected',
+      cls: spScore ? 'text-amber' : 'text-text-low',
+    },
+    {
+      label: 'Challenge noise',
+      value: `${spEvents.length} injection${spEvents.length === 1 ? '' : 's'}`,
+      cls: spEvents.length > 0 ? 'text-amber' : 'text-text-low',
+    },
+    {
+      label: 'Voiceprint',
+      value: voiceprintCaptured ? 'captured (in-call)' : voiceprintMissed ? 'missed' : 'listening…',
+      cls: voiceprintCaptured ? 'text-signal' : voiceprintMissed ? 'text-amber' : 'text-text-low',
+    },
+    {
+      label: 'Voice match',
+      value: voiceMismatches > 0 ? `${voiceMismatches} alert${voiceMismatches === 1 ? '' : 's'}` : 'no alerts',
+      cls: voiceMismatches > 0 ? 'text-danger' : 'text-text-low',
+    },
+  ];
+
+  return (
+    <div className="rounded-[14px] border border-line bg-ink-800 p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="label-caps flex items-center gap-2">
+          <Activity className="h-3.5 w-3.5 text-violet" />
+          Live analysis
+        </div>
+        {sessionState && (
+          <span
+            className={cn(
+              'rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium tracking-[0.06em]',
+              GUARDED_STATE_BADGE[sessionState] ?? 'border-violet/40 bg-violet/10 text-violet'
+            )}
+          >
+            {sessionState}
+          </span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+        {rows.map((r) => (
+          <div key={r.label} className="min-w-0">
+            <div className="text-[10px] uppercase tracking-[0.08em] text-text-low">{r.label}</div>
+            <div className={cn('truncate font-mono text-[11px]', r.cls)}>{r.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div
+        ref={scrollRef}
+        className="mt-3 max-h-28 overflow-y-auto rounded-[10px] border border-line bg-ink-950 p-2 font-mono text-[10px] leading-[1.7]"
+      >
+        {events.length === 0 ? (
+          <div className="text-text-low">Waiting for engine events…</div>
+        ) : (
+          events.slice(-50).map((e) => (
+            <div key={e.id} className="flex gap-2">
+              <span className="shrink-0 text-text-low">
+                {new Date(e.timestamp).toLocaleTimeString('en-AU', { hour12: false })}
+              </span>
+              <span className="shrink-0 text-violet">{e.eventType}</span>
+              <span className="min-w-0 truncate text-text-mid">{e.details}</span>
+            </div>
+          ))
+        )}
+      </div>
+
+      <button
+        onClick={onOpenMonitor}
+        className="mt-3 flex items-center gap-1 text-[11px] text-text-low transition-colors hover:text-text-hi"
+      >
+        Open full session monitor
+        <ArrowUpRight className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Softphone page
 // ---------------------------------------------------------------------------
 
@@ -166,6 +296,9 @@ export default function Softphone() {
     }
   }, []);
   const [guardedStatus, setGuardedStatus] = useState<string | null>(null);
+  // Verification session id of the in-flight guarded call (null when no
+  // guarded call is active). Drives the "Live analysis" panel below.
+  const [guardedSessionId, setGuardedSessionId] = useState<string | null>(null);
   const initiateGuarded = trpc.verification.initiateGuarded.useMutation({
     onSuccess: (data, vars) => {
       // Guarded inmate call: NO incoming call. Place the outbound SDK call
@@ -173,14 +306,25 @@ export default function Softphone() {
       // the TwiML App voice webhook parks this leg in the session conference
       // and starts the verification engine (Leg A dial).
       setGuardedStatus('Please wait while we connect your call…');
+      setGuardedSessionId(data.sessionId);
       t.dial(vars.calleeNumber, { guarded: data.sessionId });
     },
     onError: (err) => {
       setGuardedStatus(null);
+      setGuardedSessionId(null);
       setPending(null);
       toast.error(`Guarded call failed: ${err.message}`);
     },
   });
+  // Live analysis polling — only while a guarded session is in flight.
+  const guardedSessionQ = trpc.verification.get.useQuery(
+    { sessionId: guardedSessionId ?? '00000000' },
+    { enabled: guardedSessionId != null, refetchInterval: 2000 }
+  );
+  const guardedEventsQ = trpc.verification.events.useQuery(
+    { sessionId: guardedSessionId ?? '00000000' },
+    { enabled: guardedSessionId != null, refetchInterval: 2000 }
+  );
   const now = useNow();
   const prevState = useRef(callState);
 
@@ -209,6 +353,7 @@ export default function Softphone() {
         setNoteOpen(false);
         setNote('');
         setGuardedStatus(null);
+        setGuardedSessionId(null);
       }
     }
   }, [callState]);
@@ -353,12 +498,13 @@ export default function Softphone() {
 
         <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 xl:grid-cols-[1fr_380px]">
           {/* ================= Left: dialer / call panel ================= */}
+          <div className="flex min-h-0 flex-col gap-4">
           <motion.section
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.4 }}
             className={cn(
-              'instrument-panel relative flex min-h-0 flex-col overflow-hidden transition-[filter,border-color] duration-300',
+              'instrument-panel relative flex min-h-0 flex-1 flex-col overflow-hidden transition-[filter,border-color] duration-300',
               callState === 'active' && 'border-signal',
               callState === 'held' && 'border-amber/60 saturate-[0.7]'
             )}
@@ -939,6 +1085,16 @@ export default function Softphone() {
               )}
             </AnimatePresence>
           </motion.section>
+
+          {/* Live analysis — guarded inmate call in flight (dial → disconnect) */}
+          {guardedSessionId && callState !== 'idle' && (
+            <GuardedLivePanel
+              sessionState={(guardedSessionQ.data?.state as string | undefined) ?? null}
+              events={(guardedEventsQ.data ?? []) as GuardedEventRow[]}
+              onOpenMonitor={() => navigate('/admin/verification')}
+            />
+          )}
+          </div>
 
           {/* ================= Right rail (380px) ================= */}
           <div className="flex min-h-0 flex-col gap-4 overflow-y-auto">

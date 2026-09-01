@@ -132,7 +132,9 @@ export const verificationRouter = createRouter({
       .limit(100);
   }),
 
-  get: adminQuery.input(sessionIdInput).query(async ({ input }) => {
+  // authedQuery (not adminQuery): the softphone's in-call "Live analysis"
+  // panel polls these two endpoints for the agent's own guarded session.
+  get: authedQuery.input(sessionIdInput).query(async ({ input }) => {
     const session = await vs.findSession(input.sessionId);
     if (!session) {
       throw new TRPCError({ code: "NOT_FOUND", message: "Session not found" });
@@ -140,7 +142,7 @@ export const verificationRouter = createRouter({
     return session;
   }),
 
-  events: adminQuery.input(sessionIdInput).query(async ({ input }) => {
+  events: authedQuery.input(sessionIdInput).query(async ({ input }) => {
     return getDb()
       .select()
       .from(schema.verificationEvents)

@@ -157,10 +157,44 @@ export async function verificationTwimlHandler(c: Context) {
       }
 
       case "leg-a": {
+        const a = attemptFrom(c);
+        // GUARDED MODE ONLY — DIRECT-CONNECT flow: the callee experiences
+        // ring → answer → connected to the caller. NO monitored warning, NO
+        // press-1, NO voiceprint Record, NO press-# — the entire callee IVR
+        // below (gather/monitored/voice-ID/voice-confirm) is skipped for
+        // guarded sessions and remains only as legacy/reference for the old
+        // flow. Leg A is dialed straight into the bridge conference inline
+        // (single conference creator), the media stream is attached first
+        // fetch only, and the engine (bridgeGuardedDirect) flips the session
+        // to BRIDGED and REST-redirects the parked caller in after Leg A's
+        // participation is confirmed. Callee no-answer/reject still arrives
+        // via the status callback → FAILED.
+        if (sid) {
+          const session = await vs.findSession(sid);
+          if (session?.guarded) {
+            if (vs.isTerminal(session)) {
+              vr.hangup();
+              break;
+            }
+            if (a === 0) {
+              const streamUrl = legAStreamUrl(sid);
+              if (streamUrl) {
+                vr.start().stream({ url: streamUrl, track: "inbound_track" });
+              }
+            }
+            vr.dial().conference(
+              { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
+              vs.conferenceName(sid),
+            );
+            void vs
+              .bridgeGuardedDirect(sid)
+              .catch((err) => console.error("[verify] bridgeGuardedDirect error:", err));
+            break;
+          }
+        }
         // Phase 2, step 1: "Press 1 to accept". <Gather> accepts DTMF during
         // playback. Timeout falls through to the re-prompt redirect; wrong
         // digits re-prompt via the gather handler.
-        const a = attemptFrom(c);
         if (a >= vs.LEG_A_MAX_ATTEMPTS) {
           void vs
             .onLegFailed(sid, "legA", "callee rejected/no input")

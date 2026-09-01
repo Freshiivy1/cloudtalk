@@ -28,6 +28,7 @@ import { getTwilioClient } from "./twilio-voice";
 import { SpeakerphoneDetector } from "./relayguard/speakerphone-detector";
 import { analyzeClip } from "./relayguard/features";
 import { compareVoicePanel } from "./relayguard/voice";
+import { HOP } from "./relayguard/stft";
 
 /**
  * POST /api/verify/stream-detected?sid=… — called by the EXTERNAL relay
@@ -239,6 +240,151 @@ class VoiceMatchMonitor {
   }
 }
 
+/**
+ * GUARDED MODE ONLY: automatic in-call voice baseline — replaces the old IVR
+ * voiceprint <Record> ("my name identifies me") in the direct-connect guarded
+ * flow. The callee hears no prompts, so the baseline is captured from the
+ * callee's NATURAL speech on the Leg A stream (inbound track, post-answer):
+ * decoded μ-law PCM accumulates in a rolling ~8 s buffer; every ~2 s of
+ * incoming audio the buffer is profiled with the SAME analyzeClip() used by
+ * the old voiceprint webhook and the vendored energy-VAD segments speech
+ * (same segmentation SpeakerphoneDetector keys off —
+ * profile.vad.speechFrames). Once ≥2 s of SPEECH has been seen the profile is
+ * stored via vs.setVoiceBaseline() and VOICEPRINT_CAPTURED is logged with
+ * source=in-call-auto. If ~40 s of stream audio passes without enough speech,
+ * VOICEPRINT_MISSED is logged once (best-effort — the call continues).
+ * Single-flight per session (module-level registry below); inert for
+ * non-guarded sessions and once a baseline exists. VoiceMatchMonitor picks
+ * the baseline up lazily (it re-checks vs.getVoiceBaseline on every push), so
+ * no wiring changes are needed there.
+ */
+class VoiceBaselineCapture {
+  /** Rolling capture buffer: ~8 s @ 8 kHz. */
+  private static readonly WINDOW_SAMPLES = 64_000;
+  /** Analysis cadence: every ~2 s of incoming audio. */
+  private static readonly CHECK_EVERY_SAMPLES = 16_000;
+  /** Minimum accumulated VAD speech before profiling into the baseline. */
+  private static readonly MIN_SPEECH_SEC = 2;
+  /** Give up after ~40 s of stream audio without usable speech. */
+  private static readonly GIVE_UP_SAMPLES = 40 * SAMPLE_RATE;
+  /** VAD frame duration (relayguard stft hop). */
+  private static readonly FRAME_SEC = HOP / SAMPLE_RATE;
+
+  private buf: number[] = [];
+  private sinceCheck = 0;
+  private totalSamples = 0;
+  private done = false;
+
+  private readonly sid: string;
+  private readonly onDone?: () => void;
+
+  constructor(sid: string, onDone?: () => void) {
+    this.sid = sid;
+    this.onDone = onDone;
+  }
+
+  get finished(): boolean {
+    return this.done;
+  }
+
+  /** Feed one Twilio media payload (base64 μ-law, 8 kHz mono). */
+  push(payloadB64: string): void {
+    if (this.done) return;
+    // Another path (e.g. a parallel stream or a legacy webhook) may have set
+    // the baseline — stop capturing.
+    if (vs.getVoiceBaseline(this.sid)) {
+      this.finish();
+      return;
+    }
+    const bytes = Buffer.from(payloadB64, "base64");
+    for (const b of bytes) this.buf.push(decodeMulaw(b));
+    if (this.buf.length > VoiceBaselineCapture.WINDOW_SAMPLES) {
+      this.buf = this.buf.slice(-VoiceBaselineCapture.WINDOW_SAMPLES);
+    }
+    this.totalSamples += bytes.length;
+    this.sinceCheck += bytes.length;
+    if (this.sinceCheck < VoiceBaselineCapture.CHECK_EVERY_SAMPLES) return;
+    this.sinceCheck = 0;
+    this.check();
+  }
+
+  private check(): void {
+    try {
+      const window = this.buf;
+      // int16 → float, peak-normalized (same convention as the old voiceprint
+      // webhook and SpeakerphoneDetector).
+      let peak = 0;
+      for (const s of window) {
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      const scale = peak > 0 ? 0.9 / peak : 1;
+      const samples = new Float32Array(window.length);
+      for (let i = 0; i < window.length; i++) samples[i] = window[i] * scale;
+      const profile = analyzeClip(samples, SAMPLE_RATE);
+
+      const speechSeconds = profile.vad.speechFrames.length * VoiceBaselineCapture.FRAME_SEC;
+      if (speechSeconds >= VoiceBaselineCapture.MIN_SPEECH_SEC) {
+        vs.setVoiceBaseline(this.sid, profile);
+        void vs
+          .logEvent(
+            this.sid,
+            "VOICEPRINT_CAPTURED",
+            `source=in-call-auto speechSeconds=${speechSeconds.toFixed(1)} voicedFrames=${profile.voicePrint.voicedFrames} — captured from live Leg A speech (no IVR voiceprint)`,
+          )
+          .catch((err) => console.error("[verify-stream] voiceprint event error:", err));
+        console.log(
+          `[verify-stream] VOICEPRINT_CAPTURED sid=${this.sid} source=in-call-auto speech=${speechSeconds.toFixed(1)}s`,
+        );
+        this.finish();
+        return;
+      }
+      if (this.totalSamples >= VoiceBaselineCapture.GIVE_UP_SAMPLES) {
+        void vs
+          .logEvent(
+            this.sid,
+            "VOICEPRINT_MISSED",
+            `source=in-call-auto speechSeconds=${speechSeconds.toFixed(1)} — no usable speech within ~40s of stream audio (best-effort, call continues)`,
+          )
+          .catch((err) => console.error("[verify-stream] voiceprint event error:", err));
+        console.warn(`[verify-stream] VOICEPRINT_MISSED sid=${this.sid} source=in-call-auto`);
+        this.finish();
+      }
+    } catch (err) {
+      // DSP must never break the media path.
+      console.warn("[verify-stream] voice baseline capture failed:", (err as Error).message);
+    }
+  }
+
+  private finish(): void {
+    if (this.done) return;
+    this.done = true;
+    this.onDone?.();
+  }
+}
+
+/** Single-flight registry: at most one baseline capture per session. */
+const activeBaselineCaptures = new Set<string>();
+
+/**
+ * Start a VoiceBaselineCapture for this stream when the session is GUARDED
+ * and has no baseline yet. Returns null (gracefully, no throw) for
+ * non-guarded/unknown sessions or when a capture is already in flight.
+ */
+async function startBaselineCapture(sid: string): Promise<VoiceBaselineCapture | null> {
+  if (!sid || activeBaselineCaptures.has(sid) || vs.getVoiceBaseline(sid)) return null;
+  try {
+    const session = await vs.findSession(sid);
+    if (!session?.guarded || vs.isTerminal(session)) return null;
+    if (activeBaselineCaptures.has(sid) || vs.getVoiceBaseline(sid)) return null;
+    activeBaselineCaptures.add(sid);
+    return new VoiceBaselineCapture(sid, () => activeBaselineCaptures.delete(sid));
+  } catch (err) {
+    console.error(`[verify-stream] baseline capture attach failed sid=${sid}:`, err);
+    return null;
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* WebSocket server                                                             */
 /* -------------------------------------------------------------------------- */
@@ -322,8 +468,20 @@ export function attachVerificationStreamServer(server: HttpServer): void {
     // from here. Leg B merge detection runs on the external relay
     // (VERIFY_STREAM_URL), so no speakerphone detector attaches there.
     let spDetector: SpeakerphoneDetector | null = null;
-    // GUARDED MODE ONLY: voiceprint comparison — inert until the voice-ID
-    // recording sets a baseline for this session.
+    // GUARDED MODE ONLY: automatic in-call voice baseline — captures the
+    // callee's natural speech on this stream (single-flight per session,
+    // inert for non-guarded sessions). Feeds the same payloads read-only;
+    // SpeakerphoneDetector/VoiceMatchMonitor are unaffected.
+    let baselineCapture: VoiceBaselineCapture | null = null;
+    void startBaselineCapture(sid)
+      .then((c) => {
+        if (c) baselineCapture = c;
+      })
+      .catch((err) => console.error("[verify-stream] baseline capture error:", err));
+    // GUARDED MODE ONLY: voiceprint comparison — inert until a baseline is
+    // set for this session (now usually by VoiceBaselineCapture above; it
+    // re-checks vs.getVoiceBaseline on every push, so it picks the baseline
+    // up lazily the moment it lands).
     const voiceMonitor = new VoiceMatchMonitor(sid);
     let frames = 0;
     console.log(`[verify-stream] connected sid=${sid}`);
@@ -357,6 +515,7 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       frames++;
       spDetector?.push(msg.media.payload);
       voiceMonitor.push(msg.media.payload);
+      baselineCapture?.push(msg.media.payload);
       if (detector.push(msg.media.payload)) {
         console.log(
           `[verify-stream] MERGE TONE DETECTED sid=${sid} after ${frames} frames (~${frames * 20}ms of audio)`,
@@ -367,7 +526,14 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       }
     });
 
-    ws.on("close", () => console.log(`[verify-stream] closed sid=${sid} frames=${frames}`));
+    ws.on("close", () => {
+      // Release the single-flight slot if the stream ends before the baseline
+      // was captured, so a reconnected stream can retry.
+      if (baselineCapture && !baselineCapture.finished) {
+        activeBaselineCaptures.delete(sid);
+      }
+      console.log(`[verify-stream] closed sid=${sid} frames=${frames}`);
+    });
     ws.on("error", (err) => console.error(`[verify-stream] ws error sid=${sid}:`, err));
   });
 }

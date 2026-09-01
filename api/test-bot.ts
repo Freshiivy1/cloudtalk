@@ -2,13 +2,15 @@
  * TEST-ONLY scripted callee for end-to-end guarded-call self-tests.
  *
  * Point a spare Twilio number's voice webhook at /api/test/callee-bot, then
- * run a guarded call to that number. The bot walks the callee flow blind:
- *   1. waits out the monitored prompt, "presses 1"  (RFC2833 via <Play digits>)
- *   2. speaks the voice-ID phrase into the engine's <Record>
- *   3. "presses #" to confirm
- *   4. RECORDS 25s of post-bridge conference audio (exactly what a real
- *      callee hears: caller audio + challenge-noise announces) and posts it
- *      to /api/test/callee-bot-record, which logs the RecordingUrl.
+ * run a guarded call to that number. The direct-connect guarded flow needs
+ * NO digits at all — the callee just answers and is bridged. The bot:
+ *   1. speaks the voice-ID phrase blind (~4-5s of speech) so the engine's
+ *      automatic in-call baseline capture (verification-stream.ts) gets
+ *      usable audio,
+ *   2. RECORDS 25s of conference audio (exactly what a real callee hears:
+ *      caller audio + challenge-noise announces) and posts it to
+ *      /api/test/callee-bot-record, which logs the RecordingUrl,
+ *   3. hangs up.
  *
  * These endpoints are test fixtures — no session state, no secrets.
  */
@@ -17,17 +19,10 @@ import twilio from "twilio";
 
 export async function testCalleeBotHandler(c: Context) {
   const vr = new twilio.twiml.VoiceResponse();
-  // 1) monitored prompt (~7s speech) then press 1 inside the gather window.
-  vr.pause({ length: 8 });
-  vr.play({ digits: "ww1" });
-  // 2) voice-ID prompt + beep (~6s), then speak the phrase for the recording
-  //    (engine <Record maxLength=8 timeout=3> ends ~3s after we stop).
-  vr.pause({ length: 6 });
-  vr.say("My name identifies me.");
-  // 3) record ends + action webhook + # prompt (~4s) — then press #.
-  vr.pause({ length: 6 });
-  vr.play({ digits: "ww#" });
-  // 4) bridged into the conference: capture what the callee actually hears.
+  // 1) speak right after answer — the engine's in-call VAD baseline capture
+  //    needs ≥2s of speech; this phrase runs ~4-5s.
+  vr.say("My name identifies me. I am the automated test callee, speaking for the voice baseline.");
+  // 2) capture what the callee actually hears in the bridged conference.
   vr.record({
     maxLength: 25,
     timeout: 3,
