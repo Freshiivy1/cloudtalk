@@ -30,12 +30,16 @@ const STATE_BADGE: Record<string, string> = {
   INITIATED: 'border-amber/40 bg-amber/10 text-amber',
   CALLER_HOLDING: 'border-amber/40 bg-amber/10 text-amber',
   LEG_A_DIALING: 'border-amber/40 bg-amber/10 text-amber',
+  CALL_ACCEPTED: 'border-violet/40 bg-violet/10 text-violet',
+  CALLEE_READY: 'border-violet/40 bg-violet/10 text-violet',
+  LEG_B_DIALING: 'border-violet/40 bg-violet/10 text-violet',
+  LEG_B_ANSWERED: 'border-violet/40 bg-violet/10 text-violet',
   BRIDGED: 'border-signal/40 bg-signal/10 text-signal',
   COMPLETED: 'border-sky/40 bg-sky/10 text-sky',
   FAILED: 'border-danger/40 bg-danger/10 text-danger',
-  MERGE_DETECTED: 'border-violet/40 bg-violet/10 text-violet',
-  VOIP_DETECTED: 'border-violet/40 bg-violet/10 text-violet',
-  CALL_WAITING_OFF: 'border-sky/40 bg-sky/10 text-sky',
+  MERGE_DETECTED: 'border-danger/40 bg-danger/10 text-danger',
+  VOIP_DETECTED: 'border-danger/40 bg-danger/10 text-danger',
+  CALL_WAITING_OFF: 'border-amber/40 bg-amber/10 text-amber',
 };
 
 function StateBadge({ state }: { state: string | null }) {
@@ -61,6 +65,20 @@ function latestSpeakerphone(events: VerificationEventRow[]) {
     verdict:
       latest?.details?.match(/verdict=([A-Z][A-Z_ ]*?)(?:\s+relayState|\s+weighted|$)/)?.[1] ?? null,
   };
+}
+
+function mergeGuardStatus(events: VerificationEventRow[], state: string | null) {
+  const types = new Set(events.map((e) => e.eventType));
+  if (state === 'MERGE_DETECTED' || types.has('MERGE_STREAM_DETECTED')) {
+    return { value: 'merge detected', hint: 'in-band tone leaked into the second call; call ended', tone: 'text-danger' };
+  }
+  if (state === 'BRIDGED' || state === 'COMPLETED' || types.has('GUARDED_BRIDGED')) {
+    return { value: 'passed', hint: 'no merge-tone leak during the watch window', tone: 'text-signal' };
+  }
+  if (types.has('GUARDED_MERGE_WATCH_ARMED') || state === 'LEG_B_ANSWERED') {
+    return { value: 'watching', hint: 'second call answered; listening for merge tone', tone: 'text-amber' };
+  }
+  return { value: 'pending', hint: 'starts after voice-ID and second-call answer', tone: 'text-text-hi' };
 }
 
 function MetricCard({
@@ -99,6 +117,7 @@ function SessionLiveView({ sessionId }: { sessionId: string }) {
   const voiceprintCaptured = events.some((e) => e.eventType === 'VOICEPRINT_CAPTURED');
   const voiceprintMissed = events.some((e) => e.eventType === 'VOICEPRINT_MISSED');
   const voiceMismatches = events.filter((e) => e.eventType === 'VOICE_MISMATCH').length;
+  const mergeGuard = mergeGuardStatus(events, session?.state ?? null);
 
   const timelineRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -137,10 +156,12 @@ function SessionLiveView({ sessionId }: { sessionId: string }) {
       </div>
 
       <div className="rounded-[14px] border border-signal/30 bg-signal/10 px-4 py-3 text-sm text-text-mid">
-        Direct-connect guarded call: the callee receives <span className="text-text-hi">one call</span>,
-        answers, and is connected — <span className="text-text-hi">no press-1, no voice-ID, no press-#</span>.
-        Voiceprint baseline is captured automatically from the first seconds of in-call callee speech;
-        speakerphone and voice-match monitoring run passively while bridged.
+        Guarded inmate call: the callee hears the inmate-call warning and presses{' '}
+        <span className="text-text-hi">1</span>, says{' '}
+        <span className="text-text-hi">“my voice identifies me”</span>, then keeps the current call
+        alive and accepts the second verification call. If the calls are merged, the in-band tone
+        leaks into the second call and the session ends; if no merge is detected, the caller and
+        callee bridge and live speakerphone/voice-match forensics continue.
       </div>
 
       {sessionQ.isLoading ? (
@@ -153,7 +174,7 @@ function SessionLiveView({ sessionId }: { sessionId: string }) {
         </div>
       ) : (
         <>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
             <MetricCard
               label="Callee"
               value={session ? formatPhoneDisplay(session.calleeNumber) : '—'}
@@ -172,9 +193,15 @@ function SessionLiveView({ sessionId }: { sessionId: string }) {
               tone={sp.count > 0 ? 'text-amber' : 'text-text-hi'}
             />
             <MetricCard
+              label="Merge guard"
+              value={mergeGuard.value}
+              hint={mergeGuard.hint}
+              tone={mergeGuard.tone}
+            />
+            <MetricCard
               label="Voiceprint"
-              value={voiceprintCaptured ? 'captured' : voiceprintMissed ? 'missed' : 'listening…'}
-              hint={voiceMismatches > 0 ? `${voiceMismatches} voice-match alert${voiceMismatches === 1 ? '' : 's'}` : 'auto-captured from in-call speech'}
+              value={voiceprintCaptured ? 'captured' : voiceprintMissed ? 'missed' : 'awaiting phrase…'}
+              hint={voiceMismatches > 0 ? `${voiceMismatches} voice-match alert${voiceMismatches === 1 ? '' : 's'}` : 'captured from the required voice-ID recording'}
               tone={voiceprintCaptured ? 'text-signal' : voiceprintMissed ? 'text-amber' : 'text-text-hi'}
             />
           </div>

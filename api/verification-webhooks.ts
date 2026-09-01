@@ -158,43 +158,9 @@ export async function verificationTwimlHandler(c: Context) {
 
       case "leg-a": {
         const a = attemptFrom(c);
-        // GUARDED MODE ONLY — DIRECT-CONNECT flow: the callee experiences
-        // ring → answer → connected to the caller. NO monitored warning, NO
-        // press-1, NO voiceprint Record, NO press-# — the entire callee IVR
-        // below (gather/monitored/voice-ID/voice-confirm) is skipped for
-        // guarded sessions and remains only as legacy/reference for the old
-        // flow. Leg A is dialed straight into the bridge conference inline
-        // (single conference creator), the media stream is attached first
-        // fetch only, and the engine (bridgeGuardedDirect) flips the session
-        // to BRIDGED and REST-redirects the parked caller in after Leg A's
-        // participation is confirmed. Callee no-answer/reject still arrives
-        // via the status callback → FAILED.
-        if (sid) {
-          const session = await vs.findSession(sid);
-          if (session?.guarded) {
-            if (vs.isTerminal(session)) {
-              vr.hangup();
-              break;
-            }
-            if (a === 0) {
-              const streamUrl = legAStreamUrl(sid);
-              if (streamUrl) {
-                vr.start().stream({ url: streamUrl, track: "inbound_track" });
-              }
-            }
-            vr.dial().conference(
-              { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
-              vs.conferenceName(sid),
-            );
-            void vs
-              .bridgeGuardedDirect(sid)
-              .catch((err) => console.error("[verify] bridgeGuardedDirect error:", err));
-            break;
-          }
-        }
-        // Phase 2, step 1: "Press 1 to accept". <Gather> accepts DTMF during
-        // playback. Timeout falls through to the re-prompt redirect; wrong
-        // digits re-prompt via the gather handler.
+        // Phase 2, step 1: "Press 1 to accept". Guarded and legacy sessions
+        // both start here — the callee must explicitly accept the inmate call
+        // before any voice-ID recording, second call, merge watch, or bridge.
         if (a >= vs.LEG_A_MAX_ATTEMPTS) {
           void vs
             .onLegFailed(sid, "legA", "callee rejected/no input")
@@ -222,18 +188,7 @@ export async function verificationTwimlHandler(c: Context) {
           action: vs.gatherLegAAcceptUrl(sid, a),
           method: "POST",
         });
-        // GUARDED MODE ONLY: the monitored-call warning replaces the legacy
-        // accept prompt (single-call flow — no merge is possible by design,
-        // and any conference attempt breaks the bridge). Non-guarded keeps
-        // the exact legacy accept prompt. Best-effort lookup: any failure
-        // falls back to the legacy accept prompt rather than breaking the IVR.
-        let legAGuarded = false;
-        try {
-          legAGuarded = Boolean(sid && (await vs.findSession(sid))?.guarded);
-        } catch {
-          legAGuarded = false;
-        }
-        gather.say(legAGuarded ? P.monitored : P.accept);
+        gather.say(P.accept);
         vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a", sid), a + 1));
         break;
       }
@@ -564,12 +519,11 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
       // is no longer reachable from this flow.
       const session = await vs.onCallAccepted(sid, String(body.CallSid ?? ""));
       if (session?.guarded) {
-        // GUARDED MODE ONLY: NO Leg B. Voice-ID prompt, then record the
-        // callee saying "my name identifies me"; the /api/verify/voiceprint
-        // action stashes the recording and asks for a # confirmation — only
-        // then is the audio saved as the relayguard voice baseline and the
-        // caller + callee bridged (see verificationVoiceConfirmHandler).
-        // (Verbs after <Record> are a fallback for a failed action fetch.)
+        // GUARDED MODE ONLY: press-1 → explicit voice-ID phrase. The
+        // /api/verify/voiceprint action processes the recording, announces the
+        // second call, starts Leg B via onCalleeReady(), and parks Leg A on the
+        // hold loop until merge verification passes. (Verbs after <Record> are
+        // a fallback for a failed action fetch.)
         const P = vs.verifyPrompts();
         vr.say(P.voiceId);
         vr.record({
@@ -579,6 +533,7 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
           action: vs.voiceprintUrl(sid),
           method: "POST",
         });
+        vr.say(P.secondCall);
         vr.pause({ length: 60 });
         vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
       } else {
@@ -627,52 +582,34 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
 
 /**
  * POST /api/verify/voiceprint?sid=… — action of the guarded voice-ID
- * <Record> ("my name identifies me"). ALWAYS answers with the hold-loop
- * TwiML so Leg A stays alive; the recording is then processed fire-and-forget
- * (never blocking the webhook): fetch the WAV from Twilio, build the callee
- * voice baseline (session-scoped, in-memory), log VOICEPRINT_CAPTURED, and
- * bridge caller + Leg A into the conference. On any failure the event is
- * VOICEPRINT_MISSED and the bridge still happens — the voiceprint is
- * best-effort and never blocks the call.
+ * <Record> ("my voice identifies me"). The recording is processed
+ * fire-and-forget into the relayguard baseline; the callee is then told that
+ * the second verification call is coming, must keep the current call alive,
+ * and must accept that next call. onCalleeReady() starts Leg B immediately;
+ * Leg A is parked on the non-blocking hold loop until the merge watch passes.
  */
-/** Voice-ID recordings stashed between <Record> and the callee's # confirm. */
-const pendingVoiceprints = new Map<
-  string,
-  { recordingUrl: string; durationSec: number; callSid: string; at: number }
->();
-
 export async function verificationVoiceprintHandler(c: Context) {
   const sid = c.req.query("sid") ?? "";
   const vr = new VoiceResponse();
+  const P = vs.verifyPrompts();
   try {
     const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
     const recordingUrl = String(body.RecordingUrl ?? "");
     const durationSec = Number(body.RecordingDuration ?? 0);
     const callSid = String(body.CallSid ?? "");
-    if (sid) {
-      // Opportunistically prune stale stashes (10 min TTL).
-      for (const [k, v] of pendingVoiceprints) {
-        if (Date.now() - v.at > 10 * 60_000) pendingVoiceprints.delete(k);
-      }
-      pendingVoiceprints.set(sid, { recordingUrl, durationSec, callSid, at: Date.now() });
-      // Ask for the # confirmation. finishOnKey="" DISABLES the default '#'
-      // finish key so the hash itself is captured as the gathered digit.
-      // The audio is only saved (processed into the relayguard baseline) once
-      // the callee confirms with # — see verificationVoiceConfirmHandler.
-      const P = vs.verifyPrompts();
-      const gather = vr.gather({
-        numDigits: 1,
-        finishOnKey: "",
-        timeout: IVR_GATHER_TIMEOUT,
-        action: vs.voiceConfirmUrl(sid, 0),
-        method: "POST",
-      });
-      gather.say(P.voiceConfirm);
-      // Gather-timeout fallthrough: the confirm handler re-prompts.
-      vr.redirect({ method: "POST" }, vs.voiceConfirmUrl(sid, 1));
-    } else {
+    const session = sid ? await vs.findSession(sid) : null;
+    if (!sid || !session || !session.guarded || vs.isTerminal(session)) {
       vr.hangup();
+      return xml(c, vr);
     }
+
+    void processVoiceprint(sid, { recordingUrl, durationSec, callSid }).catch((err) =>
+      console.error("[verify] voiceprint processing error:", err),
+    );
+    vr.say(P.secondCall);
+    await vs.onCalleeReady(sid);
+    vr.pause({ length: 60 });
+    vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
   } catch (err) {
     console.error("[verify] voiceprint handler error:", err);
     try {
@@ -685,73 +622,18 @@ export async function verificationVoiceprintHandler(c: Context) {
 }
 
 /**
- * POST /api/verify/gather/voice-confirm?sid=…&a=… — the callee pressed (or
- * failed to press) # after the voice-ID recording. On "#": save the audio
- * for relayguard forensics (async fetch + baseline + VOICEPRINT_CAPTURED
- * event), transition to BRIDGED, and join Leg A into the conference INLINE
- * (single conference creator; the caller leg follows via REST redirect once
- * Twilio confirms Leg A's participation).
+ * Fetch + analyze the explicit voice-ID recording and store it as the
+ * relayguard voice baseline. Best-effort: a missed/unusable recording never
+ * blocks second-call verification or the eventual bridge.
  */
-export async function verificationVoiceConfirmHandler(c: Context) {
-  const sid = c.req.query("sid") ?? "";
-  const a = attemptFrom(c);
-  const vr = new VoiceResponse();
-  const P = vs.verifyPrompts();
-  try {
-    const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
-    const digits = String(body.Digits ?? "");
-    const session = sid ? await vs.findSession(sid) : null;
-    if (!session || vs.isTerminal(session)) {
-      vr.hangup();
-      return xml(c, vr);
-    }
-    if (digits === "#") {
-      void processVoiceprint(sid).catch((err) =>
-        console.error("[verify] voiceprint processing error:", err),
-      );
-      const bridged = await vs.confirmAndBridgeGuarded(sid);
-      if (bridged) {
-        vr.dial().conference(
-          { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
-          vs.conferenceName(sid),
-        );
-      } else {
-        vr.hangup();
-      }
-    } else if (a + 1 >= vs.LEG_A_MAX_ATTEMPTS) {
-      void vs
-        .onLegFailed(sid, "legA", "callee rejected/no confirm")
-        .catch((err) => console.error("[verify] voice-confirm reject error:", err));
-      vr.say(P.reject);
-      vr.hangup();
-    } else {
-      const gather = vr.gather({
-        numDigits: 1,
-        finishOnKey: "",
-        timeout: IVR_GATHER_TIMEOUT,
-        action: vs.voiceConfirmUrl(sid, a + 1),
-        method: "POST",
-      });
-      gather.say(P.voiceConfirm);
-      vr.redirect({ method: "POST" }, vs.voiceConfirmUrl(sid, a + 2));
-    }
-  } catch (err) {
-    console.error("[verify] voice-confirm handler error:", err);
-  }
-  return xml(c, vr);
-}
-
-/**
- * Fetch + analyze the stashed voice-ID recording and store it as the
- * relayguard voice baseline (invoked only AFTER the callee confirms with #).
- */
-async function processVoiceprint(sid: string): Promise<void> {
-  const pending = pendingVoiceprints.get(sid);
-  pendingVoiceprints.delete(sid);
+async function processVoiceprint(
+  sid: string,
+  pending: { recordingUrl: string; durationSec: number; callSid: string },
+): Promise<void> {
   const session = await vs.findSession(sid);
   if (!session || !session.guarded || vs.isTerminal(session)) return;
   let captured = false;
-  if (pending?.recordingUrl && Number.isFinite(pending.durationSec) && pending.durationSec >= 1) {
+  if (pending.recordingUrl && Number.isFinite(pending.durationSec) && pending.durationSec >= 1) {
     try {
       const profile = await fetchVoiceProfile(pending.recordingUrl);
       vs.setVoiceBaseline(sid, profile);
@@ -759,7 +641,7 @@ async function processVoiceprint(sid: string): Promise<void> {
         sid,
         "VOICEPRINT_CAPTURED",
         `recording=${pending.recordingUrl} duration=${pending.durationSec}s callSid=${pending.callSid} ` +
-          `speechFrames=${profile.vad.speechFrames.length} voicedFrames=${profile.voicePrint.voicedFrames} — confirmed via #`,
+          `speechFrames=${profile.vad.speechFrames.length} voicedFrames=${profile.voicePrint.voicedFrames} — explicit voice-ID phrase`,
       );
       captured = true;
     } catch (err) {
@@ -770,7 +652,7 @@ async function processVoiceprint(sid: string): Promise<void> {
     await vs.logEvent(
       sid,
       "VOICEPRINT_MISSED",
-      `recording=${pending?.recordingUrl || "(none)"} duration=${pending?.durationSec ?? 0}s — confirmed via #, no usable audio (voiceprint is best-effort)`,
+      `recording=${pending.recordingUrl || "(none)"} duration=${pending.durationSec ?? 0}s — explicit voice-ID phrase, no usable audio (voiceprint is best-effort)`,
     );
   }
 }

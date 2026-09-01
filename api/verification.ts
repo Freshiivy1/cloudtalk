@@ -71,17 +71,12 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
   INITIATED: [VState.CALLER_HOLDING, VState.LEG_A_DIALING, VState.FAILED],
   CALLER_HOLDING: [VState.LEG_A_DIALING, VState.FAILED],
   // CALL_WAITING_OFF is reachable from the dialing/accept states because Leg B
-  // is now pre-originated when Leg A is ANSWERED (zero ring latency) — so a
-  // Leg B busy/fail/voicemail verdict can legitimately arrive before press-1.
-  // BRIDGED from LEG_A_DIALING is GUARDED MODE ONLY (direct-connect flow: the
-  // callee answers and is dialed straight into the bridge conference — no IVR,
-  // no press-1, no voiceprint Record). See bridgeGuardedDirect().
-  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.BRIDGED, VState.CALL_WAITING_OFF, VState.FAILED],
-  // BRIDGED from CALL_ACCEPTED is GUARDED MODE ONLY (single-call flow: no
-  // Leg B, bridge right after the voiceprint step). Non-guarded sessions
-  // still only reach BRIDGED via LEG_B_ANSWERED — nothing invokes this edge
-  // for them, so their behavior is unchanged.
-  CALL_ACCEPTED: [VState.CALLEE_READY, VState.BRIDGED, VState.CALL_WAITING_OFF, VState.FAILED],
+  // can be originated while Leg A is still in the IVR — so a Leg B busy/fail/
+  // voicemail verdict can legitimately arrive before the callee finishes the
+  // voice-ID step. Guarded sessions now use the same second-call verification
+  // path as the legacy flow and only bridge after LEG_B_ANSWERED + merge watch.
+  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.CALL_WAITING_OFF, VState.FAILED],
+  CALL_ACCEPTED: [VState.CALLEE_READY, VState.CALL_WAITING_OFF, VState.FAILED],
   CALLEE_READY: [VState.LEG_B_DIALING, VState.CALL_WAITING_OFF, VState.FAILED],
   LEG_B_DIALING: [
     VState.LEG_B_ANSWERED,
@@ -177,7 +172,7 @@ export function noiseEventThrottleMs(): number {
 
 /**
  * GUARDED MODE ONLY: session-scoped callee voice baseline. Captured from the
- * post-press-1 voiceprint <Record> ("my name identifies me") by the
+ * post-press-1 voiceprint <Record> ("my voice identifies me") by the
  * /api/verify/voiceprint webhook and compared against live Leg A audio
  * in-call (verification-stream.ts). In-memory only — the recording itself
  * persists on Twilio and is referenced by the VOICEPRINT_CAPTURED event.
@@ -287,11 +282,6 @@ export function gatherLegAReadyUrl(sessionId: string, attempt: number): string {
   return `${requirePublicBaseUrl()}/api/verify/gather/leg-a-ready?sid=${sessionId}&a=${attempt}`;
 }
 
-/** GUARDED MODE ONLY: # confirmation gather after the voice-ID recording. */
-export function voiceConfirmUrl(sessionId: string, attempt: number): string {
-  return `${requirePublicBaseUrl()}/api/verify/gather/voice-confirm?sid=${sessionId}&a=${attempt}`;
-}
-
 /** GUARDED MODE ONLY: voiceprint <Record> action — keeps the leg on hold. */
 export function voiceprintUrl(sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/voiceprint?sid=${sessionId}`;
@@ -314,18 +304,15 @@ export function verifyPrompts() {
   return {
     accept:
       e.VERIFY_PROMPT_ACCEPT ??
-      "You are about to receive a call from an inmate. Do not merge or transfer this call. Press 1 to accept.",
-    // GUARDED MODE ONLY (single-call flow): replaces `accept` on Leg A.
-    monitored:
-      e.VERIFY_PROMPT_MONITORED ??
-      "This call is being monitored. Do not make any attempt of conference call. Press 1 to be connected to the inmate.",
+      "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
     // GUARDED MODE ONLY: spoken after press-1, before the voiceprint <Record>.
     voiceId:
       e.VERIFY_PROMPT_VOICE_ID ??
-      "Please identify your voice. After the beep, say: my name identifies me.",
-    voiceConfirm:
-      e.VERIFY_PROMPT_VOICE_CONFIRM ??
-      "Thank you. Press hash to be connected to the inmate.",
+      "Please identify your voice. After the beep, say: my voice identifies me.",
+    // GUARDED MODE ONLY: spoken after the voice-ID recording, before Leg B.
+    secondCall:
+      e.VERIFY_PROMPT_SECOND_CALL ??
+      "Thank you. You will receive another call shortly. Do not end this current call. Accept the next call to continue.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
@@ -580,39 +567,6 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
   }
 }
 
-/** Poll until Twilio reports `callSid` inside the session's live conference. */
-async function waitForConferenceParticipant(
-  sessionId: string,
-  callSid: string | null,
-  timeoutMs: number,
-): Promise<string | null> {
-  if (!callSid) return null;
-  const deadline = Date.now() + timeoutMs;
-  let consecutiveErrors = 0;
-  while (Date.now() < deadline) {
-    try {
-      const confs = await getTwilioClient().conferences.list({
-        friendlyName: conferenceName(sessionId),
-        status: "in-progress",
-        limit: 5,
-      });
-      for (const conf of confs) {
-        const parts = await getTwilioClient()
-          .conferences(conf.sid)
-          .participants.list({ limit: 20 });
-        if (parts.some((p) => p.callSid === callSid)) return conf.sid;
-      }
-      consecutiveErrors = 0;
-    } catch {
-      // API path broken (or mocked) — don't stall the bridge on it.
-      consecutiveErrors++;
-      if (consecutiveErrors >= 3) return null;
-    }
-    await new Promise((r) => setTimeout(r, 750));
-  }
-  return null;
-}
-
 async function redirectCall(
   callSid: string | null,
   twimlKind: string,
@@ -831,100 +785,6 @@ export async function onGuardedCallerConnected(
 }
 
 /**
- * GUARDED MODE ONLY: bridge after the voiceprint step. In the single-call
- * guarded flow there is NO Leg B (merge/leg-a-tone machinery unreachable);
- * the callee pressed 1 (CALL_ACCEPTED) and recorded the voice-ID prompt, so
- * the caller + Leg A are bridged into conference verify-<sid> right away.
- * Idempotent: any later invocation is a no-op because the session has left
- * CALL_ACCEPTED. NON-GUARDED sessions return immediately.
- */
-/**
- * GUARDED MODE ONLY: callee pressed # after the voice-ID recording.
- * Transitions CALL_ACCEPTED → BRIDGED. Leg A joins the conference INLINE
- * via the confirm handler's own TwiML response (single conference creator —
- * avoids the duplicate-friendly-name race entirely); this function then
- * polls until Twilio confirms Leg A's participation and REST-redirects the
- * caller leg (parked in the non-blocking caller-wait pause loop) into the
- * bridge. The poll+redirect runs fire-and-forget so the webhook can answer
- * Leg A immediately.
- */
-/**
- * GUARDED MODE ONLY: direct-connect bridge — the CURRENT guarded callee flow.
- * The leg-a TwiML (fetched when the callee answers) dials Leg A straight into
- * conference verify-<sid> inline (single conference creator, beep=false,
- * startConferenceOnEnter + endConferenceOnExit) — NO monitored warning, NO
- * press-1, NO voiceprint Record. This function performs the matching engine
- * half: LEG_A_DIALING → BRIDGED, then fire-and-forget it polls until Twilio
- * confirms Leg A's conference participation and REST-redirects the caller leg
- * (parked in the non-blocking caller-wait pause loop) into the bridge.
- * Idempotent: any invocation after the session has left LEG_A_DIALING is a
- * no-op. NON-GUARDED sessions return immediately.
- */
-export async function bridgeGuardedDirect(sessionId: string): Promise<boolean> {
-  const session = await findSession(sessionId);
-  if (!session || !session.guarded) return false;
-  if (session.state !== VState.LEG_A_DIALING) return false; // already bridged/terminal
-  if (
-    await transition(
-      session,
-      VState.BRIDGED,
-      "direct-connect guarded bridge (no IVR)",
-    )
-  ) {
-    await logEvent(
-      sessionId,
-      "GUARDED_BRIDGED",
-      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; direct-connect (no IVR), Leg A dialed in inline, caller via REST redirect after participant confirmation`,
-    );
-    const callerSid = session.callerCallSid;
-    const legASid = session.legACallSid;
-    void (async () => {
-      const confSid = await waitForConferenceParticipant(sessionId, legASid, 20_000);
-      if (!confSid) {
-        console.warn(
-          `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within 20s; redirecting caller anyway`,
-        );
-      }
-      await redirectCall(callerSid, "guarded-bridge", sessionId);
-    })().catch((err) => console.error("[verify] guarded direct caller bridge error:", err));
-    return true;
-  }
-  return false;
-}
-
-export async function confirmAndBridgeGuarded(sessionId: string): Promise<boolean> {
-  const session = await findSession(sessionId);
-  if (!session || !session.guarded) return false;
-  if (session.state !== VState.CALL_ACCEPTED) return false; // already bridged/terminal
-  if (
-    await transition(
-      session,
-      VState.BRIDGED,
-      "voiceprint confirmed (#) — live guarded bridge (single-call flow)",
-    )
-  ) {
-    await logEvent(
-      sessionId,
-      "GUARDED_BRIDGED",
-      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A joins inline, caller via REST redirect after participant confirmation`,
-    );
-    const callerSid = session.callerCallSid;
-    const legASid = session.legACallSid;
-    void (async () => {
-      const confSid = await waitForConferenceParticipant(sessionId, legASid, 20_000);
-      if (!confSid) {
-        console.warn(
-          `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within 20s; redirecting caller anyway`,
-        );
-      }
-      await redirectCall(callerSid, "guarded-bridge", sessionId);
-    })().catch((err) => console.error("[verify] guarded caller bridge error:", err));
-    return true;
-  }
-  return false;
-}
-
-/**
  * Leg A's phone was picked up (Twilio status in-progress) — pre-originate
  * Leg B RIGHT NOW. PSTN origination to a busy line takes ~5-15s, so firing
  * here means the second call arrives around the first press-1 and is
@@ -987,19 +847,18 @@ export async function onCallAccepted(
   ) {
     session.legACallSid = callSid;
     await save(session);
-    // SPEED: pre-originate Leg B NOW, at the first press-1 — the second call
-    // rings during prompt 2 and arrives at the second "ready" press. (Firing
-    // earlier — at answer — made the second call arrive before the callee had
-    // accepted, which is not the intended flow.)
-    // GUARDED MODE ONLY: NO Leg B — the single-call flow plays the voice-ID
-    // prompt + voiceprint <Record> instead, then bridges from CALL_ACCEPTED.
+    // Non-guarded sessions keep the legacy behavior: Leg B is originated as
+    // soon as the callee accepts. Guarded sessions intentionally wait until
+    // the explicit voice-ID <Record> action announces the second call and
+    // invokes onCalleeReady(), so the callee is told to keep the current call
+    // alive before the next call arrives.
     if (!session.guarded) {
       await originateLegB(sessionId);
     } else {
       await logEvent(
         sessionId,
         "GUARDED_VOICEPRINT_STEP",
-        "callee accepted — voice-ID prompt + recording next (Leg B skipped in guarded mode)",
+        "callee accepted — voice-ID phrase recording next; second-call verification starts after the recording callback",
       );
     }
   }
@@ -1032,17 +891,15 @@ export async function onCalleeReady(sessionId: string): Promise<void> {
 async function originateLegB(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
   if (!session) return;
-  // GUARDED MODE ONLY: Leg B / merge-detect machinery is unreachable — the
-  // single-call flow bridges from CALL_ACCEPTED after the voiceprint step.
-  if (session.guarded) return;
   if (session.state === VState.LEG_B_DIALING || session.state === VState.LEG_B_ANSWERED) {
     return;
   }
 
-  // Leg B is normally ALREADY AIRBORNE here — pre-originated when Leg A was
-  // answered (onLegAAnswered) so the callee never waits for the second call.
-  // This function is then just the FSM ack; it only originates as a fallback
-  // when the pre-origination failed.
+  // Non-guarded Leg B is normally ALREADY AIRBORNE here — pre-originated when
+  // Leg A was answered (onLegAAnswered) so the callee never waits for the
+  // second call. Guarded Leg B starts here, immediately after the voice-ID
+  // recording callback tells the callee to keep the current call alive and
+  // accept the next call. Originate only as a fallback when not airborne.
   const alreadyAirborne = Boolean(session.legBCallSid);
 
   if (

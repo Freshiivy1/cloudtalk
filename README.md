@@ -84,13 +84,15 @@ curl https://merge-relay-a7ws.onrender.com/health   # {"ok":true,...}
 curl https://merge-relay-a7ws.onrender.com/stats    # live counters
 ```
 
-Then from the CloudTalk softphone, toggle **Guarded inmate call** and dial. The guarded flow is direct-connect:
+Then from the CloudTalk softphone, toggle **Guarded inmate call** and dial. The guarded flow is IVR + voice-ID + second-call verification:
 
 1. The browser places an outbound Twilio Voice SDK call carrying the guarded session id — the caller hears “Please wait while we connect your call.” and stays parked in a non-blocking wait loop.
-2. The callee receives exactly **one** call. On answer there is **no IVR**: no monitored prompt, no press-1, no voice-ID recording, no press-#. Leg A is dialed straight into the bridge conference and the parked caller is redirected in after Twilio confirms participation.
-3. The callee voiceprint baseline is captured automatically from the first seconds of in-call callee speech on the Leg A media stream (`VOICEPRINT_CAPTURED` with `source=in-call-auto`).
-4. While BRIDGED, relayguard speakerphone scoring and voice-match comparison run passively; suspicious windows inject callee-only challenge noise and never hang up the call.
-5. Watch it live from the softphone’s **Live analysis** panel or open `/app/live-analysis/<sessionId>` for the full result page.
+2. The callee hears the inmate-call warning and must press **1** to accept: “You are receiving a call from an inmate… please press 1 if you accept.”
+3. After acceptance, the callee is asked to say the voice-ID phrase: **“my voice identifies me.”** The recording is processed into the relayguard voice baseline (`VOICEPRINT_CAPTURED`, best-effort).
+4. The callee is then told another call is coming, must **not end the current call**, and must accept the next call. Leg B runs the second-call/merge verification while Leg A plays the in-band tone loop.
+5. If the callee merges the calls, the tone leaks into Leg B and the session ends as `MERGE_DETECTED`. If no merge is detected during the watch window, the caller and callee are bridged.
+6. While BRIDGED, relayguard speakerphone scoring and voice-match comparison run live; suspicious windows inject callee-only challenge noise and never hang up the call.
+7. Watch it live from the softphone’s **Live analysis** panel or open `/app/live-analysis/<sessionId>` for the full result page.
 
 The classic admin CallVerify flow (Leg A IVR → Leg B probe → merge/voip/call-waiting verdict) remains available under `/admin/verification` for non-guarded verification only.
 

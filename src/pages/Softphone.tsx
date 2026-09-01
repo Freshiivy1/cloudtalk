@@ -151,8 +151,15 @@ const GUARDED_STATE_BADGE: Record<string, string> = {
   INITIATED: 'border-amber/40 bg-amber/10 text-amber',
   CALLER_HOLDING: 'border-amber/40 bg-amber/10 text-amber',
   LEG_A_DIALING: 'border-amber/40 bg-amber/10 text-amber',
+  CALL_ACCEPTED: 'border-violet/40 bg-violet/10 text-violet',
+  CALLEE_READY: 'border-violet/40 bg-violet/10 text-violet',
+  LEG_B_DIALING: 'border-violet/40 bg-violet/10 text-violet',
+  LEG_B_ANSWERED: 'border-violet/40 bg-violet/10 text-violet',
   BRIDGED: 'border-signal/40 bg-signal/10 text-signal',
   COMPLETED: 'border-sky/40 bg-sky/10 text-sky',
+  MERGE_DETECTED: 'border-danger/40 bg-danger/10 text-danger',
+  VOIP_DETECTED: 'border-danger/40 bg-danger/10 text-danger',
+  CALL_WAITING_OFF: 'border-amber/40 bg-amber/10 text-amber',
   FAILED: 'border-danger/40 bg-danger/10 text-danger',
 };
 
@@ -195,7 +202,7 @@ function GuardedLivePanel({
     },
     {
       label: 'Voiceprint',
-      value: voiceprintCaptured ? 'captured (in-call)' : voiceprintMissed ? 'missed' : 'listening…',
+      value: voiceprintCaptured ? 'captured (voice-ID)' : voiceprintMissed ? 'missed' : 'awaiting phrase…',
       cls: voiceprintCaptured ? 'text-signal' : voiceprintMissed ? 'text-amber' : 'text-text-low',
     },
     {
@@ -615,7 +622,7 @@ export default function Softphone() {
                       <ShieldCheck className={cn('h-4 w-4', guarded ? 'text-signal' : 'text-text-low')} />
                       <div>
                         <p className="text-xs font-medium text-text-hi">Guarded inmate call</p>
-                        <p className="text-[10px] text-text-low">One callee call · no prompts · live analysis</p>
+                        <p className="text-[10px] text-text-low">Press-1 verify · voice ID · merge guard</p>
                       </div>
                     </div>
                     <Switch
