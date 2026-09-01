@@ -36,6 +36,7 @@ import {
   CHALLENGE_NOISE_SEED,
   challengeNoiseWav,
 } from "./relayguard/noise";
+import { mergeToneWav } from "./relayguard/dtmf";
 import { wavToPcm16 } from "./verification-record";
 import { analyzeClip, type ClipProfile } from "./relayguard/features";
 
@@ -109,6 +110,29 @@ export async function challengeNoiseHandler(c: Context) {
   } catch (err) {
     console.error("[verify] challenge-noise render failed:", err);
     return c.text("noise unavailable", 500);
+  }
+}
+
+/**
+ * GET /api/verify/merge-probe.wav — serves the BRIDGED in-call merge probe:
+ * a short continuous DTMF-'9' burst (852+1336 Hz, VERIFY_MERGE_PROBE_TONE_SEC
+ * seconds) rendered by relayguard/dtmf.ts. Used as the conference announceUrl
+ * for the Leg A participant only; if the callee merged the bridged call into
+ * a conference, the burst echoes back up Leg A's own media stream and the
+ * stream-side Goertzel detector fires inside the recorded guard window.
+ */
+export async function mergeProbeToneHandler(c: Context) {
+  try {
+    const buf = mergeToneWav(vs.mergeProbeToneSec());
+    return c.body(new Uint8Array(buf), 200, {
+      "Content-Type": "audio/wav",
+      "Content-Length": String(buf.byteLength),
+      "Cache-Control": "no-store",
+      "X-Merge-Probe": `dtmf=9;freq=852+1336Hz;duration=${vs.mergeProbeToneSec()}s`,
+    });
+  } catch (err) {
+    console.error("[verify] merge-probe render failed:", err);
+    return c.text("probe unavailable", 500);
   }
 }
 
@@ -411,6 +435,15 @@ export async function verificationTwimlHandler(c: Context) {
       case "notify-merge": {
         // Played to the caller (Leg B gets it in the merge gather handler).
         vr.say(P.mergeDetected);
+        vr.hangup();
+        break;
+      }
+
+      case "notify-conference-merge": {
+        // IN-CALL (BRIDGED) merge detection: every leg hears the
+        // conference-ending notice; the engine also completes the conference
+        // by SID so all participants drop even mid-<Dial><Conference>.
+        vr.say(P.conferenceEnding);
         vr.hangup();
         break;
       }

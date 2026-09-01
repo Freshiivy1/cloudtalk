@@ -175,8 +175,9 @@ export class MergeToneDetector {
  * 6 s window of decoded PCM; every ~10 s of incoming audio it profiles the
  * window (whole-clip extraction — the vendored panel has no incremental API)
  * and runs compareVoicePanel(baseline, live). A 'different' consensus fires
- * vs.onVoiceMismatch (VOICE_MISMATCH event, throttled 30 s, feeding the
- * existing challenge-noise suspicion path). DETECTION ONLY — never hangs up.
+ * vs.onVoiceMismatch (VOICE_MISMATCH event, throttled 30 s — detection only;
+ * challenge noise is reserved for the SpeakerphoneDetector suspicion path).
+ * DETECTION ONLY — never hangs up, never injects noise.
  * Entirely inert until a baseline exists for the session.
  */
 class VoiceMatchMonitor {
@@ -281,6 +282,12 @@ async function legASpeakerphoneDetector(
         void vs
           .injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`)
           .catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
+        // A suspicious window is exactly when a mid-call merge is most
+        // likely — fire an immediate merge probe burst instead of waiting
+        // for the next interval tick.
+        void vs
+          .fireMergeProbeNow(sid)
+          .catch((err) => console.error("[verify-stream] fireMergeProbeNow error:", err));
       },
       onClean: (detail) => {
         console.log(`[verify-stream] SPEAKERPHONE CLEARED sid=${sid} ${detail}`);
@@ -318,7 +325,10 @@ export function attachVerificationStreamServer(server: HttpServer): void {
 
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const sid = new URL(req.url ?? "", "http://localhost").searchParams.get("sid") ?? "";
-    const detector = new MergeToneDetector();
+    // `let`: after an in-guard echo is noted (below the strike threshold) the
+    // detector is REPLACED with a fresh instance so it can hear the echo of
+    // the NEXT probe burst — MergeToneDetector itself fires only once.
+    let detector = new MergeToneDetector();
     // Relayguard speakerphone detector — attached LAZILY on the stream's
     // `start` event, and only when the Twilio CallSid resolves to a session's
     // legACallSid. Only CALLEE-side (Leg A) audio is analyzed: the outer
@@ -369,9 +379,14 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         console.log(
           `[verify-stream] MERGE TONE DETECTED sid=${sid} after ${frames} frames (~${frames * 20}ms of audio)`,
         );
-        void fireMergeDetected(sid).catch((err) =>
-          console.error("[verify-stream] fire error:", err),
-        );
+        void handleMergeToneFire(sid)
+          .then((outcome) => {
+            // An in-guard echo below the strike threshold is not a verdict —
+            // re-arm with a FRESH detector (MergeToneDetector fires only
+            // once) so the next probe burst's echo can be heard.
+            if (outcome === "echo") detector = new MergeToneDetector();
+          })
+          .catch((err) => console.error("[verify-stream] fire error:", err));
       }
     });
 
@@ -382,13 +397,63 @@ export function attachVerificationStreamServer(server: HttpServer): void {
   });
 }
 
-/** Stream-detected merge: run the standard verdict, then tell Leg B. */
-export async function fireMergeDetected(sid: string): Promise<void> {
+/**
+ * MergeToneDetector fire path (Leg A uplink stream / Leg B relay stream).
+ *
+ * BRIDGED in-call detection: the probe scheduler announces DTMF-'9' bursts to
+ * the Leg A participant, so a tone fire INSIDE a burst's guard window is an
+ * ECHO, not an immediate verdict — count echo strikes and only fire after
+ * VERIFY_MERGE_PROBE_ECHO_STRIKES consecutive echoing bursts. A fire OUTSIDE
+ * the guard window is real in-call tone leakage → verdict immediately.
+ * Pre-bridge sessions keep the original behavior (instant verdict).
+ *
+ * Returns "merge" when the verdict fired, "echo" when an in-guard echo was
+ * noted below the strike threshold (the caller must re-arm the detector),
+ * "ignored" otherwise (unknown/terminal session).
+ */
+export async function handleMergeToneFire(
+  sid: string,
+): Promise<"merge" | "echo" | "ignored"> {
+  const session = await vs.findSession(sid);
+  if (!session || vs.isTerminal(session)) return "ignored";
+  if (session.state === vs.VState.BRIDGED) {
+    if (vs.isMergeProbeGuarded(sid)) {
+      const strikes = vs.noteMergeProbeEcho(sid);
+      console.log(
+        `[verify-stream] MERGE_PROBE_ECHO sid=${sid} strikes=${strikes}/${vs.mergeProbeEchoStrikes()}`,
+      );
+      if (strikes < vs.mergeProbeEchoStrikes()) return "echo";
+    }
+    await fireMergeDetected(sid, { inCall: true });
+    return "merge";
+  }
+  await fireMergeDetected(sid);
+  return "merge";
+}
+
+/**
+ * Stream-detected merge: run the standard verdict, then tell Leg B.
+ * opts.inCall (or a BRIDGED session) routes every leg — including Leg B — to
+ * the conference-ending announcement via onMergeDetected; pre-bridge callers
+ * keep the original behavior (Leg B redirected to notify-merge here).
+ */
+export async function fireMergeDetected(
+  sid: string,
+  opts: { inCall?: boolean } = {},
+): Promise<void> {
   if (!sid) return;
   const session = await vs.findSession(sid);
   if (!session || vs.isTerminal(session)) return;
-  await vs.logEvent(sid, "MERGE_STREAM_DETECTED", "Goertzel detector fired on Leg B inbound audio");
-  await vs.onMergeDetected(sid); // caller verdict + hangup Leg A + ring test
+  const inCall = opts.inCall === true || session.state === vs.VState.BRIDGED;
+  await vs.logEvent(
+    sid,
+    "MERGE_STREAM_DETECTED",
+    inCall
+      ? "Goertzel detector fired on in-call (BRIDGED) audio"
+      : "Goertzel detector fired on Leg B inbound audio",
+  );
+  await vs.onMergeDetected(sid, { inCall }); // verdict + full teardown
+  if (inCall) return; // onMergeDetected already redirected every present leg
   const legB = session.legBCallSid;
   if (legB) {
     await getTwilioClient().calls(legB).update({

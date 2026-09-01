@@ -20,6 +20,10 @@ process.env.PUBLIC_BASE_URL ??= "https://verify-test.example.com";
 process.env.TWILIO_ACCOUNT_SID ??= "AC_test_mock";
 process.env.TWILIO_AUTH_TOKEN ??= "test_auth_token";
 process.env.TWILIO_CALLER_ID ??= "+61400000001";
+// Periodic in-call merge probing is disabled by default in tests (0) so the
+// probe scheduler never fires incidentally mid-suite; the scheduler tests
+// opt in explicitly. Manual bursts (fireMergeProbeNow) are unaffected.
+process.env.VERIFY_MERGE_PROBE_INTERVAL_MS ??= "0";
 
 /** Recorded Twilio REST interactions from the mocked client. */
 const twilioMock = vi.hoisted(() => ({
@@ -31,6 +35,7 @@ const twilioMock = vi.hoisted(() => ({
     announceUrl?: string;
     announceMethod?: string;
   }>,
+  conferenceUpdates: [] as Array<{ conference: string; status?: string }>,
 }));
 
 vi.mock("twilio", async (importOriginal) => {
@@ -64,6 +69,10 @@ vi.mock("twilio", async (importOriginal) => {
             return {};
           },
         }),
+        update: async (opts: { status?: string }) => {
+          twilioMock.conferenceUpdates.push({ conference: name, ...opts });
+          return {};
+        },
       }),
       {
         // Engine resolves the live conference SID by friendly name first
@@ -80,7 +89,7 @@ vi.mock("twilio", async (importOriginal) => {
   return { ...actual, default: factory };
 });
 
-const { createdCalls, updatedCalls, participantUpdates } = twilioMock;
+const { createdCalls, updatedCalls, participantUpdates, conferenceUpdates } = twilioMock;
 
 const RUN = `t${Date.now().toString(36)}`;
 const createdIds: string[] = [];
@@ -403,6 +412,208 @@ describe("injectChallengeNoise (outer speakerphone → callee leg)", () => {
     expect(participantUpdates.slice(partBefore)).toHaveLength(0);
     expect(updatedCalls.slice(updBefore)).toHaveLength(0);
   });
+
+  it("is a no-op once the session is not BRIDGED (e.g. after MERGE_DETECTED)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      callerCallSid: "CA_nt_caller",
+      legACallSid: "CA_nt_legA",
+      ringTestCallSid: "CA_nt_rt",
+    });
+    await vs.onMergeDetected(s.sessionId); // pre-bridge verdict → terminal
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
+    const partBefore = participantUpdates.length;
+    // A late speakerphone suspicion (e.g. detector refire racing the verdict)
+    // must NOT inject noise on a non-BRIDGED / terminal session.
+    await vs.injectChallengeNoise(s.sessionId, "score=0.95 late suspicion");
+    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    const sp = (await events(s.sessionId)).filter(
+      (e) => e.eventType === "SPEAKERPHONE_SUSPECTED",
+    );
+    expect(sp).toHaveLength(0);
+  });
+});
+
+describe("onVoiceMismatch (detection only — challenge noise stays forensic-gated)", () => {
+  it("logs the throttled VOICE_MISMATCH event but NEVER injects challenge noise", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_vm_caller",
+      legACallSid: "CA_vm_legA",
+    });
+    const partBefore = participantUpdates.length;
+    const updBefore = updatedCalls.length;
+    await vs.onVoiceMismatch(s.sessionId, "consensus=different test");
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("VOICE_MISMATCH");
+    // No conference announce, no redirect, no hangup — detection only.
+    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    expect(updatedCalls.slice(updBefore)).toHaveLength(0);
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+    // Throttled: a second mismatch inside the window writes no duplicate event.
+    await vs.onVoiceMismatch(s.sessionId, "consensus=different again");
+    const vm = (await events(s.sessionId)).filter((e) => e.eventType === "VOICE_MISMATCH");
+    expect(vm).toHaveLength(1);
+  });
+});
+
+describe("BRIDGED in-call merge probing", () => {
+  it("probe scheduler announces the DTMF-9 burst to the Leg A participant only and stops on terminal state", async () => {
+    process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "60";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_mp_caller",
+        legACallSid: "CA_mp_legA",
+      });
+      const partBefore = participantUpdates.length;
+      vs.startMergeProbe(s.sessionId);
+      await tick(3300); // first burst fires ~3s after the bridge
+      const added = participantUpdates.slice(partBefore);
+      expect(added.length).toBeGreaterThanOrEqual(1);
+      // Leg A (callee) participant ONLY, on this session's live conference.
+      expect(added.every((p) => p.participant === "CA_mp_legA")).toBe(true);
+      expect(added.every((p) => p.conference === `verify-${s.sessionId}`)).toBe(true);
+      expect(added[0].announceUrl).toContain("/api/verify/merge-probe.wav");
+      expect(added[0].announceMethod).toBe("GET");
+      // A burst opened a guard window the stream path can consult.
+      expect(vs.isMergeProbeGuarded(s.sessionId)).toBe(true);
+      // Terminal transition stops the scheduler — no further bursts at all.
+      await vs.onCallCompleted(s.sessionId, "caller", "CA_mp_caller", "duration=5s");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.COMPLETED);
+      const count = participantUpdates.length;
+      await tick(300); // several 60ms intervals would have fired otherwise
+      expect(participantUpdates.length).toBe(count);
+    } finally {
+      process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0";
+    }
+  });
+
+  it("VERIFY_MERGE_PROBE_INTERVAL_MS=0 disables periodic probing (manual bursts still work)", async () => {
+    process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_mp0_caller",
+        legACallSid: "CA_mp0_legA",
+      });
+      const partBefore = participantUpdates.length;
+      vs.startMergeProbe(s.sessionId);
+      await tick(3400); // past the first-tick delay — nothing may fire
+      expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+      // fireMergeProbeNow (speakerphone suspicion path) is unaffected.
+      await vs.fireMergeProbeNow(s.sessionId);
+      const added = participantUpdates.slice(partBefore);
+      expect(added).toHaveLength(1);
+      expect(added[0].participant).toBe("CA_mp0_legA");
+      expect(added[0].announceUrl).toContain("/api/verify/merge-probe.wav");
+      vs.stopMergeProbe(s.sessionId);
+    } finally {
+      process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0";
+    }
+  });
+
+  it("tone fire OUTSIDE the guard window while BRIDGED → MERGE_DETECTED + full conference teardown", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_og_caller",
+      legACallSid: "CA_og_legA",
+      legBCallSid: "CA_og_legB",
+    });
+    // No probe burst armed → any tone fire is real in-call leakage.
+    expect(vs.isMergeProbeGuarded(s.sessionId)).toBe(false);
+    expect(await handleMergeToneFire(s.sessionId)).toBe("merge");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.MERGE_DETECTED);
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_og_caller" && String(u.url).includes("notify-conference-merge"),
+      ),
+    ).toBe(true);
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_og_legA" && String(u.url).includes("notify-conference-merge"),
+      ),
+    ).toBe(true);
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_og_legB" && String(u.url).includes("notify-conference-merge"),
+      ),
+    ).toBe(true);
+    expect(
+      conferenceUpdates.some(
+        (u) => u.conference === `verify-${s.sessionId}` && u.status === "completed",
+      ),
+    ).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("MERGE_STREAM_DETECTED");
+  });
+
+  it("tone fire INSIDE the guard once is just an echo; echoes on 2 consecutive probe cycles → MERGE_DETECTED", async () => {
+    process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0"; // manual bursts only
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_ig_caller",
+        legACallSid: "CA_ig_legA",
+      });
+      // Burst 1 → echo inside its guard window = strike 1 (< 2): NO verdict.
+      await vs.fireMergeProbeNow(s.sessionId);
+      expect(vs.isMergeProbeGuarded(s.sessionId)).toBe(true);
+      expect(await handleMergeToneFire(s.sessionId)).toBe("echo");
+      expect((await vs.findSession(s.sessionId))!).toMatchObject({
+        state: vs.VState.BRIDGED,
+      });
+      // Burst 2 (burst 1 echoed, so the strike count carries over) → echo = strike 2.
+      await vs.fireMergeProbeNow(s.sessionId);
+      expect(vs.isMergeProbeGuarded(s.sessionId)).toBe(true);
+      expect(await handleMergeToneFire(s.sessionId)).toBe("merge");
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.MERGE_DETECTED);
+      expect(
+        updatedCalls.some(
+          (u) => u.sid === "CA_ig_caller" && String(u.url).includes("notify-conference-merge"),
+        ),
+      ).toBe(true);
+    } finally {
+      process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0";
+    }
+  });
+
+  it("a probe burst with NO echo resets the consecutive-strike count", async () => {
+    process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_rs_caller",
+        legACallSid: "CA_rs_legA",
+      });
+      await vs.fireMergeProbeNow(s.sessionId); // burst 1
+      expect(await handleMergeToneFire(s.sessionId)).toBe("echo"); // strike 1
+      await vs.fireMergeProbeNow(s.sessionId); // burst 2: burst 1 echoed → strikes kept (1)
+      await vs.fireMergeProbeNow(s.sessionId); // burst 3: burst 2 had NO echo → strikes reset to 0
+      // An echo in burst 3 is therefore strike 1 again — still no verdict.
+      expect(await handleMergeToneFire(s.sessionId)).toBe("echo");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+      vs.stopMergeProbe(s.sessionId);
+    } finally {
+      process.env.VERIFY_MERGE_PROBE_INTERVAL_MS = "0";
+    }
+  });
+
+  it("non-BRIDGED tone fire keeps the legacy instant verdict (no guard consulted)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      callerCallSid: "CA_lg_caller",
+      legACallSid: "CA_lg_legA",
+      legBCallSid: "CA_lg_legB",
+    });
+    expect(await handleMergeToneFire(s.sessionId)).toBe("merge");
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
+    // Pre-bridge path: notify-merge (not the conference teardown).
+    expect(
+      updatedCalls.some((u) => u.sid === "CA_lg_caller" && String(u.url).includes("twiml/notify-merge")),
+    ).toBe(true);
+    expect(conferenceUpdates.some((u) => u.conference === `verify-${s.sessionId}`)).toBe(false);
+  });
 });
 
 describe("guarded live bridge (verification pass → BRIDGED)", () => {
@@ -531,22 +742,49 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(added.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
   });
 
-  it("BRIDGED: post-bridge merge detection via the stream path still hangs up", async () => {
+  it("BRIDGED: in-call merge detection tears down the whole conference", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_pm_caller",
       legACallSid: "CA_pm_legA",
+      legBCallSid: "CA_pm_legB",
       ringTestCallSid: "CA_pm_rt",
     });
     await vs.onMergeDetected(s.sessionId);
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.MERGE_DETECTED);
-    // Existing behavior preserved: caller verdict + Leg A / ring test hangups.
-    expect(updatedCalls.some((u) => u.sid === "CA_pm_caller" && String(u.url).includes("notify-merge"))).toBe(true);
-    expect(updatedCalls.some((u) => u.sid === "CA_pm_legA" && u.status === "completed")).toBe(true);
+    // In-call verdict: BOTH bridge legs (and Leg B) are redirected to the
+    // conference-ending announcement (say + hangup), the ring test is hung
+    // up, and the live conference is completed by SID (belt-and-braces — a
+    // REST redirect cannot pull a leg out of an active <Dial><Conference>).
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_pm_caller" && String(u.url).includes("notify-conference-merge"),
+      ),
+    ).toBe(true);
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_pm_legA" && String(u.url).includes("notify-conference-merge"),
+      ),
+    ).toBe(true);
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_pm_legB" && String(u.url).includes("notify-conference-merge"),
+      ),
+    ).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_pm_rt" && u.status === "completed")).toBe(true);
+    expect(
+      conferenceUpdates.some(
+        (u) => u.conference === `verify-${s.sessionId}` && u.status === "completed",
+      ),
+    ).toBe(true);
+    // Idempotent: a second detection is a no-op on a terminal session.
+    const updCount = updatedCalls.length;
+    await vs.onMergeDetected(s.sessionId, { inCall: true });
+    expect(updatedCalls.length).toBe(updCount);
   });
 
-  it("BRIDGED: caller hangup → COMPLETED with timestamps + Leg A dropped", async () => {
+  it("BRIDGED: caller hangup → COMPLETED + Leg A told the first call ended", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_b_caller",
@@ -556,7 +794,17 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.COMPLETED);
     expect(after.completedAt).not.toBeNull();
-    expect(updatedCalls.some((u) => u.sid === "CA_b_legA" && u.status === "completed")).toBe(true);
+    // Symmetric with the callee-hangup direction: the remaining party (Leg A)
+    // is NOT silently dropped — they're redirected to the "first call ended"
+    // announcement, whose TwiML (<Hangup/>) then ends the leg.
+    expect(
+      updatedCalls.some(
+        (u) => u.sid === "CA_b_legA" && String(u.url).includes("notify-first-call-ended"),
+      ),
+    ).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_b_legA" && u.status === "completed")).toBe(
+      false,
+    );
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("GUARDED_CALL_ENDED");
     expect(types).toContain(vs.VState.COMPLETED);
@@ -724,8 +972,13 @@ import {
   verificationRecordingAudioHandler,
   verificationRecordingHandler,
 } from "./verification-record";
-import { verificationStreamDetectedHandler, relayStreamUrl } from "./verification-stream";
 import {
+  handleMergeToneFire,
+  verificationStreamDetectedHandler,
+  relayStreamUrl,
+} from "./verification-stream";
+import {
+  mergeProbeToneHandler,
   verificationStatusHandler,
   verificationTwimlHandler,
   verificationVoiceprintHandler,
@@ -740,6 +993,7 @@ hookApp.post("/api/verify/gather/leg-a-accept", verificationGatherLegAAcceptHand
 hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandler);
 hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
+hookApp.get("/api/verify/merge-probe.wav", mergeProbeToneHandler);
 hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
 hookApp.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
 hookApp.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
@@ -807,6 +1061,36 @@ describe("webhooks", () => {
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("MERGE_LISTEN_STRAY_DIGIT");
+  });
+
+  it("notify-conference-merge TwiML plays the conference-ending prompt + <Hangup/>", async () => {
+    const res = await postForm("/api/verify/twiml/notify-conference-merge?sid=abc123");
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("We've identified a conference call. This call is ending now.");
+    expect(body).toContain("<Hangup");
+  });
+
+  it("notify-conference-merge prompt is env-overridable (VERIFY_PROMPT_CONFERENCE_ENDING)", async () => {
+    process.env.VERIFY_PROMPT_CONFERENCE_ENDING = "Custom conference ending notice.";
+    try {
+      const res = await postForm("/api/verify/twiml/notify-conference-merge?sid=abc123");
+      const body = await res.text();
+      expect(body).toContain("Custom conference ending notice.");
+      expect(body).toContain("<Hangup");
+    } finally {
+      delete process.env.VERIFY_PROMPT_CONFERENCE_ENDING;
+    }
+  });
+
+  it("merge-probe.wav endpoint serves the DTMF-9 burst as audio/wav", async () => {
+    const res = await hookApp.request("/api/verify/merge-probe.wav");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("audio/wav");
+    const buf = Buffer.from(await res.arrayBuffer());
+    expect(buf.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    // Default 1.2s @ 8 kHz 16-bit mono = 19200 data bytes + 44 header.
+    expect(buf.length).toBe(44 + Math.round(1.2 * 8000) * 2);
   });
 
   it("leg-a-tone TwiML loops the in-band audio tone (1400Hz port)", async () => {

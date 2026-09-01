@@ -205,9 +205,10 @@ export function getVoiceBaseline(sessionId: string): ClipProfile | null {
 
 /**
  * In-call voice comparison fired on a 'different' consensus. Detection only —
- * NEVER hangs up. Throttled to one event write per voiceMismatchThrottleMs();
- * the detail carries VOICE_MISMATCH so it also feeds the existing
- * challenge-noise suspicion path (injectChallengeNoise is BRIDGED-gated).
+ * NEVER hangs up and NEVER fires challenge noise: a voice mismatch is a
+ * forensic signal (event log + dashboard), while challenge noise is reserved
+ * for the SpeakerphoneDetector.onSuspicious path exclusively. Throttled to
+ * one event write per voiceMismatchThrottleMs().
  */
 export async function onVoiceMismatch(sessionId: string, detail: string): Promise<void> {
   const last = lastVoiceMismatchAt.get(sessionId) ?? -Infinity;
@@ -215,7 +216,6 @@ export async function onVoiceMismatch(sessionId: string, detail: string): Promis
   lastVoiceMismatchAt.set(sessionId, Date.now());
   console.warn(`[verify] VOICE_MISMATCH session=${sessionId} | ${detail}`);
   await logEvent(sessionId, "VOICE_MISMATCH", detail);
-  await injectChallengeNoise(sessionId, `VOICE_MISMATCH ${detail}`);
 }
 
 /**
@@ -230,6 +230,7 @@ function cleanupSessionMaps(sessionId: string): void {
   lastNoiseEventAt.delete(sessionId);
   voiceBaselineBySession.delete(sessionId);
   lastVoiceMismatchAt.delete(sessionId);
+  stopMergeProbe(sessionId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -353,6 +354,11 @@ export function verifyPrompts() {
     mergeDetected:
       e.VERIFY_PROMPT_MERGE_DETECTED ??
       "We detected a potential speakerphone or merged call on this line. This call will now end. Goodbye.",
+    // GUARDED MODE ONLY: played to every leg when a merge is detected MID-CALL
+    // (BRIDGED) — the whole conference is torn down right after.
+    conferenceEnding:
+      e.VERIFY_PROMPT_CONFERENCE_ENDING ??
+      "We've identified a conference call. This call is ending now.",
     voipCallee:
       e.VERIFY_PROMPT_VOIP_CALLEE ??
       "This call cannot be completed. This line appears to be a VoIP or multi-line service.",
@@ -587,6 +593,172 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
       (err as Error).message,
     );
     return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* BRIDGED in-call merge probing (Goal A)                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Once BRIDGED, the continuous merge tone on Leg A stops (the bridge TwiML
+ * replaced the tone loop), so a mid-call callee-side merge would be invisible.
+ * The probe scheduler announces a short DTMF-'9' burst (merge-probe.wav) to
+ * the LEG A conference participant only, every mergeProbeIntervalMs(). If the
+ * callee merged the call into a conference, the burst echoes back up Leg A's
+ * own uplink media stream; the stream-side MergeToneDetector fire path then
+ * consults isMergeProbeGuarded()/noteMergeProbeEcho() to count echo strikes —
+ * sustained echoes across mergeProbeEchoStrikes() consecutive bursts (or any
+ * tone fire OUTSIDE the guard window) fire the in-call merge verdict.
+ */
+
+/** Probe interval (ms). Default 12s; 0 disables periodic probing entirely. */
+export function mergeProbeIntervalMs(): number {
+  const v = Number(process.env.VERIFY_MERGE_PROBE_INTERVAL_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 12_000;
+}
+
+/** Grace (ms) appended after the tone burst when computing the guard window. */
+export function mergeProbeGraceMs(): number {
+  const v = Number(process.env.VERIFY_MERGE_PROBE_GRACE_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 900;
+}
+
+/** Consecutive echo strikes required for the in-call merge verdict. */
+export function mergeProbeEchoStrikes(): number {
+  const v = Number(process.env.VERIFY_MERGE_PROBE_ECHO_STRIKES);
+  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 2;
+}
+
+/** Probe burst length (s) — also the duration of the served merge-probe.wav. */
+export function mergeProbeToneSec(): number {
+  const v = Number(process.env.VERIFY_MERGE_PROBE_TONE_SEC);
+  return Number.isFinite(v) && v > 0 ? v : 1.2;
+}
+
+interface MergeProbeBurst {
+  start: number;
+  end: number;
+  /** True once an in-guard tone fire has been attributed to this burst. */
+  echoCounted: boolean;
+}
+
+const mergeProbeTimers = new Map<string, NodeJS.Timeout>();
+const mergeProbeFirstTimers = new Map<string, NodeJS.Timeout>();
+const mergeProbeGuard = new Map<string, MergeProbeBurst>();
+const mergeProbeStrikes = new Map<string, number>();
+
+/** First probe ~3s after the bridge (conference + stream settle first). */
+const MERGE_PROBE_FIRST_DELAY_MS = 3_000;
+
+/**
+ * Start periodic in-call merge probing for a BRIDGED session. Idempotent;
+ * a no-op when VERIFY_MERGE_PROBE_INTERVAL_MS=0. All timers are unref'd and
+ * cleared by cleanupSessionMaps() on any terminal transition.
+ */
+export function startMergeProbe(sessionId: string): void {
+  if (mergeProbeIntervalMs() === 0) return; // periodic probing disabled
+  if (mergeProbeTimers.has(sessionId) || mergeProbeFirstTimers.has(sessionId)) return;
+  const first = setTimeout(() => {
+    mergeProbeFirstTimers.delete(sessionId);
+    void fireMergeProbeBurst(sessionId);
+    const interval = setInterval(() => {
+      void fireMergeProbeBurst(sessionId);
+    }, mergeProbeIntervalMs());
+    interval.unref?.();
+    mergeProbeTimers.set(sessionId, interval);
+  }, MERGE_PROBE_FIRST_DELAY_MS);
+  first.unref?.();
+  mergeProbeFirstTimers.set(sessionId, first);
+}
+
+/** Stop probing + drop guard/strike state. Safe for unknown sessionIds. */
+export function stopMergeProbe(sessionId: string): void {
+  const t = mergeProbeTimers.get(sessionId);
+  if (t) clearInterval(t);
+  mergeProbeTimers.delete(sessionId);
+  const f = mergeProbeFirstTimers.get(sessionId);
+  if (f) clearTimeout(f);
+  mergeProbeFirstTimers.delete(sessionId);
+  mergeProbeGuard.delete(sessionId);
+  mergeProbeStrikes.delete(sessionId);
+}
+
+/** True while `now` is inside the current probe burst's guard window. */
+export function isMergeProbeGuarded(sessionId: string): boolean {
+  const g = mergeProbeGuard.get(sessionId);
+  return Boolean(g && Date.now() >= g.start && Date.now() <= g.end);
+}
+
+/**
+ * Attribute an in-guard tone fire to the current probe burst. A burst with
+ * ≥1 echo = ONE strike (repeated fires inside the same window re-count as the
+ * same strike); the scheduler resets strikes to 0 when a burst elapses with
+ * no echo. Returns the consecutive-echo strike count.
+ */
+export function noteMergeProbeEcho(sessionId: string): number {
+  const g = mergeProbeGuard.get(sessionId);
+  if (g && !g.echoCounted) {
+    g.echoCounted = true;
+    mergeProbeStrikes.set(sessionId, (mergeProbeStrikes.get(sessionId) ?? 0) + 1);
+  }
+  return mergeProbeStrikes.get(sessionId) ?? 0;
+}
+
+/**
+ * Fire ONE probe burst immediately (BRIDGED sessions only) — used by the
+ * speakerphone onSuspicious path so a suspicious window gets an instant
+ * probe instead of waiting for the next interval tick.
+ */
+export async function fireMergeProbeNow(sessionId: string): Promise<void> {
+  await fireMergeProbeBurst(sessionId);
+}
+
+/** Announce one probe burst to the LEG A participant only. Never throws. */
+async function fireMergeProbeBurst(sessionId: string): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || session.state !== VState.BRIDGED) return;
+    if (!session.legACallSid) {
+      console.warn(`[verify] MERGE_PROBE_SKIPPED session=${sessionId} — no Leg A leg`);
+      return;
+    }
+    const base = getPublicBaseUrl();
+    if (!base) {
+      console.warn(`[verify] MERGE_PROBE_SKIPPED session=${sessionId} — no public base URL`);
+      return;
+    }
+    // A previous burst that elapsed with NO echo resets the strike count —
+    // only CONSECUTIVE echoing bursts accumulate toward the verdict.
+    const prev = mergeProbeGuard.get(sessionId);
+    if (prev && !prev.echoCounted) mergeProbeStrikes.set(sessionId, 0);
+    const start = Date.now();
+    mergeProbeGuard.set(sessionId, {
+      start,
+      end: start + Math.round(mergeProbeToneSec() * 1000) + mergeProbeGraceMs(),
+      echoCounted: false,
+    });
+    // Twilio conferences are addressable by SID only — resolve the live one.
+    const confSid = await liveConferenceSid(sessionId);
+    if (!confSid) {
+      console.warn(
+        `[verify] MERGE_PROBE_SKIPPED session=${sessionId} — no in-progress conference`,
+      );
+      return;
+    }
+    await getTwilioClient()
+      .conferences(confSid)
+      .participants(session.legACallSid)
+      .update({
+        announceUrl: `${base}/api/verify/merge-probe.wav`,
+        announceMethod: "GET",
+      });
+    console.log(
+      `[verify] MERGE_PROBE_FIRED session=${sessionId} legA=${session.legACallSid} guard=${mergeProbeToneSec()}s+${mergeProbeGraceMs()}ms`,
+    );
+  } catch (err) {
+    // Best-effort: a failed probe must never crash the media path.
+    console.error(`[verify] MERGE_PROBE_FAILED session=${sessionId}:`, err);
   }
 }
 
@@ -1118,21 +1290,79 @@ export async function maybeBridgeGuarded(
     if (!opts.legAInline) {
       await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
     }
+    // The pre-bridge merge tone stops here, so mid-call merge detection
+    // switches to active probing: periodic DTMF-'9' bursts announced to the
+    // Leg A participant only, with echo-strike accounting on the stream path.
+    startMergeProbe(sessionId);
     return true;
   }
   return false;
 }
 
-/** Merge detected — Leg A's DTMF tones leaked into Leg B's Gather. */
-export async function onMergeDetected(sessionId: string): Promise<void> {
+/**
+ * Merge detected. PRE-BRIDGE: Leg A's DTMF tones leaked into Leg B's Gather
+ * (or the relay/record-chunk path fired) — caller + Leg A hear `notify-merge`.
+ * IN-CALL (opts.inCall or the session is already BRIDGED): every leg hears
+ * `notify-conference-merge` and the live conference is completed outright —
+ * a REST redirect cannot pull a call out of an active <Dial><Conference>,
+ * so ending the conference by SID is the belt-and-braces guarantee that BOTH
+ * bridge legs drop. Idempotent via the terminal-state guard + transition.
+ */
+export async function onMergeDetected(
+  sessionId: string,
+  opts: { inCall?: boolean } = {},
+): Promise<void> {
   const session = await findSession(sessionId);
   if (!session || isTerminal(session)) return;
+  const inCall = opts.inCall === true || session.state === VState.BRIDGED;
 
-  if (await transition(session, VState.MERGE_DETECTED, "DTMF tone leak — callee merged calls")) {
+  if (
+    await transition(
+      session,
+      VState.MERGE_DETECTED,
+      inCall
+        ? "In-call merge detected (BRIDGED) — conference torn down"
+        : "DTMF tone leak — callee merged calls",
+    )
+  ) {
     session.toneDetected = true;
     session.toneDetectedAt = new Date();
     session.completedAt = new Date();
     await save(session);
+
+    if (inCall) {
+      // All terminations in parallel — speed matters (merge must die
+      // instantly). Caller, Leg A AND Leg B (if present) all hear the
+      // conference-ending announcement whose TwiML then hangs them up.
+      await Promise.allSettled([
+        redirectCall(session.callerCallSid, "notify-conference-merge", sessionId),
+        redirectCall(session.legACallSid, "notify-conference-merge", sessionId),
+        session.legBCallSid
+          ? redirectCall(session.legBCallSid, "notify-conference-merge", sessionId)
+          : Promise.resolve(),
+        hangupCall(session.ringTestCallSid),
+      ]);
+      // Belt-and-braces: completing the conference by SID drops BOTH bridge
+      // participants even if a redirect raced a leg that was still inside
+      // <Dial><Conference>. 404/already-completed errors are ignored.
+      const confSid = await liveConferenceSid(sessionId);
+      if (confSid) {
+        try {
+          await getTwilioClient()
+            .conferences(confSid)
+            .update({ status: "completed" });
+          console.log(
+            `[verify] CONFERENCE_COMPLETED session=${sessionId} conf=${confSid}`,
+          );
+        } catch (err) {
+          console.warn(
+            `[verify] conference complete failed session=${sessionId} conf=${confSid}:`,
+            (err as Error).message,
+          );
+        }
+      }
+      return;
+    }
 
     // All terminations in parallel — speed matters (merge must die instantly).
     // Caller AND callee (Leg A) both hear the merge announcement before the
@@ -1343,10 +1573,14 @@ export async function onCallCompleted(
         "GUARDED_CALL_ENDED",
         `leg=${leg} sid=${callSid} ${statusDetail}`,
       );
-      if (session.guarded && leg === "legA") {
-        // Callee ended the first call mid-bridge: tell the caller why the
-        // guarded call is ending before the TwiML hangs them up.
-        await redirectCall(session.callerCallSid, "notify-first-call-ended", sessionId);
+      if (session.guarded && (leg === "legA" || leg === "caller")) {
+        // Either party ended the live bridge: the REMAINING party is told why
+        // the guarded call is ending (symmetric firstCallEnded notice) before
+        // the TwiML hangs them up; endConferenceOnExit drops the conference
+        // and the verification legs are torn down below.
+        const remaining =
+          leg === "legA" ? session.callerCallSid : session.legACallSid;
+        await redirectCall(remaining, "notify-first-call-ended", sessionId);
         await hangupAll(session, { legB: true, ringTest: true });
       } else {
         await hangupAll(session, {
@@ -1605,9 +1839,14 @@ async function sendSmsOnce(
 /**
  * OUTER SPEAKERPHONE clear transition — the media-stream detector saw a clean
  * window after a fired suspicion. Challenge noise is finite (the exact 4s
- * probe loop) and is only re-announced while suspicion persists, so the clear
- * path is simply to STOP re-injecting; the live page gets an explicit event on
- * the next poll. Any in-progress announce can finish naturally (≤4s).
+ * probe loop) and is only re-announced while suspicion persists: re-injection
+ * is driven EXCLUSIVELY by SpeakerphoneDetector.onSuspicious emissions, which
+ * stop on the very clean window that fires this callback — so the pending
+ * re-injection is cancelled promptly by construction (there is no engine-side
+ * re-injection timer to cancel), and any in-progress announce finishes
+ * naturally (≤4s). injectChallengeNoise is additionally BRIDGED-gated, so a
+ * late emission after any terminal transition (e.g. MERGE_DETECTED) is a
+ * no-op. The live page gets an explicit event on the next poll.
  */
 export async function onSpeakerphoneCleared(
   sessionId: string,
