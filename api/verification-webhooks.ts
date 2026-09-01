@@ -141,6 +141,21 @@ export async function verificationTwimlHandler(c: Context) {
         break;
       }
 
+      case "caller-wait": {
+        // GUARDED MODE ONLY: non-blocking park for the SDK caller leg. A
+        // call sitting in <Pause> accepts REST redirects immediately (unlike
+        // one inside <Dial><Conference>), so the engine can move this leg
+        // into the bridge conference the moment the call is BRIDGED.
+        const session = sid ? await vs.findSession(sid) : null;
+        if (!session || vs.isTerminal(session)) {
+          vr.hangup();
+          break;
+        }
+        vr.pause({ length: 60 });
+        vr.redirect({ method: "POST" }, vs.twimlUrl("caller-wait", sid));
+        break;
+      }
+
       case "leg-a": {
         // Phase 2, step 1: "Press 1 to accept". <Gather> accepts DTMF during
         // playback. Timeout falls through to the re-prompt redirect; wrong

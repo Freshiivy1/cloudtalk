@@ -130,12 +130,15 @@ export async function voiceWebhookHandler(c: Context) {
       console.error("[twilio] guarded caller connect error:", err);
     }
     if (ok) {
+      // Park the caller in a NON-blocking pause loop — never inside
+      // <Dial><Conference>: a REST redirect cannot pull a call out of an
+      // active Dial, and a second leg dialling the same not-yet-started
+      // conference name spawns a DUPLICATE conference (both parties alone).
+      // The engine moves this leg into the bridge conference at bridge time.
       const P = vs.verifyPrompts();
       vr.say(P.callerConnect);
-      vr.dial().conference(
-        { beep: "false", startConferenceOnEnter: false, endConferenceOnExit: false },
-        vs.conferenceName(guardedSid),
-      );
+      vr.pause({ length: 60 });
+      vr.redirect({ method: "POST" }, vs.twimlUrl("caller-wait", guardedSid));
     } else {
       vr.say(vs.verifyPrompts().failed);
       vr.hangup();

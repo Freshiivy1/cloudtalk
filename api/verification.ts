@@ -546,6 +546,54 @@ async function originate(
 }
 
 /** AMI RedirectAction equivalent — point a live call at new TwiML. */
+/**
+ * Resolve the LIVE conference SID for a session. Twilio conferences are
+ * addressable ONLY by SID — fetching/updating via the friendly name 404s
+ * ("resource not found"). Filter by friendlyName + in-progress (also guards
+ * against duplicate-name races).
+ */
+async function liveConferenceSid(sessionId: string): Promise<string | null> {
+  try {
+    const confs = await getTwilioClient().conferences.list({
+      friendlyName: conferenceName(sessionId),
+      status: "in-progress",
+      limit: 5,
+    });
+    return confs.at(0)?.sid ?? null;
+  } catch (err) {
+    console.warn(
+      `[verify] conference lookup failed session=${sessionId}:`,
+      (err as Error).message,
+    );
+    return null;
+  }
+}
+
+/** Poll until Twilio reports `callSid` inside the session's live conference. */
+async function waitForConferenceParticipant(
+  sessionId: string,
+  callSid: string | null,
+  timeoutMs: number,
+): Promise<string | null> {
+  if (!callSid) return null;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const confSid = await liveConferenceSid(sessionId);
+    if (confSid) {
+      try {
+        const parts = await getTwilioClient()
+          .conferences(confSid)
+          .participants.list({ limit: 20 });
+        if (parts.some((p) => p.callSid === callSid)) return confSid;
+      } catch {
+        /* retry */
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return null;
+}
+
 async function redirectCall(
   callSid: string | null,
   twimlKind: string,
@@ -787,11 +835,28 @@ export async function bridgeGuardedAfterVoiceprint(sessionId: string): Promise<b
       "GUARDED_BRIDGED",
       `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A media stream persists`,
     );
-    // Bridge the two real parties into the same conference (LIVE, two-way).
+    // Bridge the two real parties into the same conference (LIVE, two-way)
+    // SEQUENTIALLY — firing both redirects at once races Twilio's
+    // friendly-name matching and can spawn TWO conferences with the same
+    // name (observed in prod: each party alone in its own conference).
+    // 1) Leg A joins first and creates the single in-progress conference
+    //    (guarded-bridge TwiML uses startConferenceOnEnter=true).
+    // 2) Only once Twilio confirms Leg A is a participant do we move the
+    //    caller — joining an IN-PROGRESS conference by name is reliable.
     // Leg A's <Start><Stream> survives the redirect, so speakerphone/voice
     // detection keeps running in-call.
-    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
     await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
+    const confSid = await waitForConferenceParticipant(
+      sessionId,
+      session.legACallSid,
+      12_000,
+    );
+    if (!confSid) {
+      console.warn(
+        `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within 12s; redirecting caller anyway`,
+      );
+    }
+    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
     return true;
   }
   return false;
@@ -1624,8 +1689,15 @@ export async function injectChallengeNoise(
       console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no public base URL, skipping announce`);
       return;
     }
+    const confSid = await liveConferenceSid(sessionId);
+    if (!confSid) {
+      console.warn(
+        `[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no in-progress conference yet, skipping announce`,
+      );
+      return;
+    }
     await getTwilioClient()
-      .conferences(conferenceName(sessionId))
+      .conferences(confSid)
       .participants(session.legACallSid)
       .update({
         announceUrl: `${base}/api/verify/challenge-noise.wav`,

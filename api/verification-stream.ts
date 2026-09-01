@@ -187,7 +187,11 @@ class VoiceMatchMonitor {
   private buf: number[] = [];
   private sinceCheck = 0;
 
-  constructor(private readonly sid: string) {}
+  private readonly sid: string;
+
+  constructor(sid: string) {
+    this.sid = sid;
+  }
 
   /** Feed one Twilio media payload (base64 μ-law, 8 kHz mono). */
   push(payloadB64: string): void {
