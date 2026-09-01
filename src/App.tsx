@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router';
 import { Toaster } from 'sonner';
 import Softphone from './pages/Softphone';
+import LiveAnalysis from './pages/LiveAnalysis';
 import Contacts from './pages/Contacts';
 import CallHistory from './pages/CallHistory';
 import AdminDashboard from './pages/AdminDashboard';
@@ -15,6 +16,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/app" replace />} />
         <Route path="/app" element={<Softphone />} />
+        <Route path="/app/live-analysis/:sessionId?" element={<LiveAnalysis />} />
         <Route path="/app/contacts" element={<Contacts />} />
         <Route path="/app/history" element={<CallHistory />} />
         <Route path="/admin" element={<AdminDashboard />} />

@@ -615,7 +615,7 @@ export default function Softphone() {
                       <ShieldCheck className={cn('h-4 w-4', guarded ? 'text-signal' : 'text-text-low')} />
                       <div>
                         <p className="text-xs font-medium text-text-hi">Guarded inmate call</p>
-                        <p className="text-[10px] text-text-low">Verified line · challenge noise on speakerphone</p>
+                        <p className="text-[10px] text-text-low">One callee call · no prompts · live analysis</p>
                       </div>
                     </div>
                     <Switch
@@ -1091,7 +1091,7 @@ export default function Softphone() {
             <GuardedLivePanel
               sessionState={(guardedSessionQ.data?.state as string | undefined) ?? null}
               events={(guardedEventsQ.data ?? []) as GuardedEventRow[]}
-              onOpenMonitor={() => navigate('/admin/verification')}
+              onOpenMonitor={() => guardedSessionId && navigate(`/app/live-analysis/${guardedSessionId}`)}
             />
           )}
           </div>

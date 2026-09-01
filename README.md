@@ -84,19 +84,15 @@ curl https://merge-relay-a7ws.onrender.com/health   # {"ok":true,...}
 curl https://merge-relay-a7ws.onrender.com/stats    # live counters
 ```
 
-Then from the CloudTalk dashboard, start a verification. The whole flow runs
-by itself — no external orchestration:
+Then from the CloudTalk softphone, toggle **Guarded inmate call** and dial. The guarded flow is direct-connect:
 
-1. **Leg A** calls the callee from `TWILIO_CALLER_ID`, plays the inmate prompt,
-   gathers press-1.
-2. First press-1 → **Leg B** originates instantly from `TWILIO_CALLER_ID_LEG_B`
-   (rings during prompt 2, so it arrives with the second "ready" press).
-3. Callee answers Leg B → Leg A starts the continuous in-band DTMF-9 tone.
-4. Callee merges the calls → the tone leaks into Leg B's duplex stream → the
-   relay's Goertzel detector fires after ~300ms and **speaks the verdict
-   straight into the call** while tearing down Leg A. Merge→verdict ≈ 0.3–0.4s.
-5. The relay also POSTs `/api/verify/stream-detected` → the app marks the
-   session `MERGE_DETECTED` and redirects the initiator's leg to the verdict.
+1. The browser places an outbound Twilio Voice SDK call carrying the guarded session id — the caller hears “Please wait while we connect your call.” and stays parked in a non-blocking wait loop.
+2. The callee receives exactly **one** call. On answer there is **no IVR**: no monitored prompt, no press-1, no voice-ID recording, no press-#. Leg A is dialed straight into the bridge conference and the parked caller is redirected in after Twilio confirms participation.
+3. The callee voiceprint baseline is captured automatically from the first seconds of in-call callee speech on the Leg A media stream (`VOICEPRINT_CAPTURED` with `source=in-call-auto`).
+4. While BRIDGED, relayguard speakerphone scoring and voice-match comparison run passively; suspicious windows inject callee-only challenge noise and never hang up the call.
+5. Watch it live from the softphone’s **Live analysis** panel or open `/app/live-analysis/<sessionId>` for the full result page.
+
+The classic admin CallVerify flow (Leg A IVR → Leg B probe → merge/voip/call-waiting verdict) remains available under `/admin/verification` for non-guarded verification only.
 
 ---
 
