@@ -96,6 +96,16 @@ export class SpeakerphoneDetector {
     return this.windows;
   }
 
+  /**
+   * True while a fired suspicion has not yet been cleared by a clean window.
+   * Used by the second-call disengage path (verification-stream.ts): when
+   * suspicion is active the merge tone stays armed even if the hold detector
+   * sees speech resume.
+   */
+  get isSuspecting(): boolean {
+    return this.suspecting;
+  }
+
   private analyzeWindow(window: number[]): void {
     this.windows++;
     // int16 → float, peak-normalized (μ-law levels vary per trunk).

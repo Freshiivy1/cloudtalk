@@ -114,25 +114,27 @@ export async function challengeNoiseHandler(c: Context) {
 }
 
 /**
- * GET /api/verify/merge-probe.wav — serves the BRIDGED in-call merge probe:
- * a short continuous DTMF-'9' burst (852+1336 Hz, VERIFY_MERGE_PROBE_TONE_SEC
- * seconds) rendered by relayguard/dtmf.ts. Used as the conference announceUrl
- * for the Leg A participant only; if the callee merged the bridged call into
- * a conference, the burst echoes back up Leg A's own media stream and the
- * stream-side Goertzel detector fires inside the recorded guard window.
+ * GET /api/verify/merge-tone.wav — serves the BRIDGED in-call merge tone:
+ * a continuous DTMF-'9' render (852+1336 Hz, VERIFY_MERGE_TONE_SEC seconds,
+ * default 5s) produced by relayguard/dtmf.ts. Used as the conference
+ * announceUrl for the Leg A participant only while the tone is ARMED
+ * (second call engaged or suspicion backstop), re-announced every
+ * VERIFY_MERGE_TONE_REARM_MS so it is effectively continuous; the instant
+ * the callee merges, the tone crosses into Leg A's uplink and the
+ * stream-side Goertzel detector fires the in-call verdict.
  */
-export async function mergeProbeToneHandler(c: Context) {
+export async function mergeToneHandler(c: Context) {
   try {
-    const buf = mergeToneWav(vs.mergeProbeToneSec());
+    const buf = mergeToneWav(vs.mergeToneSec());
     return c.body(new Uint8Array(buf), 200, {
       "Content-Type": "audio/wav",
       "Content-Length": String(buf.byteLength),
       "Cache-Control": "no-store",
-      "X-Merge-Probe": `dtmf=9;freq=852+1336Hz;duration=${vs.mergeProbeToneSec()}s`,
+      "X-Merge-Tone": `dtmf=9;freq=852+1336Hz;duration=${vs.mergeToneSec()}s`,
     });
   } catch (err) {
-    console.error("[verify] merge-probe render failed:", err);
-    return c.text("probe unavailable", 500);
+    console.error("[verify] merge-tone render failed:", err);
+    return c.text("tone unavailable", 500);
   }
 }
 

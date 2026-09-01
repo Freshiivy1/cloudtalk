@@ -230,7 +230,7 @@ function cleanupSessionMaps(sessionId: string): void {
   lastNoiseEventAt.delete(sessionId);
   voiceBaselineBySession.delete(sessionId);
   lastVoiceMismatchAt.delete(sessionId);
-  stopMergeProbe(sessionId);
+  disarmMergeTone(sessionId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -597,152 +597,90 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
 }
 
 /* -------------------------------------------------------------------------- */
-/* BRIDGED in-call merge probing (Goal A)                                       */
+/* BRIDGED in-call merge detection — continuous ARMED merge tone (v3)           */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Once BRIDGED, the continuous merge tone on Leg A stops (the bridge TwiML
- * replaced the tone loop), so a mid-call callee-side merge would be invisible.
- * The probe scheduler announces a short DTMF-'9' burst (merge-probe.wav) to
- * the LEG A conference participant only, every mergeProbeIntervalMs(). If the
- * callee merged the call into a conference, the burst echoes back up Leg A's
- * own uplink media stream; the stream-side MergeToneDetector fire path then
- * consults isMergeProbeGuarded()/noteMergeProbeEcho() to count echo strikes —
- * sustained echoes across mergeProbeEchoStrikes() consecutive bursts (or any
- * tone fire OUTSIDE the guard window) fire the in-call merge verdict.
+ * v3 design (replaces v2's periodic probe scheduler, which could take a full
+ * probe interval to notice a merge): mid-call merges are detected by TRIGGER,
+ * not by interval. When the HoldDetector on Leg A's uplink sees the callee
+ * engage a SECOND call (call-waiting / add-call: sustained hold silence or a
+ * steady hold tone after real speech), onSecondCallEngaged() ARMS the merge
+ * tone — the DTMF-'9' WAV is announced to the LEG A conference participant
+ * ONLY and re-announced every mergeToneRearmMs() so it is effectively
+ * CONTINUOUS on the callee's downlink. The instant the callee presses
+ * "merge", the tone crosses into Leg A's own uplink and the stream-side
+ * MergeToneDetector fires: verdict within 1-3 s of the actual merge.
+ * The speakerphone onSuspicious path also arms the tone as a backstop.
+ * Unarmed tone fires are ignored (MERGE_TONE_UNARMED) so self-echo of the
+ * armed tone into a NON-merged handset and ambient tone-like audio can no
+ * longer false-positive a verdict.
  */
 
-/** Probe interval (ms). Default 12s; 0 disables periodic probing entirely. */
-export function mergeProbeIntervalMs(): number {
-  const v = Number(process.env.VERIFY_MERGE_PROBE_INTERVAL_MS);
-  return Number.isFinite(v) && v >= 0 ? v : 12_000;
+/** Re-announce cadence (ms) while the merge tone is armed (default 4.5s). */
+export function mergeToneRearmMs(): number {
+  const v = Number(process.env.VERIFY_MERGE_TONE_REARM_MS);
+  return Number.isFinite(v) && v > 0 ? v : 4_500;
 }
 
-/** Grace (ms) appended after the tone burst when computing the guard window. */
-export function mergeProbeGraceMs(): number {
-  const v = Number(process.env.VERIFY_MERGE_PROBE_GRACE_MS);
-  return Number.isFinite(v) && v >= 0 ? v : 900;
+/** Merge-tone render length (s) — also the served merge-tone.wav duration. */
+export function mergeToneSec(): number {
+  const v = Number(process.env.VERIFY_MERGE_TONE_SEC);
+  return Number.isFinite(v) && v > 0 ? v : 5;
 }
-
-/** Consecutive echo strikes required for the in-call merge verdict. */
-export function mergeProbeEchoStrikes(): number {
-  const v = Number(process.env.VERIFY_MERGE_PROBE_ECHO_STRIKES);
-  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 2;
-}
-
-/** Probe burst length (s) — also the duration of the served merge-probe.wav. */
-export function mergeProbeToneSec(): number {
-  const v = Number(process.env.VERIFY_MERGE_PROBE_TONE_SEC);
-  return Number.isFinite(v) && v > 0 ? v : 1.2;
-}
-
-interface MergeProbeBurst {
-  start: number;
-  end: number;
-  /** True once an in-guard tone fire has been attributed to this burst. */
-  echoCounted: boolean;
-}
-
-const mergeProbeTimers = new Map<string, NodeJS.Timeout>();
-const mergeProbeFirstTimers = new Map<string, NodeJS.Timeout>();
-const mergeProbeGuard = new Map<string, MergeProbeBurst>();
-const mergeProbeStrikes = new Map<string, number>();
-
-/** First probe ~3s after the bridge (conference + stream settle first). */
-const MERGE_PROBE_FIRST_DELAY_MS = 3_000;
 
 /**
- * Start periodic in-call merge probing for a BRIDGED session. Idempotent;
- * a no-op when VERIFY_MERGE_PROBE_INTERVAL_MS=0. All timers are unref'd and
- * cleared by cleanupSessionMaps() on any terminal transition.
+ * Elevated energy floor for the ARMED mid-call recognizer (mean-square of a
+ * 50 ms analysis window; the legacy pre-bridge floor is 1e6). While armed the
+ * merge tone plays on Leg A's downlink at known loud amplitude, so a genuine
+ * merged echo returns LOUD — the raised floor (default 2e6) rejects the much
+ * quieter acoustic leakage of the tone into a NON-merged callee handset.
  */
-export function startMergeProbe(sessionId: string): void {
-  if (mergeProbeIntervalMs() === 0) return; // periodic probing disabled
-  if (mergeProbeTimers.has(sessionId) || mergeProbeFirstTimers.has(sessionId)) return;
-  const first = setTimeout(() => {
-    mergeProbeFirstTimers.delete(sessionId);
-    void fireMergeProbeBurst(sessionId);
-    const interval = setInterval(() => {
-      void fireMergeProbeBurst(sessionId);
-    }, mergeProbeIntervalMs());
-    interval.unref?.();
-    mergeProbeTimers.set(sessionId, interval);
-  }, MERGE_PROBE_FIRST_DELAY_MS);
-  first.unref?.();
-  mergeProbeFirstTimers.set(sessionId, first);
+export function mergeToneEnergyFloor(): number {
+  const v = Number(process.env.VERIFY_MERGE_TONE_ENERGY_FLOOR);
+  return Number.isFinite(v) && v > 0 ? v : 2e6;
 }
 
-/** Stop probing + drop guard/strike state. Safe for unknown sessionIds. */
-export function stopMergeProbe(sessionId: string): void {
-  const t = mergeProbeTimers.get(sessionId);
+/** Per-session re-announce timers + armed flags for the continuous tone. */
+const mergeToneTimers = new Map<string, NodeJS.Timeout>();
+const mergeToneArmedSessions = new Set<string>();
+
+/** True while the continuous merge tone is armed for this session. */
+export function isMergeToneArmed(sessionId: string): boolean {
+  return mergeToneArmedSessions.has(sessionId);
+}
+
+/** Stop the re-announce timer and drop the armed flag. Always safe to call. */
+export function disarmMergeTone(sessionId: string): void {
+  const t = mergeToneTimers.get(sessionId);
   if (t) clearInterval(t);
-  mergeProbeTimers.delete(sessionId);
-  const f = mergeProbeFirstTimers.get(sessionId);
-  if (f) clearTimeout(f);
-  mergeProbeFirstTimers.delete(sessionId);
-  mergeProbeGuard.delete(sessionId);
-  mergeProbeStrikes.delete(sessionId);
+  mergeToneTimers.delete(sessionId);
+  mergeToneArmedSessions.delete(sessionId);
 }
 
-/** True while `now` is inside the current probe burst's guard window. */
-export function isMergeProbeGuarded(sessionId: string): boolean {
-  const g = mergeProbeGuard.get(sessionId);
-  return Boolean(g && Date.now() >= g.start && Date.now() <= g.end);
-}
-
-/**
- * Attribute an in-guard tone fire to the current probe burst. A burst with
- * ≥1 echo = ONE strike (repeated fires inside the same window re-count as the
- * same strike); the scheduler resets strikes to 0 when a burst elapses with
- * no echo. Returns the consecutive-echo strike count.
- */
-export function noteMergeProbeEcho(sessionId: string): number {
-  const g = mergeProbeGuard.get(sessionId);
-  if (g && !g.echoCounted) {
-    g.echoCounted = true;
-    mergeProbeStrikes.set(sessionId, (mergeProbeStrikes.get(sessionId) ?? 0) + 1);
-  }
-  return mergeProbeStrikes.get(sessionId) ?? 0;
-}
-
-/**
- * Fire ONE probe burst immediately (BRIDGED sessions only) — used by the
- * speakerphone onSuspicious path so a suspicious window gets an instant
- * probe instead of waiting for the next interval tick.
- */
-export async function fireMergeProbeNow(sessionId: string): Promise<void> {
-  await fireMergeProbeBurst(sessionId);
-}
-
-/** Announce one probe burst to the LEG A participant only. Never throws. */
-async function fireMergeProbeBurst(sessionId: string): Promise<void> {
+/** Announce the merge tone to the LEG A participant only. Never throws. */
+async function announceMergeTone(sessionId: string): Promise<void> {
   try {
     const session = await findSession(sessionId);
-    if (!session || session.state !== VState.BRIDGED) return;
+    // Left BRIDGED (terminal transition / teardown raced a rearm) → disarm.
+    if (!session || session.state !== VState.BRIDGED) {
+      disarmMergeTone(sessionId);
+      return;
+    }
     if (!session.legACallSid) {
-      console.warn(`[verify] MERGE_PROBE_SKIPPED session=${sessionId} — no Leg A leg`);
+      console.warn(`[verify] MERGE_TONE_SKIPPED session=${sessionId} — no Leg A leg`);
       return;
     }
     const base = getPublicBaseUrl();
     if (!base) {
-      console.warn(`[verify] MERGE_PROBE_SKIPPED session=${sessionId} — no public base URL`);
+      console.warn(`[verify] MERGE_TONE_SKIPPED session=${sessionId} — no public base URL`);
       return;
     }
-    // A previous burst that elapsed with NO echo resets the strike count —
-    // only CONSECUTIVE echoing bursts accumulate toward the verdict.
-    const prev = mergeProbeGuard.get(sessionId);
-    if (prev && !prev.echoCounted) mergeProbeStrikes.set(sessionId, 0);
-    const start = Date.now();
-    mergeProbeGuard.set(sessionId, {
-      start,
-      end: start + Math.round(mergeProbeToneSec() * 1000) + mergeProbeGraceMs(),
-      echoCounted: false,
-    });
     // Twilio conferences are addressable by SID only — resolve the live one.
     const confSid = await liveConferenceSid(sessionId);
     if (!confSid) {
       console.warn(
-        `[verify] MERGE_PROBE_SKIPPED session=${sessionId} — no in-progress conference`,
+        `[verify] MERGE_TONE_SKIPPED session=${sessionId} — no in-progress conference`,
       );
       return;
     }
@@ -750,15 +688,86 @@ async function fireMergeProbeBurst(sessionId: string): Promise<void> {
       .conferences(confSid)
       .participants(session.legACallSid)
       .update({
-        announceUrl: `${base}/api/verify/merge-probe.wav`,
+        announceUrl: `${base}/api/verify/merge-tone.wav`,
         announceMethod: "GET",
       });
     console.log(
-      `[verify] MERGE_PROBE_FIRED session=${sessionId} legA=${session.legACallSid} guard=${mergeProbeToneSec()}s+${mergeProbeGraceMs()}ms`,
+      `[verify] MERGE_TONE_ANNOUNCED session=${sessionId} legA=${session.legACallSid} duration=${mergeToneSec()}s`,
     );
   } catch (err) {
-    // Best-effort: a failed probe must never crash the media path.
-    console.error(`[verify] MERGE_PROBE_FAILED session=${sessionId}:`, err);
+    // Best-effort: a failed announce must never crash the media path.
+    console.error(`[verify] MERGE_TONE_ANNOUNCE_FAILED session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * Arm the continuous merge tone for a BRIDGED session: announce immediately
+ * to the Leg A participant, then re-announce every mergeToneRearmMs() with a
+ * mergeToneSec()-second render so the tone is effectively continuous.
+ * Idempotent while armed. The timer is unref'd and cleared by
+ * disarmMergeTone() and by cleanupSessionMaps() on every terminal transition.
+ * Errors are caught/logged — never thrown back into the media path.
+ */
+export async function armMergeTone(sessionId: string): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || session.state !== VState.BRIDGED) return;
+    if (mergeToneArmedSessions.has(sessionId)) return; // idempotent
+    mergeToneArmedSessions.add(sessionId);
+    const timer = setInterval(() => {
+      void announceMergeTone(sessionId);
+    }, mergeToneRearmMs());
+    timer.unref?.();
+    mergeToneTimers.set(sessionId, timer);
+    console.log(
+      `[verify] MERGE_TONE_ARMED session=${sessionId} rearm=${mergeToneRearmMs()}ms tone=${mergeToneSec()}s`,
+    );
+    await announceMergeTone(sessionId);
+  } catch (err) {
+    console.error(`[verify] armMergeTone failed session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * HoldDetector callback: the callee (Leg A) engaged a SECOND call — the
+ * bridged call went on hold (sustained non-speech / hold tone after ≥3s of
+ * live speech). BRIDGED-gated; arms the continuous merge tone so a subsequent
+ * "merge" tap is caught within 1-3 s.
+ */
+export async function onSecondCallEngaged(sessionId: string): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || session.state !== VState.BRIDGED) return;
+    await logEvent(
+      sessionId,
+      "SECOND_CALL_ENGAGED",
+      "hold signature on Leg A uplink (sustained non-speech/hold tone after live speech) — continuous merge tone armed",
+    );
+    await armMergeTone(sessionId);
+  } catch (err) {
+    console.error(`[verify] onSecondCallEngaged failed session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * HoldDetector callback: speech resumed ≥1s after a second-call engagement
+ * (callee came back / dropped the other call WITHOUT merging). Disarms the
+ * merge tone — the caller path (verification-stream.ts) already checked that
+ * no speakerphone suspicion is active; if suspicion IS active the tone stays
+ * armed and this handler is never invoked.
+ */
+export async function onSecondCallDisengaged(sessionId: string): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session)) return;
+    disarmMergeTone(sessionId);
+    await logEvent(
+      sessionId,
+      "SECOND_CALL_DISENGAGED",
+      "speech resumed on Leg A uplink ≥1s — merge tone disarmed",
+    );
+  } catch (err) {
+    console.error(`[verify] onSecondCallDisengaged failed session=${sessionId}:`, err);
   }
 }
 
@@ -1290,10 +1299,11 @@ export async function maybeBridgeGuarded(
     if (!opts.legAInline) {
       await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
     }
-    // The pre-bridge merge tone stops here, so mid-call merge detection
-    // switches to active probing: periodic DTMF-'9' bursts announced to the
-    // Leg A participant only, with echo-strike accounting on the stream path.
-    startMergeProbe(sessionId);
+    // The pre-bridge merge tone stops here. Mid-call merge detection is
+    // TRIGGER-driven (v3): the HoldDetector on Leg A's uplink arms the
+    // continuous merge tone when the callee engages a second call, and the
+    // stream-side MergeToneDetector fires the instant the tone crosses a
+    // merge. Nothing to start at bridge time.
     return true;
   }
   return false;
