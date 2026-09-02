@@ -18,7 +18,7 @@
  *   POST {PUBLIC_BASE_URL}/api/verify/voiceprint?sid=...        (guarded only)
  */
 import { TRPCError } from "@trpc/server";
-import { and, eq, lt, notInArray, or } from "drizzle-orm";
+import { and, desc, eq, gt, lt, ne, notInArray, or } from "drizzle-orm";
 import * as schema from "@db/schema";
 import type { VerificationSession } from "@db/schema";
 import type { ClipProfile } from "./relayguard/features";
@@ -888,17 +888,31 @@ export function conferenceName(sessionId: string): string {
 /** SMS (Crazytel HTTP API) — ported from application.yml `sms:` block. */
 function smsCfg() {
   const e = process.env;
+  const maxAttempts = Number.parseInt(e.SMS_MAX_ATTEMPTS ?? "3", 10);
+  const timeoutMs = Number.parseInt(e.SMS_HTTP_TIMEOUT_MS ?? "6000", 10);
   return {
     enabled: (e.SMS_ENABLED ?? "false") === "true",
     token: e.SMS_API_TOKEN ?? "",
     from: e.SMS_FROM ?? "CallVerify",
     baseUrl: e.SMS_BASE_URL ?? "https://sms.crazytel.net.au/api/v1/sms/send",
+    /** Delivery attempts incl. the first (transient 5xx/timeouts are retried). */
+    maxAttempts: Number.isFinite(maxAttempts) && maxAttempts >= 1 ? Math.min(maxAttempts, 5) : 3,
+    /** Per-attempt HTTP timeout. */
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs >= 1000 ? timeoutMs : 6000,
     messageConfirmed:
       e.SMS_MESSAGE_CONFIRMED ??
       "Your call waiting is off. Please turn it on to receive calls. If you need assistance I am AI SMS — just tell me your phone model and I can walk you through the settings to turn it on.",
     messageHangup:
       e.SMS_MESSAGE_HANGUP ??
       "How was your call? If your call didn't go through and you heard a weird sound it means your call waiting is off. Please turn call waiting on. If you need assistance I am AI SMS — I can help.",
+    /**
+     * SMART UPGRADE (beyond the Asterisk version): repeat-offender template.
+     * When this callee has already failed call-waiting verification before,
+     * the follow-up SMS is more direct and includes the universal GSM code.
+     */
+    messageRepeat:
+      e.SMS_MESSAGE_REPEAT ??
+      "Calls to your phone are still failing because call waiting is OFF — this has happened more than once. Fastest fix: open your Phone app, dial *43# and press call to switch call waiting ON. Reply with your phone model (e.g. iPhone 13, Samsung S23) and AI SMS will walk you through it step by step.",
   };
 }
 
@@ -2025,6 +2039,36 @@ export async function onCallWaitingOff(
   if (!session || isTerminal(session)) return;
 
   console.warn(`[verify] CALL_WAITING_OFF ${reason} — notifying caller, SMS on caller hangup`);
+  // Structured call-waiting analysis (upgrade over the Asterisk version, which
+  // only logged free-text lines): a single machine-readable evidence trail for
+  // the dashboard — detection reason, FSM state at detection, guarded mode,
+  // Leg B age (how long the second call survived before failing), the callee's
+  // repeat-offender count and the SMS window that now applies.
+  const stateAtDetection = session.state;
+  const legBAgeMs = session.legBOriginatedAt
+    ? Date.now() - new Date(session.legBOriginatedAt).getTime()
+    : null;
+  let priorFailures = 0;
+  try {
+    priorFailures = await countPriorCallWaitingOff(session.calleeNumber, session.sessionId);
+  } catch {
+    // history lookup is best-effort — never block the verdict on it
+  }
+  await logEvent(
+    sessionId,
+    "CALL_WAITING_ANALYSIS",
+    JSON.stringify({
+      reason,
+      stateAtDetection,
+      guarded: !!session.guarded,
+      legBAgeMs,
+      priorCallWaitingOff: priorFailures,
+      smsWindowSec: session.callerCallSid ? SMS_WINDOW_SECONDS : 0,
+      smsPlan: session.callerCallSid
+        ? "unconfirmed template if caller hangs up within window"
+        : "confirmed template now (no caller leg)",
+    }).slice(0, 512),
+  );
   if (await transition(session, VState.CALL_WAITING_OFF, `Call waiting OFF (${reason})`)) {
     session.completedAt = new Date();
     await save(session);
@@ -2402,9 +2446,147 @@ async function failSession(
   await hangupAll(session, { legA: true, legB: true, ringTest: true });
 }
 
+/* -------------------------------------------------------------------------- */
+/* Smart SMS notification (Crazytel) — Asterisk SmsService parity + upgrades  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Counts this callee's PRIOR call-waiting-off failures (terminal sessions in
+ * CALL_WAITING_OFF state, excluding the current session). Drives the smart
+ * repeat-offender escalation: the first failure gets the coaching template,
+ * repeats get the direct `*43#` fix-it template.
+ */
+export async function countPriorCallWaitingOff(
+  calleeNumber: string,
+  excludeSessionId?: string,
+): Promise<number> {
+  const conditions = [
+    eq(schema.verificationSessions.calleeNumber, calleeNumber),
+    eq(schema.verificationSessions.state, VState.CALL_WAITING_OFF),
+  ];
+  if (excludeSessionId) {
+    conditions.push(ne(schema.verificationSessions.sessionId, excludeSessionId));
+  }
+  const rows = await getDb()
+    .select({ sessionId: schema.verificationSessions.sessionId })
+    .from(schema.verificationSessions)
+    .where(and(...conditions))
+    .orderBy(desc(schema.verificationSessions.completedAt))
+    .limit(20);
+  return rows.length;
+}
+
+/**
+ * Picks the SMS template. Parity with the Asterisk version (confirmed vs
+ * hangup) plus the smart upgrade: repeat offenders get the escalation text.
+ */
+export function buildSmsMessage(
+  cfg: { messageConfirmed: string; messageHangup: string; messageRepeat: string },
+  confirmed: boolean,
+  priorFailures: number,
+): string {
+  if (priorFailures > 0) return cfg.messageRepeat;
+  return confirmed ? cfg.messageConfirmed : cfg.messageHangup;
+}
+
+export interface SmsDeliveryResult {
+  ok: boolean;
+  /** Last HTTP status (when the provider answered) */
+  status?: number;
+  /** Provider message id / reference parsed from the JSON response, if any */
+  providerId?: string;
+  /** Last error text (network error / provider error body) */
+  error?: string;
+}
+
+/**
+ * Crazytel SMS HTTP delivery — exact port of SmsService.send's wire contract
+ * (Authorization: Bearer <api-token>, JSON body {to, from, message} — the
+ * token is NEVER sent in the body), upgraded with:
+ *   - per-attempt timeout (AbortController) so a hung provider can't wedge the
+ *     session engine;
+ *   - retry with exponential backoff on network errors and 5xx (transient
+ *     provider faults); 4xx is a permanent config problem → no retry;
+ *   - delivery audit: the provider's message id/reference is captured into the
+ *     SMS_SENT event so every outbound text is traceable end-to-end.
+ */
+export async function deliverSms(
+  cfg: {
+    baseUrl: string;
+    token: string;
+    from: string;
+    maxAttempts: number;
+    timeoutMs: number;
+  },
+  to: string,
+  message: string,
+): Promise<SmsDeliveryResult> {
+  const body = JSON.stringify({ to, from: cfg.from, message });
+  let last: SmsDeliveryResult = { ok: false, error: "no attempt made" };
+  for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+    try {
+      const res = await fetch(cfg.baseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // SmsService.java: .header("Authorization", "Bearer " + props.getToken())
+          Authorization: `Bearer ${cfg.token}`,
+        },
+        body,
+        signal: controller.signal,
+      });
+      const text = await res.text().catch(() => "");
+      if (res.ok) {
+        let providerId: string | undefined;
+        try {
+          const j = JSON.parse(text) as Record<string, unknown>;
+          const id = j.id ?? j.messageId ?? j.message_id ?? j.reference;
+          if (id != null) providerId = String(id);
+        } catch {
+          // non-JSON success body — fine, delivery still confirmed by 2xx
+        }
+        return { ok: true, status: res.status, providerId };
+      }
+      last = { ok: false, status: res.status, error: text.slice(0, 200) };
+      // 4xx = permanent (bad token/number/payload) — retrying cannot help.
+      if (res.status >= 400 && res.status < 500) return last;
+    } catch (err) {
+      last = {
+        ok: false,
+        error:
+          controller.signal.aborted
+            ? `timeout after ${cfg.timeoutMs}ms`
+            : err instanceof Error
+              ? err.message
+              : String(err),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt < cfg.maxAttempts) {
+      // Backoff: 800ms, 1600ms, 3200ms, … (capped at 4s)
+      await new Promise((r) => setTimeout(r, Math.min(800 * 2 ** (attempt - 1), 4000)));
+    }
+  }
+  return last;
+}
+
 /**
  * Sends the SMS appropriate to the trigger and marks smsSent.
  * Port of SessionService.sendSmsOnce + the SmsEvent listener (Crazytel HTTP).
+ *
+ * Parity with the Asterisk version:
+ *   - mark-before-send so concurrent triggers can never double-text the callee
+ *     (Java: session.markSmsSent() then publish SmsEvent AFTER_COMMIT);
+ *   - same two triggers (explicit confirmation vs caller hangup in the window);
+ *   - same Bearer-auth Crazytel wire contract.
+ *
+ * Upgrades beyond Asterisk:
+ *   - smart repeat-offender escalation template (per-callee failure history);
+ *   - retry with backoff + per-attempt timeout;
+ *   - provider message-id capture for a full delivery audit trail.
  *
  * @param confirmed true = explicit confirmation (definitive template),
  *                  false = caller hung up within the 15s window
@@ -2426,36 +2608,152 @@ async function sendSmsOnce(
     await logEvent(session.sessionId, "SMS_SKIPPED", "SMS disabled or missing SMS_API_TOKEN");
     return;
   }
-  const message = confirmed ? cfg.messageConfirmed : cfg.messageHangup;
 
-  // Fire-and-forget — HTTP call happens outside any DB unit of work.
-  void fetch(cfg.baseUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      token: cfg.token,
-      to: session.calleeNumber,
-      from: cfg.from,
-      message,
-    }),
-  })
-    .then(async (res) => {
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        console.error(`[verify] SMS_HTTP_${res.status} ${body.slice(0, 200)}`);
-        await logEvent(session.sessionId, "SMS_FAILED", `http=${res.status}`).catch(() => {});
-      } else {
-        await logEvent(session.sessionId, "SMS_SENT", `to=${session.calleeNumber}`).catch(() => {});
-      }
-    })
-    .catch(async (err) => {
-      console.error("[verify] SMS_FAILED", err);
+  // Smart escalation: has this callee failed call-waiting verification before?
+  let priorFailures = 0;
+  try {
+    priorFailures = await countPriorCallWaitingOff(session.calleeNumber, session.sessionId);
+  } catch (err) {
+    console.warn("[verify] SMS_HISTORY_LOOKUP_FAILED — defaulting to base template", err);
+  }
+  if (priorFailures > 0) {
+    await logEvent(
+      session.sessionId,
+      "SMS_REPEAT_OFFENDER",
+      `callee=${session.calleeNumber} priorCallWaitingOff=${priorFailures} — escalation template`,
+    );
+  }
+  const message = buildSmsMessage(cfg, confirmed, priorFailures);
+
+  // Bounded delivery (maxAttempts × timeout) — every caller of sendSmsOnce is
+  // an async status-callback/admin path, never a TwiML webhook with a
+  // response deadline, so awaiting retries here is safe.
+  const result = await deliverSms(cfg, session.calleeNumber, message);
+  if (result.ok) {
+    await logEvent(
+      session.sessionId,
+      "SMS_SENT",
+      `to=${session.calleeNumber} template=${priorFailures > 0 ? "repeat" : confirmed ? "confirmed" : "hangup"}${result.providerId ? ` providerId=${result.providerId}` : ""}`,
+    ).catch(() => {});
+  } else {
+    console.error(`[verify] SMS_FAILED to=${session.calleeNumber}`, result.error);
+    await logEvent(
+      session.sessionId,
+      "SMS_FAILED",
+      `attempts=${cfg.maxAttempts}${result.status ? ` http=${result.status}` : ""} ${result.error ?? ""}`.slice(0, 512),
+    ).catch(() => {});
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Inbound AI SMS — two-way upgrade beyond the Asterisk version               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The Asterisk templates invite the callee to "reply with your phone model"
+ * but nothing ever reads those replies. Crazytel Virtual Mobile Numbers post
+ * inbound texts to a JSON webhook ({from, to, text}), so this port closes the
+ * loop: the reply webhook (POST /api/verify/sms/inbound) routes the sender's
+ * text here and this returns a concrete, model-specific call-waiting
+ * walkthrough. Deterministic knowledge base — no LLM dependency, no extra API
+ * keys, instant even on a cold free-tier dyno.
+ */
+export function buildAiSmsReply(text: string): string {
+  const t = text.toLowerCase();
+  const universal =
+    "Universal fix: open the Phone app, dial *43# and press call — this switches call waiting ON on most carriers.";
+  if (/iphone|apple|ios/.test(t)) {
+    return `iPhone: Settings → Apps → Phone → Call Waiting → ON (older iOS: Settings → Phone → Call Waiting). Then ask them to call you again. ${universal}`;
+  }
+  if (/samsung|galaxy|\bs2\d|note\s?\d/.test(t)) {
+    return `Samsung: Phone app → ⋮ menu → Settings → Supplementary services → Call waiting → ON. Then ask them to call you again. ${universal}`;
+  }
+  if (/pixel|google/.test(t)) {
+    return `Google Pixel: Phone app → ⋮ menu → Settings → Calls → Call waiting → ON. Then ask them to call you again. ${universal}`;
+  }
+  if (/oppo|realme|xiaomi|redmi|huawei|motorola|\bmoto\b|nokia|tcl|zte|vivo|oneplus|android/.test(t)) {
+    return `Android: Phone app → ⋮ menu → Settings → Calling accounts (or Carrier call settings) → your SIM → Call waiting → ON. Then ask them to call you again. ${universal}`;
+  }
+  // Model not recognised — ask again AND give the universal fix so this reply
+  // is still useful on its own.
+  return `AI SMS: I didn't catch your phone model — reply with e.g. "iPhone 13" or "Samsung S23" and I'll send the exact steps. ${universal}`;
+}
+
+/** Cooldown between AI replies to the same session (reply-loop protection). */
+const SMS_AI_REPLY_COOLDOWN_MS = 60_000;
+/** Max AI replies per session per rolling 24h (abuse / cost protection). */
+const SMS_AI_REPLY_MAX_PER_DAY = 10;
+
+/**
+ * Handles one inbound SMS from a callee: attaches the text to their most
+ * recent verification session's event trail, rate-limits, and replies with
+ * the model-specific walkthrough via Crazytel. Returns a short status string
+ * for the webhook response/logs.
+ */
+export async function handleInboundSms(fromRaw: string, text: string): Promise<string> {
+  const from = normalizeE164(fromRaw);
+  if (!from || !text.trim()) return "invalid-request";
+  const db = getDb();
+
+  // Most recent session for this callee (any state — a reply may arrive days
+  // after the failure). The event trail attaches there; with no session we
+  // still answer — the knowledge base needs no session context.
+  const recent = await db
+    .select()
+    .from(schema.verificationSessions)
+    .where(eq(schema.verificationSessions.calleeNumber, from))
+    .orderBy(desc(schema.verificationSessions.createdAt))
+    .limit(1);
+  const session = recent[0] ?? null;
+
+  if (session) {
+    await logEvent(session.sessionId, "SMS_INBOUND", `from=${from} text="${text.slice(0, 120)}"`);
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const replyRows = await db
+      .select({ timestamp: schema.verificationEvents.timestamp })
+      .from(schema.verificationEvents)
+      .where(
+        and(
+          eq(schema.verificationEvents.sessionId, session.sessionId),
+          eq(schema.verificationEvents.eventType, "SMS_AI_REPLY"),
+          gt(schema.verificationEvents.timestamp, dayAgo),
+        ),
+      )
+      .orderBy(desc(schema.verificationEvents.timestamp));
+    if (replyRows.length >= SMS_AI_REPLY_MAX_PER_DAY) {
       await logEvent(
         session.sessionId,
-        "SMS_FAILED",
-        err instanceof Error ? err.message : String(err),
-      ).catch(() => {});
-    });
+        "SMS_AI_REPLY_LIMIT",
+        `${replyRows.length} AI replies in 24h — suppressed inbound from ${from}`,
+      );
+      return "reply-limit";
+    }
+    const lastAt = replyRows[0]?.timestamp ? new Date(replyRows[0].timestamp).getTime() : 0;
+    if (Date.now() - lastAt < SMS_AI_REPLY_COOLDOWN_MS) {
+      return "cooldown";
+    }
+  }
+
+  const cfg = smsCfg();
+  if (!cfg.enabled || !cfg.token) {
+    if (session) {
+      await logEvent(session.sessionId, "SMS_SKIPPED", "inbound reply — SMS disabled or missing SMS_API_TOKEN");
+    }
+    return "sms-disabled";
+  }
+
+  const reply = buildAiSmsReply(text);
+  const result = await deliverSms(cfg, from, reply);
+  if (session) {
+    await logEvent(
+      session.sessionId,
+      result.ok ? "SMS_AI_REPLY" : "SMS_FAILED",
+      result.ok
+        ? `to=${from} aiReply${result.providerId ? ` providerId=${result.providerId}` : ""}`
+        : `to=${from} ${result.error ?? ""}`.slice(0, 512),
+    ).catch(() => {});
+  }
+  return result.ok ? "replied" : "send-failed";
 }
 
 /**

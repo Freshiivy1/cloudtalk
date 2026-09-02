@@ -1403,6 +1403,7 @@ import {
 } from "./verification-stream";
 import {
   mergeToneHandler,
+  verificationSmsInboundHandler,
   verificationStatusHandler,
   verificationTwimlHandler,
   verificationVoiceprintHandler,
@@ -1424,6 +1425,7 @@ hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
 hookApp.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
 hookApp.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
 hookApp.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
+hookApp.post("/api/verify/sms/inbound", verificationSmsInboundHandler);
 // TwiML App voice webhook (SDK outbound calls — guarded branch keys off the
 // `guarded` custom param).
 hookApp.post("/api/voice/twiml", voiceWebhookHandler);
@@ -2722,6 +2724,376 @@ describe("call review recordings", () => {
     } finally {
       if (saved === undefined) delete process.env.AUTH_DISABLED;
       else process.env.AUTH_DISABLED = saved;
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Smart SMS notifications (Crazytel) — Asterisk parity + upgrades            */
+/* -------------------------------------------------------------------------- */
+
+interface CapturedFetch {
+  url: string;
+  init?: RequestInit;
+}
+
+/** Save/restore the SMS env vars a test mutates. */
+function smsEnvSnapshot() {
+  const keys = ["SMS_ENABLED", "SMS_API_TOKEN", "SMS_MAX_ATTEMPTS", "SMS_INBOUND_TOKEN"];
+  const saved: Record<string, string | undefined> = {};
+  for (const k of keys) saved[k] = process.env[k];
+  return () => {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  };
+}
+
+describe("smart SMS notifications (Crazytel)", () => {
+  it("wire contract: Authorization Bearer header, token NEVER in the JSON body (SmsService.java parity)", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      // Ignore stray non-Crazytel fetches from earlier tests' fire-and-forget work.
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({ id: "msg_abc" }), { status: 200 });
+    });
+    try {
+      // No caller leg → detection itself triggers the confirmed SMS.
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990001" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toContain("crazytel");
+      const headers = calls[0].init?.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer ct_test_token");
+      const body = JSON.parse(String(calls[0].init?.body));
+      expect(body).not.toHaveProperty("token");
+      expect(body.to).toBe("+61499990001");
+      expect(body.from).toBe("CallVerify");
+      expect(body.message).toContain("call waiting");
+      const evts = await events(s.sessionId);
+      const sent = evts.find((e) => e.eventType === "SMS_SENT");
+      expect(sent?.details).toContain("providerId=msg_abc");
+      expect(sent?.details).toContain("template=confirmed");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("retries transient 5xx with backoff, then succeeds (delivery audit)", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_MAX_ATTEMPTS = "3";
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      // Fail twice, succeed on the third attempt.
+      return calls.length < 3
+        ? new Response("gateway error", { status: 502 })
+        : new Response(JSON.stringify({ id: "msg_retry" }), { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990011" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(calls).toHaveLength(3);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("SMS_SENT");
+      expect(types).not.toContain("SMS_FAILED");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  }, 20_000);
+
+  it("4xx is permanent — no retry, SMS_FAILED carries the status", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_bad_token";
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response("unauthorized", { status: 401 });
+    });
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990012" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(calls).toHaveLength(1);
+      const failed = (await events(s.sessionId)).find((e) => e.eventType === "SMS_FAILED");
+      expect(failed?.details).toContain("http=401");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("SMS_SKIPPED + no HTTP when disabled or token missing (default env)", async () => {
+    const restore = smsEnvSnapshot();
+    delete process.env.SMS_ENABLED;
+    delete process.env.SMS_API_TOKEN;
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response("{}", { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990013" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(calls).toHaveLength(0);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("SMS_QUEUED");
+      expect(types).toContain("SMS_SKIPPED");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("SMART ESCALATION: repeat offender gets the *43# template + SMS_REPEAT_OFFENDER event", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({ id: "msg_rep" }), { status: 200 });
+    });
+    try {
+      // Seed a prior terminal CALL_WAITING_OFF failure for this callee.
+      await makeSession(vs.VState.CALL_WAITING_OFF, { calleeNumber: "+61499990014" });
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990014" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(calls).toHaveLength(1);
+      const body = JSON.parse(String(calls[0].init?.body));
+      expect(body.message).toContain("*43#");
+      const evts = await events(s.sessionId);
+      expect(evts.map((e) => e.eventType)).toContain("SMS_REPEAT_OFFENDER");
+      const sent = evts.find((e) => e.eventType === "SMS_SENT");
+      expect(sent?.details).toContain("template=repeat");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("first-time callee gets the base template (no false escalation)", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990015" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      const body = JSON.parse(String(calls[0].init?.body));
+      expect(body.message).not.toContain("*43#");
+      expect(body.message).toContain("AI SMS");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("CALL_WAITING_ANALYSIS: structured evidence trail event on detection", async () => {
+    const s = await makeSession(vs.VState.LEG_B_DIALING, {
+      calleeNumber: "+61499990016",
+      guarded: true,
+      legBOriginatedAt: new Date(Date.now() - 7000),
+    });
+    await vs.onVoicemailDetected(s.sessionId, "machine_start");
+    const evt = (await events(s.sessionId)).find((e) => e.eventType === "CALL_WAITING_ANALYSIS");
+    expect(evt).toBeDefined();
+    const j = JSON.parse(evt!.details!);
+    expect(j.reason).toContain("voicemail");
+    expect(j.reason).toContain("machine_start");
+    expect(j.stateAtDetection).toBe(vs.VState.LEG_B_DIALING);
+    expect(j.guarded).toBe(true);
+    expect(j.legBAgeMs).toBeGreaterThanOrEqual(6000);
+    expect(j.priorCallWaitingOff).toBe(0);
+    expect(j.smsWindowSec).toBe(0); // no caller leg
+    expect(j.smsPlan).toContain("confirmed");
+  });
+
+  it("buildSmsMessage: repeat > confirmed > hangup precedence", () => {
+    const cfg = { messageConfirmed: "C", messageHangup: "H", messageRepeat: "R" };
+    expect(vs.buildSmsMessage(cfg, true, 0)).toBe("C");
+    expect(vs.buildSmsMessage(cfg, false, 0)).toBe("H");
+    expect(vs.buildSmsMessage(cfg, true, 2)).toBe("R");
+    expect(vs.buildSmsMessage(cfg, false, 1)).toBe("R");
+  });
+
+  it("deliverSms: per-attempt timeout surfaces as an error result", async () => {
+    vi.stubGlobal(
+      "fetch",
+      (_url: unknown, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("The operation was aborted.", "AbortError")),
+          );
+        }),
+    );
+    try {
+      const result = await vs.deliverSms(
+        {
+          baseUrl: "https://sms.example.com/send",
+          token: "t",
+          from: "CallVerify",
+          maxAttempts: 2,
+          timeoutMs: 1000,
+        },
+        "+61499990017",
+        "hello",
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("timeout");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 20_000);
+});
+
+/* -------------------------------------------------------------------------- */
+/* Inbound AI SMS — two-way reply channel (beyond the Asterisk version)       */
+/* -------------------------------------------------------------------------- */
+
+function postJson(url: string, data: Record<string, unknown>) {
+  return hookApp.request(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+describe("inbound AI SMS", () => {
+  it("buildAiSmsReply: model-specific walkthroughs", () => {
+    expect(vs.buildAiSmsReply("iPhone 13")).toContain("Settings");
+    expect(vs.buildAiSmsReply("iphone")).toContain("Call Waiting");
+    expect(vs.buildAiSmsReply("Samsung Galaxy S23")).toContain("Supplementary services");
+    expect(vs.buildAiSmsReply("google pixel 8")).toContain("Calls");
+    expect(vs.buildAiSmsReply("oppo a57")).toContain("Calling accounts");
+    // Unknown model → ask again + universal *43# fallback.
+    const unknown = vs.buildAiSmsReply("hello");
+    expect(unknown).toContain("didn't catch");
+    expect(unknown).toContain("*43#");
+    // Every reply carries the universal fallback.
+    expect(vs.buildAiSmsReply("iPhone")).toContain("*43#");
+  });
+
+  it("end-to-end: callee replies with a model → AI walkthrough sent + event trail", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    delete process.env.SMS_INBOUND_TOKEN;
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({ id: "msg_ai" }), { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.CALL_WAITING_OFF, { calleeNumber: "+61499990020" });
+      const res = await postJson("/api/verify/sms/inbound", {
+        from: "+61499990020",
+        to: "+61400000099",
+        text: "iPhone 13",
+      });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { ok: boolean; result: string };
+      expect(json.result).toBe("replied");
+      expect(calls).toHaveLength(1);
+      const body = JSON.parse(String(calls[0].init?.body));
+      expect(body.to).toBe("+61499990020");
+      expect(body.message).toContain("iPhone");
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("SMS_INBOUND");
+      expect(types).toContain("SMS_AI_REPLY");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("cooldown: a second inbound within 60s is not re-answered", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    delete process.env.SMS_INBOUND_TOKEN;
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    try {
+      await makeSession(vs.VState.CALL_WAITING_OFF, { calleeNumber: "+61499990021" });
+      const r1 = await postJson("/api/verify/sms/inbound", { from: "+61499990021", text: "samsung" });
+      expect(((await r1.json()) as { result: string }).result).toBe("replied");
+      const r2 = await postJson("/api/verify/sms/inbound", { from: "+61499990021", text: "samsung s23" });
+      expect(((await r2.json()) as { result: string }).result).toBe("cooldown");
+      expect(calls).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("unknown sender (no session) still gets the walkthrough", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_API_TOKEN = "ct_test_token";
+    delete process.env.SMS_INBOUND_TOKEN;
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    try {
+      const res = await postJson("/api/verify/sms/inbound", { from: "+61499990099", text: "pixel" });
+      const json = (await res.json()) as { result: string };
+      expect(json.result).toBe("replied");
+      expect(calls).toHaveLength(1);
+      expect(JSON.parse(String(calls[0].init?.body)).message).toContain("Pixel");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("shared-secret auth: wrong/missing token → 401 when SMS_INBOUND_TOKEN is set", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_INBOUND_TOKEN = "secret123";
+    try {
+      const noToken = await postJson("/api/verify/sms/inbound", { from: "+61499990098", text: "hi" });
+      expect(noToken.status).toBe(401);
+      const wrong = await postJson("/api/verify/sms/inbound?token=nope", { from: "+61499990098", text: "hi" });
+      expect(wrong.status).toBe(401);
+    } finally {
+      restore();
+    }
+  });
+
+  it("validation: missing from/text → 400", async () => {
+    const restore = smsEnvSnapshot();
+    delete process.env.SMS_INBOUND_TOKEN;
+    try {
+      const res = await postJson("/api/verify/sms/inbound", { from: "+61499990097" });
+      expect(res.status).toBe(400);
+    } finally {
+      restore();
     }
   });
 });

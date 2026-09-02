@@ -13,6 +13,7 @@ import {
   verificationGatherHandler,
   verificationGatherLegAAcceptHandler,
   verificationGatherLegAReadyHandler,
+  verificationSmsInboundHandler,
   verificationStatusHandler,
   verificationToneHandler,
   verificationTwimlHandler,
@@ -54,6 +55,9 @@ app.post("/api/test/callee-bot", testCalleeBotHandler);
 app.get("/api/test/callee-bot", testCalleeBotHandler);
 app.post("/api/test/callee-bot-record", testCalleeBotRecordHandler);
 app.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
+// Two-way AI SMS: Crazytel Virtual Mobile Number inbound webhook (JSON
+// {from, to, text}) — replies with model-specific call-waiting walkthroughs.
+app.post("/api/verify/sms/inbound", verificationSmsInboundHandler);
 // Serve the in-band DTMF verification tone with a proper audio/wav Content-Type
 // (the generic static server returns octet-stream; Twilio refuses it — error 12300).
 app.get("/api/verify/tone.wav", verificationToneHandler);

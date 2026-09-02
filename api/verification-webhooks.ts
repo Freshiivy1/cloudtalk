@@ -1080,3 +1080,46 @@ export async function verificationGatherHandler(c: Context) {
   }
   return xml(c, vr);
 }
+
+/**
+ * POST /api/verify/sms/inbound — Crazytel Virtual Mobile Number "JSON Web
+ * Request" webhook (two-way AI SMS — the upgrade the Asterisk version never
+ * had). Crazytel posts JSON {"from":"+614…","to":"+614…","text":"iphone 13"};
+ * we answer with a model-specific call-waiting walkthrough (see
+ * vs.handleInboundSms). Form-encoded posts are tolerated as a fallback.
+ *
+ * Auth: the provider cannot sign requests, so when SMS_INBOUND_TOKEN is
+ * configured the ?token= query must match (shared-secret URL). Always returns
+ * 200 on processing errors so the provider doesn't retry-storm us.
+ */
+export async function verificationSmsInboundHandler(c: Context) {
+  const expected = process.env.SMS_INBOUND_TOKEN;
+  if (expected && c.req.query("token") !== expected) {
+    return c.json({ ok: false, error: "unauthorized" }, 401);
+  }
+  let from = "";
+  let text = "";
+  try {
+    const body = (await c.req.json()) as { from?: string; text?: string; message?: string };
+    from = String(body.from ?? "");
+    text = String(body.text ?? body.message ?? "");
+  } catch {
+    try {
+      const form = await c.req.parseBody();
+      from = String(form.from ?? "");
+      text = String(form.text ?? form.message ?? "");
+    } catch {
+      /* fall through to validation */
+    }
+  }
+  if (!from || !text) {
+    return c.json({ ok: false, error: "missing from/text" }, 400);
+  }
+  try {
+    const result = await vs.handleInboundSms(from, text);
+    return c.json({ ok: true, result });
+  } catch (err) {
+    console.error("[verify] SMS_INBOUND_ERROR", err);
+    return c.json({ ok: false, error: "internal" }, 200);
+  }
+}
