@@ -965,12 +965,17 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
         callerCallSid: "CA_ng_caller",
         legACallSid: "CA_ng_legA",
       });
+      // Assert only on THIS test's REST updates — earlier guarded-bridge
+      // tests legitimately redirect to guarded-bridge, so the global array
+      // must not be consulted whole.
+      const updBefore = updatedCalls.length;
       await vs.onLegBAnswered(s.sessionId, "CA_ng_legB");
       await tick(200);
       // No bridge, no guarded events, no hangups — session waits for the
       // legacy merge/verdict outcomes exactly as before.
       expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
-      expect(updatedCalls.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
+      const added = updatedCalls.slice(updBefore);
+      expect(added.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
       expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).not.toContain("GUARDED_MERGE_WATCH_ARMED");
@@ -1593,7 +1598,10 @@ describe("Leg A press-1 IVR", () => {
     const body = await res.text();
     expect(body).toContain("<Gather");
     expect(body).toContain('numDigits="1"');
-    expect(body).toContain("Press 1 to accept");
+    // Current acceptance prompt (verifyPrompts().accept — CALL-FLOW.md Phase 2).
+    expect(body).toContain(
+      "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
+    );
     expect(body).toContain("/api/verify/gather/leg-a-accept?sid=abc123");
     // timeout falls through to a re-prompt redirect (attempt incremented)
     expect(body).toContain("&amp;a=1");
@@ -1612,7 +1620,7 @@ describe("Leg A press-1 IVR", () => {
     expect(body).not.toContain("<Start>");
   });
 
-  it("press 1 to accept → Leg B PRE-ORIGINATED (already dialing), serves ready gather", async () => {
+  it("press 1 to accept → Leg B PRE-ORIGINATED (already dialing), Leg A parked on hold loop", async () => {
     const s = await makeSession(vs.VState.LEG_A_DIALING);
     const res = await postForm(`/api/verify/gather/leg-a-accept?sid=${s.sessionId}&a=0`, {
       CallSid: "CA_lega_ivr",
@@ -1621,7 +1629,8 @@ describe("Leg A press-1 IVR", () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     // Pre-origination: first press-1 immediately starts Leg B ringing so the
-    // second call arrives instantly after the ready press.
+    // second call arrives instantly (single-press flow — the ready-press step
+    // is bypassed for non-guarded sessions; Leg A is parked on the hold loop).
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.LEG_B_DIALING);
     expect(after.legBCallSid).toMatch(/^CA_mock_/);
@@ -1629,8 +1638,8 @@ describe("Leg A press-1 IVR", () => {
       (c) => String(c.url).includes("/twiml/leg-b") && String(c.url).includes(s.sessionId),
     );
     expect(legB?.timeout).toBe(15);
-    expect(body).toContain("Do not end this call. You will receive a second call. Please press 1.");
-    expect(body).toContain("/api/verify/gather/leg-a-ready?sid=");
+    expect(body).toContain("Thank you. Please stay on the line while your call is connected.");
+    expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
   });
 
   it("second press-1 is idempotent — never double-originates Leg B", async () => {
@@ -1836,8 +1845,9 @@ describe("full flows (mocked Twilio)", () => {
       CallSid: "CA_legb_headless",
       Digits: "9",
     });
+    // Current merge verdict (verifyPrompts().mergeDetected) + hangup.
     expect(await res.text()).toContain(
-      "Merge detected. Verification complete. This line is confirmed as a cellular phone.",
+      "We detected a potential speakerphone or merged call on this line. This call will now end. Goodbye.",
     );
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
   });
@@ -1969,7 +1979,7 @@ describe("guarded single-call flow", () => {
     expect((await vs.findSession(already.sessionId))!.state).toBe(vs.VState.BRIDGED);
   });
 
-  it("voice webhook guarded branch parks the caller in the session conference", async () => {
+  it("voice webhook guarded branch parks the caller in the non-blocking caller-wait loop", async () => {
     const s = await makeSession(vs.VState.INITIATED, { guarded: true });
     const res = await postForm("/api/voice/twiml", {
       guarded: s.sessionId,
@@ -1979,9 +1989,14 @@ describe("guarded single-call flow", () => {
     const body = await res.text();
     expect(res.status).toBe(200);
     expect(body).toContain("Please wait while we connect your call.");
-    expect(body).toContain("<Conference");
-    expect(body).toContain(`verify-${s.sessionId}`);
-    expect(body).toContain('startConferenceOnEnter="false"');
+    // Non-blocking park: <Pause> + self-redirect — NEVER <Dial><Conference>
+    // (a REST redirect cannot pull a call out of an active Dial, and a second
+    // leg dialling the same not-yet-started conference would spawn a
+    // duplicate conference with both parties alone). The engine moves this
+    // leg into the bridge conference at bridge time.
+    expect(body).toContain("<Pause");
+    expect(body).toContain(`/api/verify/twiml/caller-wait?sid=${s.sessionId}`);
+    expect(body).not.toContain("<Conference");
     // Engine advanced: caller stored, Leg A airborne.
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.callerCallSid).toBe("CA_sdk_wh");
@@ -2015,7 +2030,8 @@ describe("guarded single-call flow", () => {
     expect(gBody).toContain(
       "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
     );
-    expect(gBody).toContain(`/api/verify/gather/leg-a-accept?sid=${g.sessionId}&a=0`);
+    // TwiML is XML — query-string '&' is emitted correctly escaped as '&amp;'.
+    expect(gBody).toContain(`/api/verify/gather/leg-a-accept?sid=${g.sessionId}&amp;a=0`);
     // Media stream attached on the first fetch (inbound callee uplink).
     expect(gBody).toContain("<Start>");
     expect(gBody).toContain(`/api/verify/stream?sid=${g.sessionId}`);

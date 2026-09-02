@@ -963,6 +963,16 @@ async function save(session: VerificationSession): Promise<void> {
       smsSent: session.smsSent,
       completedAt: session.completedAt,
       failureReason: session.failureReason,
+      // Call-review recordings (guarded voice-ID clip + bridge conference
+      // recording) — written by storeVoiceRecording/storeBridgeRecording and
+      // previously dropped here, so call review never had playable audio.
+      voiceRecordingUrl: session.voiceRecordingUrl,
+      voiceRecordingDurationSec: session.voiceRecordingDurationSec,
+      voiceRecordedAt: session.voiceRecordedAt,
+      bridgeRecordingSid: session.bridgeRecordingSid,
+      bridgeRecordingUrl: session.bridgeRecordingUrl,
+      bridgeRecordingDurationSec: session.bridgeRecordingDurationSec,
+      bridgeRecordedAt: session.bridgeRecordedAt,
     })
     .where(eq(schema.verificationSessions.sessionId, session.sessionId));
 }
