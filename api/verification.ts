@@ -153,6 +153,17 @@ export function mergeWatchMs(): number {
 }
 
 /**
+ * Participant-confirmation budget (ms) for the sequential guarded bridge:
+ * how long waitForConferenceParticipant polls for Leg A inside the live
+ * conference before the warn-then-redirect-anyway fallback fires. Default
+ * 20s (matches the pre-regression reference); env-overridable for tests.
+ */
+export function bridgeConfirmTimeoutMs(): number {
+  const v = Number(process.env.VERIFY_BRIDGE_CONFIRM_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 20_000;
+}
+
+/**
  * In-process record of when the merge watch was armed per session (LEG_B_
  * ANSWERED). Short-lived, mirrors the pendingLegBAnswer pattern. Used by the
  * leg-a-tone TwiML poll fallback so the bridge also happens on runtimes
@@ -1084,6 +1095,101 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
   }
 }
 
+/**
+ * Poll until Twilio reports `callSid` inside the session's live conference,
+ * returning that conference's SID (null on timeout). Restored single-creator
+ * sequential-bridge primitive (regression of ac2c860): the caller leg is
+ * REST-redirected into the conference ONLY after Leg A is confirmed inside
+ * it — redirecting both legs at once lets Twilio spawn DUPLICATE conferences
+ * under the same friendlyName (one participant each) and both sides hear
+ * silence. Never throws: API failures are tolerated (≥3 consecutive errors
+ * give up) so a broken API path cannot stall the bridge.
+ */
+async function waitForConferenceParticipant(
+  sessionId: string,
+  callSid: string | null,
+  timeoutMs: number,
+): Promise<string | null> {
+  if (!callSid) return null;
+  const deadline = Date.now() + timeoutMs;
+  let consecutiveErrors = 0;
+  while (Date.now() < deadline) {
+    try {
+      const confs = await getTwilioClient().conferences.list({
+        friendlyName: conferenceName(sessionId),
+        status: "in-progress",
+        limit: 5,
+      });
+      for (const conf of confs) {
+        const parts = await getTwilioClient()
+          .conferences(conf.sid)
+          .participants.list({ limit: 20 });
+        if (parts.some((p) => p.callSid === callSid)) return conf.sid;
+      }
+      consecutiveErrors = 0;
+    } catch {
+      // API path broken (or mocked) — don't stall the bridge on it.
+      consecutiveErrors++;
+      if (consecutiveErrors >= 3) return null;
+    }
+    await new Promise((r) => setTimeout(r, 750));
+  }
+  return null;
+}
+
+/**
+ * Post-bridge verification (~3s after the caller redirect): re-list the
+ * session's live conferences and log decisive evidence of whether BOTH
+ * bridge legs landed in the SAME conference (GUARDED_BRIDGE_VERIFIED) or
+ * not (GUARDED_BRIDGE_MISMATCH — the duplicate-conference race symptom).
+ * Never throws; purely observational.
+ */
+async function verifyBridgeParticipants(
+  sessionId: string,
+  callerCallSid: string | null,
+  legACallSid: string | null,
+): Promise<void> {
+  try {
+    const confs = await getTwilioClient().conferences.list({
+      friendlyName: conferenceName(sessionId),
+      status: "in-progress",
+      limit: 5,
+    });
+    for (const conf of confs) {
+      const parts = await getTwilioClient()
+        .conferences(conf.sid)
+        .participants.list({ limit: 20 });
+      const hasCaller =
+        callerCallSid !== null && parts.some((p) => p.callSid === callerCallSid);
+      const hasLegA =
+        legACallSid !== null && parts.some((p) => p.callSid === legACallSid);
+      if (hasCaller || hasLegA) {
+        const both = hasCaller && hasLegA;
+        await logEvent(
+          sessionId,
+          both ? "GUARDED_BRIDGE_VERIFIED" : "GUARDED_BRIDGE_MISMATCH",
+          `conf=${conf.sid} participants=${parts.length} caller=${hasCaller} legA=${hasLegA} — ` +
+            (both
+              ? "both bridge legs confirmed in the SAME conference"
+              : "bridge legs NOT in the same conference (duplicate-conference race?)"),
+        );
+        return;
+      }
+    }
+    await logEvent(
+      sessionId,
+      "GUARDED_BRIDGE_MISMATCH",
+      `no live conference ${conferenceName(sessionId)} contains either bridge leg ` +
+        `(caller=${callerCallSid ?? "(none)"} legA=${legACallSid ?? "(none)"})`,
+    );
+  } catch (err) {
+    console.warn(
+      `[verify] bridge verification failed session=${sessionId}:`,
+      (err as Error).message,
+    );
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* BRIDGED in-call merge detection — continuous ARMED merge tone (v3)           */
 /* -------------------------------------------------------------------------- */
@@ -1789,6 +1895,41 @@ export async function onLegBAnswered(
 }
 
 /**
+ * Sequential-bridge core (single execution guaranteed by the caller's
+ * transition gate): poll until Leg A is a confirmed participant of the
+ * session's live conference (≤20s), then REST-redirect the caller into it.
+ * Timeout fallback (warn-then-redirect-anyway): a missing confirmation must
+ * not leave the caller parked forever — the caller is still redirected and
+ * GUARDED_BRIDGE_UNCONFIRMED is logged. ~3s after the redirect, the bridge
+ * is verified (GUARDED_BRIDGE_VERIFIED / GUARDED_BRIDGE_MISMATCH) so live
+ * logs carry decisive evidence of both legs sharing one conference.
+ */
+async function confirmAndRedirectCaller(
+  sessionId: string,
+  legASid: string | null,
+  callerSid: string | null,
+): Promise<void> {
+  const timeoutMs = bridgeConfirmTimeoutMs();
+  const confSid = await waitForConferenceParticipant(sessionId, legASid, timeoutMs);
+  if (!confSid) {
+    console.warn(
+      `[verify] GUARDED_BRIDGE session=${sessionId} — Leg A not confirmed in conference within ${timeoutMs}ms; redirecting caller anyway`,
+    );
+    await logEvent(
+      sessionId,
+      "GUARDED_BRIDGE_UNCONFIRMED",
+      `Leg A (${legASid ?? "(none)"}) not confirmed in conference ${conferenceName(sessionId)} within ${timeoutMs}ms — redirecting caller anyway`,
+    );
+  }
+  await redirectCall(callerSid, "guarded-bridge", sessionId);
+  setTimeout(() => {
+    void verifyBridgeParticipants(sessionId, callerSid, legASid).catch((err) =>
+      console.error("[verify] guarded bridge verify error:", err),
+    );
+  }, 3_000).unref?.();
+}
+
+/**
  * Guarded pass point: LEG_B_ANSWERED (callee accepted via press-1 AND the
  * second simultaneous call was answered by a human, i.e. call waiting works
  * and the line is cellular) + the merge-detection watch window elapsed with
@@ -1843,10 +1984,36 @@ export async function maybeBridgeGuarded(
     // by a human) is left to end naturally. Leg A's <Start><Stream> survives
     // the bridge redirect, so speakerphone detection keeps running in-call.
     await hangupAll(session, { ringTest: true });
-    // Bridge the two real parties into the same conference (LIVE, two-way).
-    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
-    if (!opts.legAInline) {
-      await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
+    // Bridge the two real parties into the same conference (LIVE, two-way) —
+    // SINGLE-CREATOR SEQUENTIAL bridge (restored after the ac2c860
+    // regression): Leg A must join the conference FIRST and the caller leg is
+    // REST-redirected ONLY after Twilio confirms Leg A as a participant.
+    // Redirecting both legs at the same conference friendlyName concurrently
+    // lets Twilio spawn DUPLICATE conferences (one participant each) and
+    // both sides hear silence.
+    const callerSid = session.callerCallSid;
+    const legASid = session.legACallSid;
+    if (opts.legAInline) {
+      // Leg A is joining the conference RIGHT NOW via this TwiML fetch's own
+      // <Dial><Conference> response — a REST redirect of Leg A here would
+      // race the response Twilio is about to execute, and this fetch MUST
+      // NOT block waiting for the participant to materialize. Fire and
+      // forget: confirm Leg A (≤20s), then redirect the parked caller in.
+      void (async () => {
+        await confirmAndRedirectCaller(sessionId, legASid, callerSid);
+      })().catch((err) =>
+        console.error("[verify] guarded caller bridge error:", err),
+      );
+    } else {
+      // Force bridge (Leg B hung up): no inline join is in flight, so Leg A
+      // must be REST-redirected into the conference FIRST, then the caller
+      // is redirected only after Leg A is confirmed inside.
+      await redirectCall(legASid, "guarded-bridge", sessionId);
+      void (async () => {
+        await confirmAndRedirectCaller(sessionId, legASid, callerSid);
+      })().catch((err) =>
+        console.error("[verify] guarded caller bridge error:", err),
+      );
     }
     // The pre-bridge merge tone stops here. Mid-call merge detection is
     // TRIGGER-driven (v3): the HoldDetector on Leg A's uplink arms the

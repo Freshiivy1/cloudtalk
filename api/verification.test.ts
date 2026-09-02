@@ -35,6 +35,13 @@ const twilioMock = vi.hoisted(() => ({
     announceMethod?: string;
   }>,
   conferenceUpdates: [] as Array<{ conference: string; status?: string }>,
+  // Sequential guarded bridge: callSids the mocked conferences report as
+  // participants via conferences(sid).participants.list — the engine waits
+  // for Leg A to appear here before REST-redirecting the caller.
+  conferenceParticipants: [] as string[],
+  // Ordered REST call log so tests can assert bridge sequencing (the caller
+  // redirect must come AFTER a participants.list confirms Leg A).
+  restLog: [] as string[],
 }));
 
 vi.mock("twilio", async (importOriginal) => {
@@ -46,6 +53,7 @@ vi.mock("twilio", async (importOriginal) => {
       (sid: string) => ({
         update: async (opts: { url?: string; method?: string; status?: string }) => {
           twilioMock.updatedCalls.push({ sid, ...opts });
+          twilioMock.restLog.push(`calls.update:${sid}`);
           return {};
         },
       }),
@@ -58,16 +66,27 @@ vi.mock("twilio", async (importOriginal) => {
     ),
     conferences: Object.assign(
       (name: string) => ({
-        participants: (participantSid: string) => ({
-          update: async (opts: { announceUrl?: string; announceMethod?: string }) => {
-            twilioMock.participantUpdates.push({
-              conference: name,
-              participant: participantSid,
-              ...opts,
-            });
-            return {};
+        participants: Object.assign(
+          (participantSid: string) => ({
+            update: async (opts: { announceUrl?: string; announceMethod?: string }) => {
+              twilioMock.participantUpdates.push({
+                conference: name,
+                participant: participantSid,
+                ...opts,
+              });
+              return {};
+            },
+          }),
+          {
+            // Participant roster of this conference — the sequential guarded
+            // bridge polls this until Leg A shows up before redirecting the
+            // caller.
+            list: async () => {
+              twilioMock.restLog.push(`participants.list:${name}`);
+              return twilioMock.conferenceParticipants.map((callSid) => ({ callSid }));
+            },
           },
-        }),
+        ),
         update: async (opts: { status?: string }) => {
           twilioMock.conferenceUpdates.push({ conference: name, ...opts });
           return {};
@@ -76,9 +95,10 @@ vi.mock("twilio", async (importOriginal) => {
       {
         // Engine resolves the live conference SID by friendly name first
         // (conferences are addressable by SID only on the real API).
-        list: async (opts?: { friendlyName?: string }) => [
-          { sid: opts?.friendlyName ?? "CF_mock" },
-        ],
+        list: async (opts?: { friendlyName?: string; status?: string; limit?: number }) => {
+          twilioMock.restLog.push("conferences.list");
+          return [{ sid: opts?.friendlyName ?? "CF_mock" }];
+        },
       },
     ),
   };
@@ -88,7 +108,14 @@ vi.mock("twilio", async (importOriginal) => {
   return { ...actual, default: factory };
 });
 
-const { createdCalls, updatedCalls, participantUpdates, conferenceUpdates } = twilioMock;
+const {
+  createdCalls,
+  updatedCalls,
+  participantUpdates,
+  conferenceUpdates,
+  conferenceParticipants,
+  restLog,
+} = twilioMock;
 
 const RUN = `t${Date.now().toString(36)}`;
 const createdIds: string[] = [];
@@ -924,6 +951,7 @@ describe("speakerphoneArmWindows (3s forensic arming)", () => {
 describe("guarded live bridge (verification pass → BRIDGED)", () => {
   it("guarded: bridges caller + Leg A live once the merge watch elapses with no merge", async () => {
     process.env.VERIFY_MERGE_WATCH_MS = "0";
+    conferenceParticipants.push("CA_g_legA");
     try {
       const s = await makeSession(vs.VState.LEG_B_DIALING, {
         guarded: true,
@@ -936,7 +964,9 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       await vs.onLegBAnswered(s.sessionId, "CA_g_legB");
       expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
       // Watch window (0ms here) elapses with no merge → PASS → live bridge.
-      await tick(150);
+      // Sequential bridge: Leg A is redirected first, then the caller is
+      // redirected asynchronously once Leg A is confirmed a participant.
+      await tick(600);
       const after = (await vs.findSession(s.sessionId))!;
       expect(after.state).toBe(vs.VState.BRIDGED);
       const added = updatedCalls.slice(updBefore);
@@ -955,6 +985,7 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       expect(types).toContain("GUARDED_BRIDGED");
     } finally {
       delete process.env.VERIFY_MERGE_WATCH_MS;
+      conferenceParticipants.length = 0;
     }
   });
 
@@ -987,6 +1018,7 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
 
   it("maybeBridgeGuarded(legAInline): redirects the caller only (Leg A is served inline)", async () => {
     process.env.VERIFY_MERGE_WATCH_MS = "0";
+    conferenceParticipants.push("CA_i_legA");
     try {
       const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
         guarded: true,
@@ -996,16 +1028,31 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       // First sight in this process arms the watch and defers one cycle.
       expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(false);
       const updBefore = updatedCalls.length;
+      const logBefore = restLog.length;
       expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(true);
+      // The caller redirect is DEFERRED behind Leg A's participant
+      // confirmation (fire-and-forget so the TwiML fetch never blocks).
+      await tick(300);
       const added = updatedCalls.slice(updBefore);
       expect(added.some((u) => u.sid === "CA_i_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
       // Leg A must NOT be REST-redirected — the TwiML fetch serves it inline.
       expect(added.some((u) => u.sid === "CA_i_legA" && String(u.url).includes("guarded-bridge"))).toBe(false);
       expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
-      // Idempotent: a second pass is a no-op.
+      // Caller redirect came only AFTER a participants.list confirmed Leg A.
+      const log = restLog.slice(logBefore);
+      const callerIdx = log.indexOf("calls.update:CA_i_caller");
+      expect(callerIdx).toBeGreaterThan(-1);
+      const confirmIdx = log.findIndex((e) => e.startsWith("participants.list:"));
+      expect(confirmIdx).toBeGreaterThan(-1);
+      expect(callerIdx).toBeGreaterThan(confirmIdx);
+      // Idempotent: a second pass is a no-op — no further redirects at all.
+      const updAfter = updatedCalls.length;
       expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
+      await tick(150);
+      expect(updatedCalls.length).toBe(updAfter);
     } finally {
       delete process.env.VERIFY_MERGE_WATCH_MS;
+      conferenceParticipants.length = 0;
     }
   });
 
@@ -1021,6 +1068,9 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       // First sight arms the watch and defers one cycle.
       expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
       expect(vs.isBridgedSession(s.sessionId)).toBe(false);
+      // Leg A resolvable as a conference participant so the deferred caller
+      // redirect confirms instantly instead of polling until the fallback.
+      conferenceParticipants.push("CA_reg_legA");
       // The successful bridge sets the flag on return — the media-stream
       // analyzer path sees BRIDGED on the next audio window, before any
       // DB refresh poll could run.
@@ -1031,21 +1081,27 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       expect(vs.isBridgedSession(s.sessionId)).toBe(false);
     } finally {
       delete process.env.VERIFY_MERGE_WATCH_MS;
+      conferenceParticipants.length = 0;
     }
   });
 
   it("guarded: Leg B hangup during LEG_B_ANSWERED bridges (no notify-completed)", async () => {
-    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
-      guarded: true,
-      callerCallSid: "CA_lbh_caller",
-      legACallSid: "CA_lbh_legA",
-      ringTestCallSid: "CA_lbh_rt",
-    });
-    const updBefore = updatedCalls.length;
-    await vs.onCallCompleted(s.sessionId, "legB", "CA_lbh_legB", "duration=12s");
-    const after = (await vs.findSession(s.sessionId))!;
-    expect(after.state).toBe(vs.VState.BRIDGED);
-    const added = updatedCalls.slice(updBefore);
+    conferenceParticipants.push("CA_lbh_legA");
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        guarded: true,
+        callerCallSid: "CA_lbh_caller",
+        legACallSid: "CA_lbh_legA",
+        ringTestCallSid: "CA_lbh_rt",
+      });
+      const updBefore = updatedCalls.length;
+      await vs.onCallCompleted(s.sessionId, "legB", "CA_lbh_legB", "duration=12s");
+      // Sequential bridge: Leg A was redirected synchronously; the caller
+      // redirect lands asynchronously after participant confirmation.
+      await tick(300);
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.BRIDGED);
+      const added = updatedCalls.slice(updBefore);
     // BOTH caller and Leg A are redirected into the live conference…
     expect(added.some((u) => u.sid === "CA_lbh_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
     expect(added.some((u) => u.sid === "CA_lbh_legA" && String(u.url).includes("guarded-bridge"))).toBe(true);
@@ -1054,9 +1110,12 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(added.some((u) => String(u.url).includes("notify-"))).toBe(false);
     expect(added.some((u) => u.sid === "CA_lbh_legA" && u.status === "completed")).toBe(false);
     expect(added.some((u) => u.sid === "CA_lbh_rt" && u.status === "completed")).toBe(true);
-    const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("GUARDED_BRIDGED");
-    expect(types).toContain(vs.VState.BRIDGED);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("GUARDED_BRIDGED");
+      expect(types).toContain(vs.VState.BRIDGED);
+    } finally {
+      conferenceParticipants.length = 0;
+    }
   });
 
   it("non-guarded: Leg B hangup still completes with notify-completed + hangupAll (legacy)", async () => {
@@ -1075,6 +1134,145 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(added.some((u) => u.sid === "CA_lgn_legA" && u.status === "completed")).toBe(true);
     expect(added.some((u) => u.sid === "CA_lgn_rt" && u.status === "completed")).toBe(true);
     expect(added.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
+  });
+
+  it("sequential bridge: caller redirect happens ONLY after Leg A participant confirmation (mock call log order)", async () => {
+    // No participants yet — the confirmation poll must keep the caller parked.
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_seq_caller",
+      legACallSid: "CA_seq_legA",
+    });
+    const logBefore = restLog.length;
+    try {
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { force: true })).toBe(true);
+      // Leg A is redirected FIRST (synchronously, inside the gated block).
+      expect(restLog.slice(logBefore)).toContain("calls.update:CA_seq_legA");
+      // One poll cycle has run; with Leg A not yet a participant the caller
+      // is NOT redirected (no concurrent dual-dial → no duplicate conference).
+      await tick(400);
+      expect(restLog.slice(logBefore)).not.toContain("calls.update:CA_seq_caller");
+      // Leg A materializes inside the conference → the next poll confirms it
+      // and ONLY THEN the caller is redirected in.
+      conferenceParticipants.push("CA_seq_legA");
+      await tick(700);
+      const log = restLog.slice(logBefore);
+      const legAIdx = log.indexOf("calls.update:CA_seq_legA");
+      const confirmIdx = log.findIndex((e) => e.startsWith("participants.list:"));
+      const callerIdx = log.indexOf("calls.update:CA_seq_caller");
+      expect(legAIdx).toBeGreaterThan(-1);
+      expect(confirmIdx).toBeGreaterThan(-1);
+      expect(callerIdx).toBeGreaterThan(confirmIdx);
+      expect(callerIdx).toBeGreaterThan(legAIdx);
+      // Exactly one caller redirect across the whole bridge.
+      expect(log.filter((e) => e === "calls.update:CA_seq_caller").length).toBe(1);
+    } finally {
+      conferenceParticipants.length = 0;
+    }
+  });
+
+  it("sequential bridge: confirmation timeout warns + logs GUARDED_BRIDGE_UNCONFIRMED + redirects the caller anyway", async () => {
+    process.env.VERIFY_BRIDGE_CONFIRM_TIMEOUT_MS = "50";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        guarded: true,
+        callerCallSid: "CA_to_caller",
+        legACallSid: "CA_to_legA",
+      });
+      const updBefore = updatedCalls.length;
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { force: true })).toBe(true);
+      // Leg A never appears in the conference: after the (shortened) timeout
+      // the fallback still redirects the caller rather than parking it forever.
+      await tick(1400);
+      const added = updatedCalls.slice(updBefore);
+      expect(
+        added.some((u) => u.sid === "CA_to_caller" && String(u.url).includes("guarded-bridge")),
+      ).toBe(true);
+      expect(
+        warnSpy.mock.calls.some(
+          (args) =>
+            typeof args[0] === "string" &&
+            args[0].includes("GUARDED_BRIDGE") &&
+            args[0].includes("redirecting caller anyway"),
+        ),
+      ).toBe(true);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("GUARDED_BRIDGE_UNCONFIRMED");
+    } finally {
+      delete process.env.VERIFY_BRIDGE_CONFIRM_TIMEOUT_MS;
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("sequential bridge: GUARDED_BRIDGE_VERIFIED logs both legs in the SAME conference (~3s post-redirect)", async () => {
+    conferenceParticipants.push("CA_vb_legA");
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_vb_caller",
+      legACallSid: "CA_vb_legA",
+    });
+    try {
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { force: true })).toBe(true);
+      await tick(400);
+      // The caller joined too by the time the verification step runs (+3s).
+      conferenceParticipants.push("CA_vb_caller");
+      await tick(3300);
+      const evts = await events(s.sessionId);
+      const verified = evts.find((e) => e.eventType === "GUARDED_BRIDGE_VERIFIED");
+      expect(verified).toBeDefined();
+      expect(verified!.details).toContain(`conf=${vs.conferenceName(s.sessionId)}`);
+      expect(verified!.details).toContain("participants=2");
+      expect(verified!.details).toContain("caller=true legA=true");
+      expect(evts.some((e) => e.eventType === "GUARDED_BRIDGE_MISMATCH")).toBe(false);
+    } finally {
+      conferenceParticipants.length = 0;
+    }
+  });
+
+  it("sequential bridge: GUARDED_BRIDGE_MISMATCH when the caller is not in Leg A's conference", async () => {
+    conferenceParticipants.push("CA_mm_legA"); // Leg A confirms; caller never shows up.
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_mm_caller",
+      legACallSid: "CA_mm_legA",
+    });
+    try {
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { force: true })).toBe(true);
+      await tick(3800);
+      const evts = await events(s.sessionId);
+      const mismatch = evts.find((e) => e.eventType === "GUARDED_BRIDGE_MISMATCH");
+      expect(mismatch).toBeDefined();
+      expect(mismatch!.details).toContain("caller=false legA=true");
+      expect(evts.some((e) => e.eventType === "GUARDED_BRIDGE_VERIFIED")).toBe(false);
+    } finally {
+      conferenceParticipants.length = 0;
+    }
+  });
+
+  it("sequential bridge: idempotent — a second maybeBridgeGuarded performs no redirects", async () => {
+    conferenceParticipants.push("CA_idem_legA");
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      guarded: true,
+      callerCallSid: "CA_idem_caller",
+      legACallSid: "CA_idem_legA",
+    });
+    try {
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { force: true })).toBe(true);
+      await tick(400);
+      expect(restLog).toContain("calls.update:CA_idem_caller");
+      const updCount = updatedCalls.length;
+      const logCount = restLog.length;
+      // Both later triggers (TwiML poll + force) are no-ops: the transition
+      // gate consumed the single bridge execution.
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(false);
+      expect(await vs.maybeBridgeGuarded(s.sessionId, { force: true })).toBe(false);
+      await tick(300);
+      expect(updatedCalls.length).toBe(updCount);
+      expect(restLog.length).toBe(logCount);
+    } finally {
+      conferenceParticipants.length = 0;
+    }
   });
 
   it("BRIDGED: in-call merge detection tears down the whole conference", async () => {
