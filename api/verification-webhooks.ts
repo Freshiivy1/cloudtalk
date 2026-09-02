@@ -151,6 +151,51 @@ function xml(c: Context, vr: twilio.twiml.VoiceResponse) {
 /** <Gather> digit timeout per IVR attempt, seconds. */
 const IVR_GATHER_TIMEOUT = 8;
 
+/**
+ * Caller-wait park cadence (seconds). Short enough that the self-healing
+ * bridge check (BRIDGED → join conference from this fetch) recovers from a
+ * failed/raced REST redirect within seconds instead of up to a minute.
+ */
+const CALLER_WAIT_PAUSE_SEC = 10;
+
+/**
+ * The live two-way bridge conference TwiML, shared by the `guarded-bridge`
+ * document, the caller-wait self-heal path and the leg-a-tone inline bridge.
+ *
+ * Leg A is the ANCHOR (startConferenceOnEnter: true) — the conference exists
+ * the moment the callee enters. The caller is the JOINER (false): a leg that
+ * cannot start the conference can never spawn a duplicate same-name
+ * conference (the classic Twilio race that strands both parties alone in
+ * silence); if the caller arrives first it waits in the lobby the few
+ * hundred ms until the anchor dials in. endConferenceOnExit on both legs:
+ * when either party hangs up, the other is dropped out of the conference.
+ *
+ * The post-Dial <Redirect> is the ONLY way to tell the surviving party the
+ * call is over: a REST redirect cannot reach a call inside an active
+ * <Dial><Conference>. When the conference ends, the Dial verb returns and
+ * the surviving leg hears notify-partner-ended, then hangs up. (For the
+ * party that hung up the call is already over — these verbs never run.)
+ */
+function serveBridgeConference(
+  vr: twilio.twiml.VoiceResponse,
+  sid: string,
+  leg: "caller" | "legA",
+) {
+  vr.dial().conference(
+    {
+      beep: "false",
+      startConferenceOnEnter: leg === "legA",
+      endConferenceOnExit: true,
+      record: "record-from-start",
+      recordingStatusCallback: vs.recordingBridgeUrl(sid),
+      recordingStatusCallbackMethod: "POST",
+      recordingStatusCallbackEvent: ["completed"],
+    },
+    vs.conferenceName(sid),
+  );
+  vr.redirect({ method: "POST" }, vs.twimlUrl("notify-partner-ended", sid));
+}
+
 function attemptFrom(c: Context): number {
   const a = parseInt(c.req.query("a") ?? "0", 10);
   return Number.isFinite(a) && a >= 0 ? a : 0;
@@ -213,7 +258,18 @@ export async function verificationTwimlHandler(c: Context) {
           vr.hangup();
           break;
         }
-        vr.pause({ length: 60 });
+        // SELF-HEALING BRIDGE: the REST redirect in maybeBridgeGuarded is the
+        // fast path into the conference, but if it raced an in-flight
+        // self-redirect fetch or the REST update failed (transient API error,
+        // region mismatch on the SDK leg), the caller would otherwise be
+        // parked in silence FOREVER — Leg A alone in the conference, both
+        // parties deaf. Check the session on every poll: once BRIDGED, join
+        // the bridge conference directly from THIS fetch.
+        if (session.state === vs.VState.BRIDGED) {
+          serveBridgeConference(vr, sid, "caller");
+          break;
+        }
+        vr.pause({ length: CALLER_WAIT_PAUSE_SEC });
         vr.redirect({ method: "POST" }, vs.twimlUrl("caller-wait", sid));
         break;
       }
@@ -363,6 +419,14 @@ export async function verificationTwimlHandler(c: Context) {
           vr.hangup();
           break;
         }
+        // SELF-HEALING BRIDGE (same contract as caller-wait): if the session
+        // is already BRIDGED, join the conference from this fetch instead of
+        // waiting for a REST redirect that may have raced or failed. Leg A is
+        // the conference ANCHOR.
+        if (session.guarded && session.state === vs.VState.BRIDGED) {
+          serveBridgeConference(vr, sid, "legA");
+          break;
+        }
         vr.pause({ length: 60 });
         vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
         break;
@@ -391,10 +455,9 @@ export async function verificationTwimlHandler(c: Context) {
               session.state === vs.VState.BRIDGED ||
               (await vs.maybeBridgeGuarded(sid, { legAInline: true }));
             if (bridged) {
-              vr.dial().conference(
-                { beep: "false", startConferenceOnEnter: true, endConferenceOnExit: true },
-                vs.conferenceName(sid),
-              );
+              // Leg A is the conference ANCHOR (starts the conference; the
+              // caller joins with startConferenceOnEnter: false).
+              serveBridgeConference(vr, sid, "legA");
               break;
             }
             vr.play({ loop: 1 }, `${vs.requirePublicBaseUrl()}/api/verify/tone.wav`);
@@ -416,19 +479,23 @@ export async function verificationTwimlHandler(c: Context) {
         // into this TwiML, so speakerphone detection continues in-call.
         // record-from-start captures the whole conversation for call review;
         // Twilio posts the finished recording to /api/verify/recording/bridge
-        // when the conference ends.
-        vr.dial().conference(
-          {
-            beep: "false",
-            startConferenceOnEnter: true,
-            endConferenceOnExit: true,
-            record: "record-from-start",
-            recordingStatusCallback: vs.recordingBridgeUrl(sid),
-            recordingStatusCallbackMethod: "POST",
-            recordingStatusCallbackEvent: ["completed"],
-          },
-          vs.conferenceName(sid),
-        );
+        // when the conference ends. The `leg` query param selects the
+        // conference role (see serveBridgeConference); URLs without it are
+        // treated as the anchor for backwards compatibility.
+        const legParam = c.req.query("leg") === "caller" ? "caller" : "legA";
+        serveBridgeConference(vr, sid, legParam);
+        break;
+      }
+
+      case "notify-partner-ended": {
+        // Post-Dial landing for the SURVIVING bridge leg: the other party
+        // hung up, endConferenceOnExit ended the conference, the Dial verb
+        // returned and the bridge TwiML fell through to this redirect. (A
+        // REST redirect cannot reach a call inside an active
+        // <Dial><Conference>, which is why this notice lives in the TwiML
+        // flow itself rather than being pushed by the state machine.)
+        vr.say(P.partnerEnded);
+        vr.hangup();
         break;
       }
 
@@ -585,6 +652,19 @@ export async function verificationTwimlHandler(c: Context) {
     }
   } catch (err) {
     console.error(`[verify] twiml handler error kind=${kind}`, err);
+    // NEVER return an empty TwiML document from a live call's fetch: Twilio
+    // treats "no verbs" as an immediate hangup, so any transient error (DB
+    // hiccup, slow query, cold dependency) used to KILL the call mid-flow —
+    // the "drops randomly" symptom. Pause briefly and re-fetch this exact
+    // document instead: a transient error becomes a 2s silence and the call
+    // survives. (Terminal notify-* kinds add no failure-prone work before
+    // their Say/Hangup, so they never land here with an empty document.)
+    try {
+      vr.pause({ length: 2 });
+      vr.redirect({ method: "POST" }, c.req.url);
+    } catch {
+      /* ignore — vr stays whatever it was */
+    }
   }
   return xml(c, vr);
 }
@@ -712,6 +792,14 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
     }
   } catch (err) {
     console.error("[verify] leg-a-accept gather error:", err);
+    // Never empty-TwiML a live call (empty doc = instant hangup). Re-serve
+    // the CURRENT IVR step after a short pause — same attempt counter.
+    try {
+      vr.pause({ length: 2 });
+      vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a", sid), a));
+    } catch {
+      /* ignore */
+    }
   }
   return xml(c, vr);
 }
@@ -745,6 +833,14 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
     }
   } catch (err) {
     console.error("[verify] leg-a-ready gather error:", err);
+    // Never empty-TwiML a live call — re-serve the current step (same
+    // attempt counter) after a short pause.
+    try {
+      vr.pause({ length: 2 });
+      vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), a));
+    } catch {
+      /* ignore */
+    }
   }
   return xml(c, vr);
 }
@@ -790,8 +886,13 @@ export async function verificationVoiceprintHandler(c: Context) {
     vr.redirect({ method: "POST" }, vs.twimlUrl("voice-id-wait", sid));
   } catch (err) {
     console.error("[verify] voiceprint handler error:", err);
+    // Never hang up on a transient error here — that used to kill the callee
+    // leg mid voice-ID. Hand the callee back to the voice-ID wait loop: its
+    // poll cap counts a missed attempt and re-prompts the recording, which
+    // is the designed recovery for a lost voice-ID action.
     try {
-      vr.hangup();
+      vr.pause({ length: 2 });
+      vr.redirect({ method: "POST" }, vs.twimlUrl("voice-id-wait", sid));
     } catch {
       /* ignore */
     }
@@ -967,6 +1068,15 @@ export async function verificationGatherHandler(c: Context) {
     }
   } catch (err) {
     console.error("[verify] gather handler error:", err);
+    // Never empty-TwiML a live Leg B call. Re-POST to this same gather
+    // endpoint (no Digits) after a short pause — the timeout branch then
+    // re-arms the merge listener (or hangs up cleanly if terminal).
+    try {
+      vr.pause({ length: 2 });
+      vr.redirect({ method: "POST" }, c.req.url);
+    } catch {
+      /* ignore */
+    }
   }
   return xml(c, vr);
 }

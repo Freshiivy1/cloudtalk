@@ -732,6 +732,18 @@ export function twimlUrl(kind: string, sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/twiml/${kind}?sid=${sessionId}`;
 }
 
+/**
+ * Guarded live-bridge TwiML URL. The `leg` param tells the webhook which
+ * conference ROLE to serve: Leg A is the ANCHOR (startConferenceOnEnter:
+ * true — the conference exists the moment the callee enters), the caller is
+ * the JOINER (false — it can never spawn a duplicate same-name conference,
+ * the classic Twilio race that strands both parties alone in silence; if the
+ * caller arrives first it simply waits in the lobby for the anchor).
+ */
+export function bridgeUrl(sessionId: string, leg: "caller" | "legA"): string {
+  return `${twimlUrl("guarded-bridge", sessionId)}&leg=${leg}`;
+}
+
 export function statusUrl(leg: VerifyLeg, sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/status/${leg}?sid=${sessionId}`;
 }
@@ -801,10 +813,14 @@ export function verifyPrompts() {
       e.VERIFY_PROMPT_VOICE_ID_FAILED ??
       "We could not verify your voice. This call will now end. Goodbye.",
     // GUARDED MODE ONLY: spoken after the voice-ID recording; the SECOND
-    // press-1 is the explicit trigger that originates Leg B.
+    // press-1 is the explicit trigger that originates Leg B. The callee is
+    // pre-taught the call-waiting choreography: answering the second call
+    // puts THIS call on hold on their handset, so they must know the second
+    // call ends by itself (the engine hangs Leg B up at bridge time) and
+    // returns them here.
     secondCall:
       e.VERIFY_PROMPT_SECOND_CALL ??
-      "Do not end this call. You will receive a second call. Please press 1.",
+      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. Press 1 to continue.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
@@ -812,7 +828,7 @@ export function verifyPrompts() {
       "Please wait while we connect your call.",
     ready:
       e.VERIFY_PROMPT_READY ??
-      "Do not end this call. You will receive a second call. Please press 1.",
+      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. Press 1 to continue.",
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
       "Please hold. Your call is being connected. You will hear updates as the line is verified.",
@@ -826,6 +842,13 @@ export function verifyPrompts() {
     firstCallEnded:
       e.VERIFY_PROMPT_FIRST_CALL_ENDED ??
       "The first call has ended, so this guarded call will now be terminated. Goodbye.",
+    // GUARDED MODE ONLY: played to the SURVIVING bridge party when the other
+    // party hung up mid-call. Served via the post-<Dial> <Redirect> inside
+    // the bridge TwiML itself — a REST redirect cannot reach a call inside an
+    // active <Dial><Conference>.
+    partnerEnded:
+      e.VERIFY_PROMPT_PARTNER_ENDED ??
+      "The other party has ended the call. Goodbye.",
     reject:
       e.VERIFY_PROMPT_REJECT ??
       "No response received. This verification call will now end. Goodbye.",
@@ -1297,13 +1320,20 @@ async function redirectCall(
   callSid: string | null,
   twimlKind: string,
   sessionId: string,
+  bridgeLeg?: "caller" | "legA",
 ): Promise<void> {
   if (!callSid) return;
   try {
+    // Bridge redirects carry the leg role so the webhook serves the right
+    // conference attributes (anchor vs joiner — see bridgeUrl).
+    const url =
+      twimlKind === "guarded-bridge" && bridgeLeg
+        ? bridgeUrl(sessionId, bridgeLeg)
+        : twimlUrl(twimlKind, sessionId);
     await getTwilioClient()
       .calls(callSid)
-      .update({ url: twimlUrl(twimlKind, sessionId), method: "POST" });
-    console.log(`[verify] REDIRECT sid=${callSid} kind=${twimlKind}`);
+      .update({ url, method: "POST" });
+    console.log(`[verify] REDIRECT sid=${callSid} kind=${twimlKind}${bridgeLeg ? ` leg=${bridgeLeg}` : ""}`);
   } catch (err) {
     console.error(`[verify] REDIRECT_FAILED sid=${callSid}`, err);
   }
@@ -1839,14 +1869,36 @@ export async function maybeBridgeGuarded(
       "GUARDED_BRIDGED",
       `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A media stream persists`,
     );
-    // Verification is done: hang up the ring-test leg only; Leg B (answered
-    // by a human) is left to end naturally. Leg A's <Start><Stream> survives
-    // the bridge redirect, so speakerphone detection keeps running in-call.
+    // Verification is done: hang up the ring-test leg. Leg A's
+    // <Start><Stream> survives the bridge redirect, so speakerphone
+    // detection keeps running in-call.
     await hangupAll(session, { ringTest: true });
     // Bridge the two real parties into the same conference (LIVE, two-way).
-    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId);
+    // LEG A ENTERS FIRST and is the conference anchor: in the inline path
+    // (legAInline) the leg-a-tone fetch serves the anchor TwiML directly;
+    // otherwise Leg A is REST-redirected here BEFORE the caller. The caller
+    // always joins with startConferenceOnEnter: false (bridgeUrl role), so a
+    // near-simultaneous arrival can never spawn a duplicate same-name
+    // conference stranding both parties alone in silence.
     if (!opts.legAInline) {
-      await redirectCall(session.legACallSid, "guarded-bridge", sessionId);
+      await redirectCall(session.legACallSid, "guarded-bridge", sessionId, "legA");
+    }
+    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId, "caller");
+    // LEG B TEARDOWN — the two-way-audio fix. Reaching LEG_B_ANSWERED means
+    // the callee ANSWERED the verification second call via call waiting,
+    // which puts Leg A ON HOLD on their handset. Bridging a held line
+    // conferences silence both ways (the caller talks to a muted held call;
+    // the callee is listening to Leg B's silent detector loop). Ending Leg B
+    // server-side makes the handset return to Leg A — now the live
+    // conference — restoring two-way audio. Leg B's completion status then
+    // lands while BRIDGED and is ignored by onCallCompleted (verified path).
+    if (session.legBCallSid) {
+      await logEvent(
+        sessionId,
+        "LEG_B_PASS_TEARDOWN",
+        `sid=${session.legBCallSid} — verification second call ended at bridge time so the callee's handset returns to Leg A (call waiting had it on hold)`,
+      );
+      await hangupCall(session.legBCallSid);
     }
     // The pre-bridge merge tone stops here. Mid-call merge detection is
     // TRIGGER-driven (v3): the HoldDetector on Leg A's uplink arms the
@@ -2114,9 +2166,10 @@ export async function onCallCompleted(
 
   // GUARDED MODE ONLY: the live bridge ends when either party hangs up.
   // endConferenceOnExit=true on both bridge legs makes Twilio drop the other
-  // participant too; the hangups below are belt-and-braces. Leg B / ring
-  // test completions while BRIDGED are expected (ring test was hung up at
-  // bridge time; Leg B is left to end naturally) and fall through untouched.
+  // participant too; the surviving leg then hears the partner-ended notice
+  // via its post-Dial <Redirect> (see below). Leg B / ring test completions
+  // while BRIDGED are expected (the ring test was hung up and Leg B was torn
+  // down at bridge time) and fall through untouched.
   if (session.state === VState.BRIDGED && (leg === "caller" || leg === "legA")) {
     if (
       await transition(
@@ -2133,13 +2186,23 @@ export async function onCallCompleted(
         `leg=${leg} sid=${callSid} ${statusDetail}`,
       );
       if (session.guarded && (leg === "legA" || leg === "caller")) {
-        // Either party ended the live bridge: the REMAINING party is told why
-        // the guarded call is ending (symmetric firstCallEnded notice) before
-        // the TwiML hangs them up; endConferenceOnExit drops the conference
-        // and the verification legs are torn down below.
+        // Either party ended the live bridge. The REMAINING party is inside
+        // an active <Dial><Conference>, which a REST redirect CANNOT pull
+        // them out of — so the "partner ended" notice is delivered by the
+        // bridge TwiML itself: endConferenceOnExit on the departed leg ends
+        // the conference, the surviving leg's Dial verb returns, and its
+        // post-Dial <Redirect> plays notify-partner-ended and hangs up.
+        // The ONE case that needs a REST hangup is a remaining leg that
+        // never reached the started conference (e.g. the caller still in the
+        // pre-start lobby because the anchor died before entering) — that
+        // lobby has no end trigger, so detect it via the absence of a live
+        // conference and hang the leg up directly.
         const remaining =
           leg === "legA" ? session.callerCallSid : session.legACallSid;
-        await redirectCall(remaining, "notify-first-call-ended", sessionId);
+        const confSid = await liveConferenceSid(sessionId);
+        if (!confSid) {
+          await hangupCall(remaining);
+        }
         await hangupAll(session, { legB: true, ringTest: true });
       } else {
         await hangupAll(session, {

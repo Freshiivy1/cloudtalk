@@ -35,6 +35,10 @@ const twilioMock = vi.hoisted(() => ({
     announceMethod?: string;
   }>,
   conferenceUpdates: [] as Array<{ conference: string; status?: string }>,
+  // Optional override for conferences.list: null (default) = a live
+  // conference always exists for any friendly name; set to [] to simulate
+  // "no in-progress conference" (the pre-start-lobby case).
+  listResult: null as Array<{ sid: string }> | null,
 }));
 
 vi.mock("twilio", async (importOriginal) => {
@@ -76,9 +80,8 @@ vi.mock("twilio", async (importOriginal) => {
       {
         // Engine resolves the live conference SID by friendly name first
         // (conferences are addressable by SID only on the real API).
-        list: async (opts?: { friendlyName?: string }) => [
-          { sid: opts?.friendlyName ?? "CF_mock" },
-        ],
+        list: async (opts?: { friendlyName?: string }) =>
+          twilioMock.listResult ?? [{ sid: opts?.friendlyName ?? "CF_mock" }],
       },
     ),
   };
@@ -940,19 +943,23 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       const after = (await vs.findSession(s.sessionId))!;
       expect(after.state).toBe(vs.VState.BRIDGED);
       const added = updatedCalls.slice(updBefore);
-      // Caller + Leg A redirected into the live two-way conference…
-      expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
-      expect(added.some((u) => u.sid === "CA_g_legA" && String(u.url).includes("guarded-bridge"))).toBe(true);
-      // …the ring-test leg is hung up, but Leg B (answered by a human) is
-      // left to end naturally — NOT hung up by the engine.
+      // Caller + Leg A redirected into the live two-way conference, each with
+      // its conference role in the URL (caller=joiner, legA=anchor)…
+      expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("guarded-bridge") && String(u.url).includes("leg=caller"))).toBe(true);
+      expect(added.some((u) => u.sid === "CA_g_legA" && String(u.url).includes("guarded-bridge") && String(u.url).includes("leg=legA"))).toBe(true);
+      // …the ring-test leg is hung up, AND Leg B is torn down at bridge time:
+      // the callee answered it via call waiting (Leg A went on hold on their
+      // handset), so ending Leg B server-side returns the handset to Leg A —
+      // now the live conference. Leaving Leg B up was the both-sides-deaf bug.
       expect(added.some((u) => u.sid === "CA_g_rt" && u.status === "completed")).toBe(true);
-      expect(added.some((u) => u.sid === "CA_g_legB" && u.status === "completed")).toBe(false);
+      expect(added.some((u) => u.sid === "CA_g_legB" && u.status === "completed")).toBe(true);
       // …and the caller is NEVER sent to the legacy verdict announcement.
       expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("notify-"))).toBe(false);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).toContain("GUARDED_MERGE_WATCH_ARMED");
       expect(types).toContain(vs.VState.BRIDGED);
       expect(types).toContain("GUARDED_BRIDGED");
+      expect(types).toContain("LEG_B_PASS_TEARDOWN");
     } finally {
       delete process.env.VERIFY_MERGE_WATCH_MS;
     }
@@ -1049,8 +1056,9 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     // BOTH caller and Leg A are redirected into the live conference…
     expect(added.some((u) => u.sid === "CA_lbh_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
     expect(added.some((u) => u.sid === "CA_lbh_legA" && String(u.url).includes("guarded-bridge"))).toBe(true);
-    // …the caller is NOT sent to the legacy verdict announcement, Leg A is
-    // NOT hung up, and only the ring-test leg is terminated.
+    // …the caller is NOT sent to the legacy verdict announcement and Leg A
+    // is NOT hung up. (Leg B already ended — that completion is what fired
+    // the force-bridge — and the ring-test leg is terminated.)
     expect(added.some((u) => String(u.url).includes("notify-"))).toBe(false);
     expect(added.some((u) => u.sid === "CA_lbh_legA" && u.status === "completed")).toBe(false);
     expect(added.some((u) => u.sid === "CA_lbh_rt" && u.status === "completed")).toBe(true);
@@ -1119,51 +1127,66 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(updatedCalls.length).toBe(updCount);
   });
 
-  it("BRIDGED: caller hangup → COMPLETED + Leg A told the first call ended", async () => {
+  it("BRIDGED: caller hangup → COMPLETED + Leg A released by the conference, not a REST redirect", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_b_caller",
       legACallSid: "CA_b_legA",
     });
+    const updBefore = updatedCalls.length;
     await vs.onCallCompleted(s.sessionId, "caller", "CA_b_caller", "duration=120s");
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.COMPLETED);
     expect(after.completedAt).not.toBeNull();
-    // Symmetric with the callee-hangup direction: the remaining party (Leg A)
-    // is NOT silently dropped — they're redirected to the "first call ended"
-    // announcement, whose TwiML (<Hangup/>) then ends the leg.
-    expect(
-      updatedCalls.some(
-        (u) => u.sid === "CA_b_legA" && String(u.url).includes("notify-first-call-ended"),
-      ),
-    ).toBe(true);
-    expect(updatedCalls.some((u) => u.sid === "CA_b_legA" && u.status === "completed")).toBe(
-      false,
-    );
+    // The surviving party is inside an active <Dial><Conference> — a REST
+    // redirect cannot reach them, so NONE is attempted. endConferenceOnExit
+    // on the departed leg ends the conference; the survivor's Dial returns
+    // and its post-Dial <Redirect> plays notify-partner-ended and hangs up
+    // (asserted in the bridge-TwiML tests below). With a live conference
+    // (mock default) the survivor is NOT REST-hung-up either.
+    const added = updatedCalls.slice(updBefore);
+    expect(added.some((u) => u.sid === "CA_b_legA")).toBe(false);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("GUARDED_CALL_ENDED");
     expect(types).toContain(vs.VState.COMPLETED);
   });
 
-  it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller told the first call ended", async () => {
+  it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller released by the conference, not a REST redirect", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_b2_caller",
       legACallSid: "CA_b2_legA",
     });
+    const updBefore = updatedCalls.length;
     await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.COMPLETED);
-    // The caller is NOT silently dropped — they're redirected to the
-    // "first call ended" announcement, whose TwiML then hangs up.
-    expect(
-      updatedCalls.some(
-        (u) => u.sid === "CA_b2_caller" && String(u.url).includes("notify-first-call-ended"),
-      ),
-    ).toBe(true);
-    expect(updatedCalls.some((u) => u.sid === "CA_b2_caller" && u.status === "completed")).toBe(
-      false,
-    );
+    // Same contract as the caller-hangup direction: no REST redirect/hangup
+    // against a leg that is inside the (mock-live) conference.
+    const added = updatedCalls.slice(updBefore);
+    expect(added.some((u) => u.sid === "CA_b2_caller")).toBe(false);
+  });
+
+  it("BRIDGED: a survivor stuck OUTSIDE the conference (lobby) is hung up by REST", async () => {
+    // The caller joins with startConferenceOnEnter: false — if the anchor
+    // (Leg A) dies before ever starting the conference, the caller is stuck
+    // in a pre-start lobby with no end trigger. With NO live conference the
+    // engine must hang the survivor up directly.
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_lob_caller",
+      legACallSid: "CA_lob_legA",
+    });
+    twilioMock.listResult = []; // no in-progress conference
+    try {
+      await vs.onCallCompleted(s.sessionId, "legA", "CA_lob_legA", "duration=5s");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.COMPLETED);
+      expect(
+        updatedCalls.some((u) => u.sid === "CA_lob_caller" && u.status === "completed"),
+      ).toBe(true);
+    } finally {
+      twilioMock.listResult = null;
+    }
   });
 
   it("guarded: callee ends the first call during LEG_B_DIALING → FAILED + caller told", async () => {
@@ -1234,11 +1257,76 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(body).toContain("<Conference");
     expect(body).toContain("verify-abc123");
     expect(body).toContain('beep="false"');
+    // No leg param → backwards-compatible anchor role.
     expect(body).toContain('startConferenceOnEnter="true"');
     expect(body).toContain('endConferenceOnExit="true"');
     // No verdict announcement, no hangup — this is a LIVE bridge.
     expect(body).not.toContain("<Say");
     expect(body).not.toContain("<Hangup");
+    // …but a post-Dial <Redirect> so the SURVIVING leg hears the
+    // partner-ended notice when the conference ends (a REST redirect cannot
+    // reach a call inside an active <Dial><Conference>).
+    expect(body).toContain("/api/verify/twiml/notify-partner-ended?sid=abc123");
+  });
+
+  it("guarded-bridge TwiML: the caller leg is the JOINER (never duplicates the conference)", async () => {
+    const res = await postForm("/api/verify/twiml/guarded-bridge?sid=abc123&leg=caller");
+    const body = await res.text();
+    // startConferenceOnEnter=false: a caller arriving before the anchor waits
+    // in the lobby instead of spawning a duplicate same-name conference.
+    expect(body).toContain('startConferenceOnEnter="false"');
+    expect(body).toContain('endConferenceOnExit="true"');
+    expect(body).toContain("verify-abc123");
+    expect(body).toContain("/api/verify/twiml/notify-partner-ended?sid=abc123");
+  });
+
+  it("notify-partner-ended TwiML announces and hangs up", async () => {
+    const res = await postForm("/api/verify/twiml/notify-partner-ended?sid=abc123");
+    const body = await res.text();
+    expect(body).toContain("The other party has ended the call.");
+    expect(body).toContain("<Hangup");
+  });
+
+  it("caller-wait self-heals into the bridge conference once BRIDGED", async () => {
+    // The REST redirect is the fast path; if it raced/failed, the parked
+    // caller's next poll must join the conference itself (as JOINER) instead
+    // of sitting in silence forever.
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_cw_caller",
+      legACallSid: "CA_cw_legA",
+    });
+    const res = await postForm(`/api/verify/twiml/caller-wait?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("<Conference");
+    expect(body).toContain(`verify-${s.sessionId}`);
+    expect(body).toContain('startConferenceOnEnter="false"');
+    expect(body).not.toContain("<Pause");
+  });
+
+  it("caller-wait keeps parking (short cadence) while verification runs", async () => {
+    const s = await makeSession(vs.VState.CALLER_HOLDING, {
+      guarded: true,
+      callerCallSid: "CA_cw2_caller",
+    });
+    const res = await postForm(`/api/verify/twiml/caller-wait?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain('<Pause length="10"');
+    expect(body).toContain(`/api/verify/twiml/caller-wait?sid=${s.sessionId}`);
+    expect(body).not.toContain("<Conference");
+  });
+
+  it("leg-a-hold self-heals into the bridge conference once BRIDGED (anchor role)", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_lah_caller",
+      legACallSid: "CA_lah_legA",
+    });
+    const res = await postForm(`/api/verify/twiml/leg-a-hold?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("<Conference");
+    expect(body).toContain('startConferenceOnEnter="true"');
+    expect(body).not.toContain("<Pause");
   });
 
   it("guarded-bridge TwiML records the conference for call review", async () => {
@@ -2237,7 +2325,7 @@ describe("voice-ID enforcement (guarded)", () => {
     const wait = await postForm(`/api/verify/twiml/voice-id-wait?sid=${s.sessionId}`);
     const waitBody = await wait.text();
     expect(waitBody).toContain(
-      "Do not end this call. You will receive a second call. Please press 1.",
+      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. Press 1 to continue.",
     );
     expect(waitBody).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
     // …and that press-1 originates Leg B (the only bridge path).
