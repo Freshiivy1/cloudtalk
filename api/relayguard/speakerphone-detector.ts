@@ -90,6 +90,17 @@ export interface SpeakerphoneDetectorOptions {
    * setBridged() when the verification session enters BRIDGED.
    */
   bridged?: boolean;
+  /**
+   * When true, suspicious windows accumulate a streak ONLY while BRIDGED
+   * (default false — the detector stays a pure streak/refire state machine).
+   * Wired by verification-stream.ts (D2): pre-bridge audio is ringback/IVR
+   * — and between the actual bridge and the bridged flag arriving (registry
+   * / DB poll) windows would otherwise be scored with bridged=false, no
+   * warm-up suppression and a live IVR-era baseline, letting ≥3 false-RED
+   * windows fire the challenge BEFORE the warm-up starts. Freezing the
+   * streak while !bridged closes that race.
+   */
+  armOnlyWhenBridged?: boolean;
   /** Called when speakerphone use is suspected. score ∈ 0..1 (relay fp). */
   onSuspicious?: (score: number, detail: string) => void;
   /** Called once when a fired suspicion clears on a clean analysis window. */
@@ -116,6 +127,7 @@ export class SpeakerphoneDetector {
   private lastFiredAt = 0;
   private suspecting = false;
   /** BRIDGED state + warm-up bookkeeping. */
+  private readonly armOnlyWhenBridged: boolean;
   private bridged: boolean;
   private bridgedAt = 0;
   private warmupDone: boolean;
@@ -130,6 +142,7 @@ export class SpeakerphoneDetector {
     this.onSuspicious = opts.onSuspicious;
     this.onClean = opts.onClean;
     this.onWarmupComplete = opts.onWarmupComplete;
+    this.armOnlyWhenBridged = opts.armOnlyWhenBridged ?? false;
     this.bridged = opts.bridged ?? false;
     this.warmupDone = this.warmup <= 0;
     if (this.bridged) this.bridgedAt = Date.now();
@@ -251,6 +264,18 @@ export class SpeakerphoneDetector {
         `baseline rebuilt, forensic arming live`;
       console.log(`[speakerphone-detector] FORENSICS_WARMUP_COMPLETE ${detail}`);
       this.onWarmupComplete?.(detail);
+    }
+
+    // STREAK FREEZE (D2): when armed-only-when-bridged, suspicion can only
+    // accumulate once the bridged flag says BRIDGED — pre-bridge windows
+    // (including the race between the actual bridge and the flag arriving
+    // via the event-driven registry / DB poll) never build a streak, so a
+    // delayed bridged-flag refresh can no longer fire the challenge BEFORE
+    // the warm-up starts. The rolling baseline still absorbs clean audio.
+    if (this.armOnlyWhenBridged && !this.bridged) {
+      this.streak = 0;
+      if (verdict === "MATCH") this.baseline = profile;
+      return;
     }
 
     // ARMING BAR: a window counts as suspicious ONLY when the verdict is

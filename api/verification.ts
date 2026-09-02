@@ -160,6 +160,22 @@ export function mergeWatchMs(): number {
  */
 const mergeWatchArmedAt = new Map<string, number>();
 
+/**
+ * D2: event-driven BRIDGED notification registry. maybeBridgeGuarded() sets
+ * the flag SYNCHRONOUSLY on the successful LEG_B_ANSWERED → BRIDGED
+ * transition, so the media-stream analyzer path (verification-stream.ts)
+ * sees the bridge on the very next audio window instead of waiting for the
+ * ~0.5s DB refresh poll — closing the race where false-RED windows were
+ * scored with bridged=false (no warm-up suppression) before the poll
+ * noticed the bridge. Cleared by cleanupSessionMaps() on terminal states.
+ */
+const bridgedSessions = new Set<string>();
+
+/** True once this process has bridged the session (event-driven, no DB). */
+export function isBridgedSession(sessionId: string): boolean {
+  return bridgedSessions.has(sessionId);
+}
+
 /** Per-session challenge-noise injection counter (event payload enrichment). */
 const noiseInjectionCount = new Map<string, number>();
 
@@ -255,6 +271,16 @@ export function getVoiceBaseline(sessionId: string): ClipProfile | null {
 
 /** Max voice-ID record attempts before the call is failed. */
 export const VOICE_ID_MAX_ATTEMPTS = 3;
+
+/**
+ * Max voice-id-wait loop polls (2s pause each, ~20s) tolerated with NO
+ * attempt begun — i.e. the voice-ID <Record> action never fired (Twilio
+ * action-fetch failure, or the redirect-after-Record fallback landed in the
+ * wait loop). Past this cap the wait loop counts a FAILED attempt (D1) and
+ * routes into the normal re-record path instead of holding the callee in
+ * silence forever.
+ */
+export const VOICE_ID_WAIT_MAX_POLLS = 10;
 
 /** Min VAD speech (seconds) for a voiceprint to count as usable/strong. */
 export const VOICE_ID_MIN_SPEECH_SEC = 1.5;
@@ -364,13 +390,40 @@ export function voiceIdBeginAttempt(sessionId: string, recordingSid = ""): numbe
   return st.attempts;
 }
 
+/**
+ * D3: true while `recordingSid` belongs to the CURRENT voice-ID attempt —
+ * used to keep a slow processVoiceprint fetch (still retrying when a
+ * re-record already began attempt N+1) from stamping its baseline/note onto
+ * the new attempt. Un-correlatable (empty) SIDs are accepted, matching the
+ * late-transcript guard convention; no current attempt → stale.
+ */
+export function voiceIdIsCurrentRecording(sessionId: string, recordingSid: string): boolean {
+  const cur = voiceIdBySession.get(sessionId)?.current;
+  if (!cur) return false;
+  if (!recordingSid || !cur.recordingSid) return true;
+  return cur.recordingSid === recordingSid;
+}
+
 /** Recording profiling outcome for the current attempt (from the action). */
 export function voiceIdNoteRecording(
   sessionId: string,
-  note: { usable: boolean; strong: boolean; detail: string },
+  note: { usable: boolean; strong: boolean; detail: string; recordingSid?: string },
 ): void {
   const st = voiceIdState(sessionId);
   if (!st.current || st.current.decided !== "pending") return;
+  // D3: a note from a PREVIOUS attempt's recording (its processVoiceprint
+  // fetch was still retrying when the re-record began) must never land on
+  // the new attempt — same guard as the stale-transcript path.
+  if (
+    note.recordingSid &&
+    st.current.recordingSid &&
+    note.recordingSid !== st.current.recordingSid
+  ) {
+    console.log(
+      `[verify] VOICE_ID_RECORDING_STALE session=${sessionId} — profiling note for an older recording, ignoring`,
+    );
+    return;
+  }
   st.current.recordingNoted = true;
   st.current.recordingUsable = note.usable;
   st.current.voiceprintStrong = note.strong;
@@ -526,9 +579,60 @@ export async function voiceIdVerdict(sessionId: string): Promise<VoiceIdVerdict>
   return { status: "pending", attempts: st.attempts, reason: "awaiting transcript/voiceprint" };
 }
 
+/**
+ * D1: the voice-id-wait loop hit its poll cap (VOICE_ID_WAIT_MAX_POLLS × 2s)
+ * with NO attempt begun — the <Record> action never fired (Twilio
+ * action-fetch failure, or the redirect-after-Record fallback landed in the
+ * wait loop). Counts as a FAILED voice-ID attempt so the wait loop routes
+ * into the normal re-record path (and the polite goodbye after
+ * VOICE_ID_MAX_ATTEMPTS) instead of holding the callee in silence forever.
+ * Passthrough to the normal verdict when an attempt IS in flight (the poll
+ * cap only applies to the no-attempt case).
+ */
+export async function voiceIdNoteMissedAttempt(sessionId: string): Promise<VoiceIdVerdict> {
+  const st = voiceIdState(sessionId);
+  // An attempt IS in flight — the poll cap only applies to the no-attempt
+  // case (the pending attempt's transcript/profiling timeouts decide it).
+  if (st.current && st.current.decided === "pending") return voiceIdVerdict(sessionId);
+  st.attempts++;
+  const a = newVoiceIdAttempt("");
+  a.decided = "failed";
+  a.decisionReason = "voice-ID recording never started (<Record> action not received)";
+  st.current = a;
+  console.log(
+    `[verify] VOICE_ID_NO_ATTEMPT session=${sessionId} attempt=${st.attempts} — counted as failed (wait poll cap)`,
+  );
+  await logEvent(
+    sessionId,
+    "VOICE_ID_NO_ATTEMPT",
+    `attempt=${st.attempts} | <Record> action never fired within ${VOICE_ID_WAIT_MAX_POLLS} wait polls — counted as failed`,
+  );
+  return { status: "failed", attempts: st.attempts, reason: a.decisionReason };
+}
+
 /** True once the session's voice-ID has PASSED (bridge gate). */
 export async function isVoiceIdPassed(sessionId: string): Promise<boolean> {
   return (await voiceIdVerdict(sessionId)).status === "passed";
+}
+
+/**
+ * True while NO voice-ID attempt has begun (the <Record> action hasn't
+ * fired). D1: the wait loop's poll cap only applies in this state.
+ */
+export function voiceIdAwaitingAttempt(sessionId: string): boolean {
+  return voiceIdBySession.get(sessionId)?.current == null;
+}
+
+/**
+ * The wait loop served the re-record TwiML for a FAILED attempt — clear the
+ * latched attempt so subsequent wait-loop polls see "no attempt begun"
+ * until the new <Record> action fires. D1: if it never fires, the poll cap
+ * counts the miss as the NEXT failed attempt (3 strikes → polite goodbye)
+ * instead of instantly re-serving the same re-record TwiML forever.
+ */
+export function voiceIdAcknowledgeFailure(sessionId: string): void {
+  const st = voiceIdBySession.get(sessionId);
+  if (st?.current && st.current.decided === "failed") st.current = null;
 }
 
 /**
@@ -583,6 +687,7 @@ export async function onVoiceMismatch(sessionId: string, detail: string): Promis
 function cleanupSessionMaps(sessionId: string): void {
   pendingLegBAnswer.delete(sessionId);
   mergeWatchArmedAt.delete(sessionId);
+  bridgedSessions.delete(sessionId);
   noiseInjectionCount.delete(sessionId);
   lastNoiseEventAt.delete(sessionId);
   voiceBaselineBySession.delete(sessionId);
@@ -1715,6 +1820,10 @@ export async function maybeBridgeGuarded(
     )
   ) {
     mergeWatchArmedAt.delete(sessionId);
+    // D2: flip the event-driven registry flag SYNCHRONOUSLY with the bridge
+    // so the media-stream analyzer path starts the forensic warm-up on the
+    // next audio window — not on the next DB refresh poll.
+    bridgedSessions.add(sessionId);
     await logEvent(
       sessionId,
       "GUARDED_BRIDGED",

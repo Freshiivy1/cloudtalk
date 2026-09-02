@@ -20,7 +20,7 @@ process.env.PUBLIC_BASE_URL ??= "https://verify-test.example.com";
 process.env.TWILIO_ACCOUNT_SID ??= "AC_test_mock";
 process.env.TWILIO_AUTH_TOKEN ??= "test_auth_token";
 process.env.TWILIO_CALLER_ID ??= "+61400000001";
-// The continuous merge-tone rearm cadence defaults to 4.5s; tests that arm
+// The merge-tone beep rearm cadence defaults to 2s; tests that arm
 // the tone set VERIFY_MERGE_TONE_REARM_MS explicitly (or disarm at the end),
 // so no re-announce fires incidentally mid-suite.
 
@@ -999,6 +999,31 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
       // Idempotent: a second pass is a no-op.
       expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
+    } finally {
+      delete process.env.VERIFY_MERGE_WATCH_MS;
+    }
+  });
+
+  it("D2: the bridge flips the event-driven registry flag synchronously (no DB poll needed)", async () => {
+    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        guarded: true,
+        callerCallSid: "CA_reg_caller",
+        legACallSid: "CA_reg_legA",
+      });
+      expect(vs.isBridgedSession(s.sessionId)).toBe(false);
+      // First sight arms the watch and defers one cycle.
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
+      expect(vs.isBridgedSession(s.sessionId)).toBe(false);
+      // The successful bridge sets the flag on return — the media-stream
+      // analyzer path sees BRIDGED on the next audio window, before any
+      // DB refresh poll could run.
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(true);
+      expect(vs.isBridgedSession(s.sessionId)).toBe(true);
+      // A terminal transition clears the flag (maps can't grow unboundedly).
+      await vs.onMergeDetected(s.sessionId, { inCall: true });
+      expect(vs.isBridgedSession(s.sessionId)).toBe(false);
     } finally {
       delete process.env.VERIFY_MERGE_WATCH_MS;
     }
@@ -2399,6 +2424,135 @@ describe("voice-ID enforcement (guarded)", () => {
     expect(body).toContain(`/api/verify/twiml/voice-id-wait?sid=${s.sessionId}`);
     expect(body).not.toContain("/api/verify/gather/leg-a-ready?sid=");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
+  });
+
+  it("D1: pending wait carries the poll counter on the self-redirect", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_d1w_caller",
+      legACallSid: "CA_d1w_legA",
+    });
+    // No attempt begun (the <Record> action never fired) — still waiting.
+    const res = await postForm(`/api/verify/twiml/voice-id-wait?sid=${s.sessionId}&w=4`);
+    const body = await res.text();
+    expect(body).toContain("<Pause");
+    expect(body).toContain(`voice-id-wait?sid=${s.sessionId}&amp;w=5`);
+  });
+
+  it("D1: no <Record> action + poll cap → failed attempt counted, wait loop re-records (no infinite silence)", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_d1_caller",
+      legACallSid: "CA_d1_legA",
+    });
+    // Below the cap with no attempt begun: keep holding (counter advances).
+    const early = await postForm(
+      `/api/verify/twiml/voice-id-wait?sid=${s.sessionId}&w=${vs.VOICE_ID_WAIT_MAX_POLLS - 1}`,
+    );
+    const earlyBody = await early.text();
+    expect(earlyBody).toContain("<Pause");
+    expect(earlyBody).toContain(`&amp;w=${vs.VOICE_ID_WAIT_MAX_POLLS}`);
+    // At the cap the miss is counted as a FAILED attempt → the normal
+    // re-record path (NOT an endless pause/redirect loop).
+    const capped = await postForm(
+      `/api/verify/twiml/voice-id-wait?sid=${s.sessionId}&w=${vs.VOICE_ID_WAIT_MAX_POLLS}`,
+    );
+    const cappedBody = await capped.text();
+    expect(cappedBody).toContain("That didn't match. Please try again.");
+    expect(cappedBody).toContain("<Record");
+    expect(cappedBody).not.toContain("/api/verify/gather/leg-a-ready?sid=");
+    const verdict = await vs.voiceIdVerdict(s.sessionId);
+    expect(verdict.attempts).toBe(1);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("VOICE_ID_NO_ATTEMPT");
+  });
+
+  it("D1: 3 missed attempts (action never fires) → polite goodbye + session FAILED", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_d13_caller",
+      legACallSid: "CA_d13_legA",
+    });
+    for (let i = 0; i < vs.VOICE_ID_MAX_ATTEMPTS; i++) {
+      const v = await vs.voiceIdNoteMissedAttempt(s.sessionId);
+      expect(v.status).toBe("failed");
+      expect(v.attempts).toBe(i + 1);
+      // The re-record TwiML served for failures 1-2 clears the latched
+      // attempt so the NEXT miss can be counted (poll-cap path); the third
+      // failure routes straight to the polite-goodbye branch instead.
+      if (i < vs.VOICE_ID_MAX_ATTEMPTS - 1) vs.voiceIdAcknowledgeFailure(s.sessionId);
+    }
+    const res = await postForm(`/api/verify/twiml/voice-id-wait?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("We could not verify your voice. This call will now end. Goodbye.");
+    expect(body).toContain("<Hangup");
+    await tick(150); // let onVoiceIdFailed settle
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.FAILED);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types.filter((t) => t === "VOICE_ID_NO_ATTEMPT")).toHaveLength(3);
+    expect(types).toContain("VOICE_ID_EXHAUSTED");
+  });
+
+  it("D3: stale transcript for attempt N is ignored once attempt N+1 has begun (VOICE_ID_TRANSCRIPT_STALE)", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_d3t_caller",
+      legACallSid: "CA_d3t_legA",
+    });
+    vs.voiceIdBeginAttempt(s.sessionId, "RE_old");
+    vs.voiceIdBeginAttempt(s.sessionId, "RE_new"); // re-record began
+    // The OLD recording's transcript lands late — it must never decide the
+    // new attempt (not even a passing phrase).
+    await vs.voiceIdNoteTranscript(s.sessionId, {
+      status: "completed",
+      text: "my voice identifies me",
+      recordingSid: "RE_old",
+    });
+    const verdict = await vs.voiceIdVerdict(s.sessionId);
+    expect(verdict.status).toBe("pending");
+    expect(verdict.attempts).toBe(2);
+    // The CURRENT recording's transcript still lands normally.
+    await vs.voiceIdNoteTranscript(s.sessionId, {
+      status: "completed",
+      text: "sure thing buddy",
+      recordingSid: "RE_new",
+    });
+    const after = await vs.voiceIdVerdict(s.sessionId);
+    expect(after.status).toBe("failed"); // phrase mismatch decides attempt 2
+    expect(after.attempts).toBe(2);
+  });
+
+  it("D3: stale profiling note/baseline for attempt N ignored after attempt N+1 begins", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_d3n_caller",
+      legACallSid: "CA_d3n_legA",
+    });
+    vs.voiceIdBeginAttempt(s.sessionId, "RE_old");
+    vs.voiceIdBeginAttempt(s.sessionId, "RE_new"); // re-record began
+    // Attempt N's slow processVoiceprint fetch finally finishes — its note
+    // must NOT fail the new attempt, and its baseline must not install.
+    vs.voiceIdNoteRecording(s.sessionId, {
+      usable: false,
+      strong: false,
+      detail: "stale fetch from attempt N",
+      recordingSid: "RE_old",
+    });
+    const verdict = await vs.voiceIdVerdict(s.sessionId);
+    expect(verdict.status).toBe("pending"); // NOT failed by the stale note
+    expect(verdict.attempts).toBe(2);
+    expect(vs.voiceIdIsCurrentRecording(s.sessionId, "RE_old")).toBe(false);
+    expect(vs.voiceIdIsCurrentRecording(s.sessionId, "RE_new")).toBe(true);
+    // The CURRENT attempt's note lands normally and decides it.
+    vs.voiceIdNoteRecording(s.sessionId, {
+      usable: false,
+      strong: false,
+      detail: "attempt N+1 note",
+      recordingSid: "RE_new",
+    });
+    const after = await vs.voiceIdVerdict(s.sessionId);
+    expect(after.status).toBe("failed"); // unusable recording → re-record
+    expect(after.attempts).toBe(2);
   });
 });
 

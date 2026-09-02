@@ -347,7 +347,12 @@ async function legAAnalyzers(callSid: string): Promise<LegAAnalyzers | null> {
       // conversation/ringback no longer false-arms the forensic challenge
       // seconds into the bridge.
       warmupMs: vs.forensicsWarmupMs(),
-      bridged: session.state === vs.VState.BRIDGED,
+      // D2: suspicion may only accumulate while BRIDGED — pre-bridge windows
+      // (incl. the race between the actual bridge and the bridged-flag
+      // refresh) never build a streak, so the warm-up can't be outrun by
+      // false-RED windows.
+      armOnlyWhenBridged: true,
+      bridged: session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid),
       onSuspicious: (score, detail) => handleSpeakerphoneSuspicious(sid, score, detail),
       onClean: (detail) => {
         console.log(`[verify-stream] SPEAKERPHONE CLEARED sid=${sid} ${detail}`);
@@ -363,7 +368,7 @@ async function legAAnalyzers(callSid: string): Promise<LegAAnalyzers | null> {
     // disengage disarms it unless speakerphone suspicion is active.
     const hold = new HoldDetector({
       sessionId: sid,
-      armed: session.state === vs.VState.BRIDGED,
+      armed: session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid),
       onSecondCallEngaged: (engagedSid) => {
         console.warn(`[verify-stream] SECOND CALL ENGAGED sid=${engagedSid}`);
         void vs
@@ -474,13 +479,22 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       analyzers?.sp.push(msg.media.payload);
       if (analyzers) {
         analyzers.hold.push(msg.media.payload);
+        // D2: event-driven bridge sync — maybeBridgeGuarded() flips an
+        // in-process registry flag SYNCHRONOUSLY with the bridge, so the
+        // detectors see BRIDGED on the very next media frame (not the next
+        // DB poll below) and the forensic warm-up starts immediately.
+        if (vs.isBridgedSession(sid)) {
+          analyzers.hold.setArmed(true);
+          analyzers.sp.setBridged(true);
+        }
         // Refresh the hold detector's armed flag AND the speakerphone
         // detector's BRIDGED flag (calibration warm-up starts on the
-        // transition) from the verification store every ~2s of audio (the
+        // transition) from the verification store every ~0.5s of audio (the
         // session transitions to BRIDGED on this same call, after the stream
-        // has already started).
+        // has already started). This DB poll is the cross-process fallback
+        // for the in-process registry check above.
         sinceArmedRefresh++;
-        if (sinceArmedRefresh >= 100) {
+        if (sinceArmedRefresh >= 25) {
           sinceArmedRefresh = 0;
           const hold = analyzers.hold;
           const sp = analyzers.sp;

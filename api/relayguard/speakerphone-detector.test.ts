@@ -312,7 +312,88 @@ describe("SpeakerphoneDetector calibration warm-up", () => {
     expect(lines).toHaveLength(2);
     logSpy.mockRestore();
   });
+});
 
+describe("SpeakerphoneDetector BRIDGED-gated streak freeze (D2)", () => {
+  function setupFreeze(warmupMs = 8_000) {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const fires: Array<{ score: number; detail: string }> = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 3,
+      warmupMs,
+      armOnlyWhenBridged: true,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+    });
+    const push = (suspicious: boolean) => {
+      dsp.suspicious = suspicious;
+      d.pushSamples(WINDOW);
+    };
+    push(false); // pre-bridge baseline seed (ringback/IVR audio)
+    return { d, fires, push, logSpy };
+  }
+
+  it("pre-bridge RED windows NEVER accumulate a streak — no arm before the bridge lands", () => {
+    const { fires, push, logSpy } = setupFreeze();
+    // Well past the 3-window arming requirement while NOT bridged: the
+    // challenge can never fire on pre-bridge (ringback/IVR-era) audio.
+    for (let i = 0; i < 6; i++) {
+      now += 1_000;
+      push(true);
+      expect(fires).toHaveLength(0);
+    }
+    logSpy.mockRestore();
+  });
+
+  it("bridge via setBridged (event-driven registry path, poll not yet run) → warm-up starts immediately", () => {
+    const { d, fires, push, logSpy } = setupFreeze();
+    // False-RED windows in the race window before the flag arrives: frozen.
+    now += 1_000;
+    push(true);
+    now += 1_000;
+    push(true);
+    expect(fires).toHaveLength(0);
+    // The bridge lands: the registry flip reaches the detector per window.
+    d.setBridged(true);
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("FORENSICS_WARMUP_START"))).toBe(
+      true,
+    );
+    // Warm-up suppression is live IMMEDIATELY — RED windows during the
+    // warm-up cannot arm, and the frozen pre-bridge streak does not carry.
+    for (let i = 0; i < 5; i++) {
+      now += 1_000;
+      push(true);
+    }
+    expect(fires).toHaveLength(0);
+    // Past the warm-up the detector arms normally from a fresh streak.
+    now += 4_000; // t = bridge + 9s
+    push(true); // streak 1 (post-warm-up)
+    now += 1_000;
+    push(true); // streak 2
+    expect(fires).toHaveLength(0);
+    now += 1_000;
+    push(true); // streak 3 → arm
+    expect(fires).toHaveLength(1);
+    logSpy.mockRestore();
+  });
+
+  it("without armOnlyWhenBridged the legacy pre-bridge arming behavior is unchanged", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 2,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+    });
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // baseline seed
+    dsp.suspicious = true;
+    d.pushSamples(WINDOW); // streak 1
+    d.pushSamples(WINDOW); // streak 2 → arms even though never bridged
+    expect(fires).toHaveLength(1);
+  });
+});
+
+describe("SpeakerphoneDetector calibration warm-up (continued)", () => {
   it("a session already BRIDGED at construction warm-ups from t0", () => {
     nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
     const fires: number[] = [];
