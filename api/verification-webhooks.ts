@@ -75,8 +75,10 @@ export async function verificationToneHandler(c: Context) {
  * 4-second seamless loop. The production callee path uses the telephony-grade
  * 16 kHz WAV asset; an in-process 8 kHz render is kept as a fallback. Used as
  * the conference announceUrl for the OUTER speakerphone case: Twilio plays it
- * to the CALLEE (Leg A) participant only, so the callee is prompted to get
- * off speakerphone to hear clearly (the call continues — no hangup).
+ * to the CALLER (inmate) participant only, so the party relaying the call
+ * over speakerphone is prompted to take it off speaker to hear clearly (the
+ * call continues — no hangup). The callee (Leg A) participant NEVER gets
+ * this noise — that announce channel is reserved for the DTMF merge tone.
  */
 export async function challengeNoiseHandler(c: Context) {
   const candidates = [
@@ -115,8 +117,8 @@ export async function challengeNoiseHandler(c: Context) {
 
 /**
  * GET /api/verify/merge-tone.wav — serves the BRIDGED in-call merge tone:
- * a continuous DTMF-'9' render (852+1336 Hz, VERIFY_MERGE_TONE_SEC seconds,
- * default 5s) produced by relayguard/dtmf.ts. Used as the conference
+ * a DTMF-'9' beep render (852+1336 Hz, VERIFY_MERGE_TONE_SEC seconds,
+ * default 0.5s) produced by relayguard/dtmf.ts. Used as the conference
  * announceUrl for the Leg A participant only while the tone is ARMED
  * (HoldDetector second-call engagement), re-announced every
  * VERIFY_MERGE_TONE_REARM_MS so it is effectively continuous; the instant
@@ -152,6 +154,12 @@ const IVR_GATHER_TIMEOUT = 8;
 function attemptFrom(c: Context): number {
   const a = parseInt(c.req.query("a") ?? "0", 10);
   return Number.isFinite(a) && a >= 0 ? a : 0;
+}
+
+/** D1: poll counter carried on the voice-id-wait self-redirect (&w=n). */
+function waitPollFrom(c: Context): number {
+  const w = parseInt(c.req.query("w") ?? "0", 10);
+  return Number.isFinite(w) && w >= 0 ? w : 0;
 }
 
 /** Append the attempt counter to a twiml URL (twimlUrl already has ?sid=). */
@@ -267,6 +275,82 @@ export async function verificationTwimlHandler(c: Context) {
         });
         gather.say(P.ready);
         vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), a + 1));
+        break;
+      }
+
+      case "voice-id-wait": {
+        // GUARDED MODE ONLY: voice-ID verdict wait loop. The callee recorded
+        // the voice-ID phrase; the recording is being profiled and Twilio is
+        // transcribing it. Hold here (short pause + self-redirect, same
+        // pattern as leg-a-hold) until the verdict lands:
+        //   PASSED → serve the second press-1 gather (the only path to Leg B)
+        //   FAILED → re-prompt + re-record, up to VOICE_ID_MAX_ATTEMPTS, then
+        //            a polite failure prompt + hangup (session FAILED)
+        //   pending → keep waiting (transcript timeout handled by the verdict)
+        // D1: the self-redirect carries a poll counter (&w=n). After
+        // VOICE_ID_WAIT_MAX_POLLS polls with NO attempt begun — the <Record>
+        // action never fired (Twilio action-fetch failure, or the
+        // redirect-after-Record fallback landed here) — the miss is counted
+        // as a FAILED attempt so the callee re-records (3 strikes → polite
+        // goodbye) instead of sitting in silence ~10min.
+        const session = sid ? await vs.findSession(sid) : null;
+        if (!session || !session.guarded || vs.isTerminal(session)) {
+          vr.hangup();
+          break;
+        }
+        const waits = waitPollFrom(c);
+        let verdict = await vs.voiceIdVerdict(sid);
+        if (
+          verdict.status === "pending" &&
+          vs.voiceIdAwaitingAttempt(sid) &&
+          waits >= vs.VOICE_ID_WAIT_MAX_POLLS
+        ) {
+          verdict = await vs.voiceIdNoteMissedAttempt(sid);
+        }
+        if (verdict.status === "passed") {
+          const gather = vr.gather({
+            numDigits: 1,
+            timeout: IVR_GATHER_TIMEOUT,
+            action: vs.gatherLegAReadyUrl(sid, 0),
+            method: "POST",
+          });
+          gather.say(P.secondCall);
+          vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), 1));
+        } else if (verdict.status === "failed") {
+          if (verdict.attempts >= vs.VOICE_ID_MAX_ATTEMPTS) {
+            // All attempts exhausted: fail the session (caller notified via
+            // notify-failed) and give the callee the polite goodbye — the
+            // TwiML hangs the leg up itself (outer-call system untouched).
+            void vs
+              .onVoiceIdFailed(sid)
+              .catch((err) => console.error("[verify] voice-id fail error:", err));
+            vr.say(P.voiceIdFailed);
+            vr.hangup();
+          } else {
+            // Re-prompt the voice-ID and re-record (transcribed, same gate).
+            // D1: clear the latched failure so the wait loop polls for the
+            // NEW recording's action — if it never fires, the poll cap (not
+            // an instant re-serve of this same TwiML) counts the next miss.
+            vs.voiceIdAcknowledgeFailure(sid);
+            vr.say(P.voiceIdRetry);
+            vr.record({
+              maxLength: 8,
+              timeout: 3,
+              playBeep: true,
+              action: vs.voiceprintUrl(sid),
+              method: "POST",
+              transcribe: true,
+              transcribeCallback: vs.voiceprintTranscriptionUrl(sid),
+            });
+            vr.redirect({ method: "POST" }, vs.twimlUrl("voice-id-wait", sid));
+          }
+        } else {
+          vr.pause({ length: 2 });
+          vr.redirect(
+            { method: "POST" },
+            `${vs.twimlUrl("voice-id-wait", sid)}&w=${waits + 1}`,
+          );
+        }
         break;
       }
 
@@ -598,11 +682,13 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
       // Leg B is originated only by that second press (leg-a-ready).
       const session = await vs.onCallAccepted(sid, String(body.CallSid ?? ""));
       if (session?.guarded) {
-        // GUARDED MODE ONLY: press-1 → explicit voice-ID phrase. The
-        // /api/verify/voiceprint action processes the recording and serves the
-        // second press-1 gather. The verbs after <Record> are only a fallback
-        // for a failed action fetch, so they mirror that same second-press
-        // gather rather than originating Leg B or parking the call early.
+        // GUARDED MODE ONLY: press-1 → explicit voice-ID phrase, ENFORCED.
+        // The recording is transcribed (transcribe + transcribeCallback) so
+        // the phrase itself is verified, and the /api/verify/voiceprint action
+        // profiles the clip — BOTH must pass before the second press-1 gather
+        // is ever served (see the voice-id-wait TwiML). The verbs after
+        // <Record> are only a fallback for a failed action fetch, so they
+        // land in the same voice-ID wait loop rather than the ready gather.
         const P = vs.verifyPrompts();
         vr.say(P.voiceId);
         vr.record({
@@ -611,15 +697,10 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
           playBeep: true,
           action: vs.voiceprintUrl(sid),
           method: "POST",
+          transcribe: true,
+          transcribeCallback: vs.voiceprintTranscriptionUrl(sid),
         });
-        const ready = vr.gather({
-          numDigits: 1,
-          timeout: IVR_GATHER_TIMEOUT,
-          action: vs.gatherLegAReadyUrl(sid, 0),
-          method: "POST",
-        });
-        ready.say(P.secondCall);
-        vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), 1));
+        vr.redirect({ method: "POST" }, vs.twimlUrl("voice-id-wait", sid));
       } else {
         vr.say("Thank you. Please stay on the line while your call is connected.");
         vr.pause({ length: 60 });
@@ -646,11 +727,15 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
     if (digits === "1") {
       // Callee ready. GUARDED MODE: this second press-1 is the explicit
       // second-call trigger — Leg B is originated here, after voice-ID.
-      // Non-guarded sessions may already have Leg B airborne from the legacy
-      // pre-origination path; onCalleeReady is idempotent either way. Leg A
-      // then waits on a long-pause hold loop that keeps the call alive.
+      // onCalleeReady refuses (false) when a guarded voice-ID has NOT passed:
+      // the callee is bounced back into the voice-ID wait loop instead of
+      // being parked (NO BRIDGE without a passing voice-ID).
       const P = vs.verifyPrompts();
-      await vs.onCalleeReady(sid);
+      const ready = await vs.onCalleeReady(sid);
+      if (!ready) {
+        vr.redirect({ method: "POST" }, vs.twimlUrl("voice-id-wait", sid));
+        return xml(c, vr);
+      }
       // Tell the callee the bridge is being set up before parking them.
       vr.say(P.calleeConnectWait);
       vr.pause({ length: 60 });
@@ -670,16 +755,17 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
 
 /**
  * POST /api/verify/voiceprint?sid=… — action of the guarded voice-ID
- * <Record> ("my voice identifies me"). The recording is processed
- * fire-and-forget into the relayguard baseline; the callee is then asked to
- * press 1 AGAIN to receive the second verification call. Leg B is originated
- * only by that second press through gather/leg-a-ready → onCalleeReady(); the
- * recording callback itself never originates the next call.
+ * <Record> ("my voice identifies me"). A new voice-ID attempt begins here;
+ * the recording is processed fire-and-forget (relayguard baseline + the
+ * usable/strong voiceprint note) and the callee is handed to the
+ * voice-id-wait loop, which holds them until the transcript/voiceprint
+ * verdict lands. The second press-1 gather is served ONLY from that loop
+ * once the voice-ID has PASSED; Leg B is originated only by that second
+ * press through gather/leg-a-ready → onCalleeReady().
  */
 export async function verificationVoiceprintHandler(c: Context) {
   const sid = c.req.query("sid") ?? "";
   const vr = new VoiceResponse();
-  const P = vs.verifyPrompts();
   try {
     const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
     const recordingUrl = String(body.RecordingUrl ?? "");
@@ -691,17 +777,17 @@ export async function verificationVoiceprintHandler(c: Context) {
       return xml(c, vr);
     }
 
-    void processVoiceprint(sid, { recordingUrl, durationSec, callSid }).catch((err) =>
-      console.error("[verify] voiceprint processing error:", err),
+    const recordingSid = String(body.RecordingSid ?? "");
+    const attempt = vs.voiceIdBeginAttempt(sid, recordingSid);
+    console.log(`[verify] VOICE_ID_ATTEMPT session=${sid} attempt=${attempt}`);
+    // D3: RecordingSid is threaded through so a slow fetch retrying past a
+    // re-record can never stamp its note/baseline onto the NEW attempt.
+    void processVoiceprint(sid, { recordingUrl, durationSec, callSid, recordingSid }).catch(
+      (err) => console.error("[verify] voiceprint processing error:", err),
     );
-    const ready = vr.gather({
-      numDigits: 1,
-      timeout: IVR_GATHER_TIMEOUT,
-      action: vs.gatherLegAReadyUrl(sid, 0),
-      method: "POST",
-    });
-    ready.say(P.secondCall);
-    vr.redirect({ method: "POST" }, withAttempt(vs.twimlUrl("leg-a-ready", sid), 1));
+    // Hold in the voice-ID wait loop until the verdict (pass → second
+    // press-1 gather; fail → re-record / end; pending → keep waiting).
+    vr.redirect({ method: "POST" }, vs.twimlUrl("voice-id-wait", sid));
   } catch (err) {
     console.error("[verify] voiceprint handler error:", err);
     try {
@@ -714,13 +800,35 @@ export async function verificationVoiceprintHandler(c: Context) {
 }
 
 /**
+ * POST /api/verify/voiceprint-transcription?sid=… — Twilio transcribeCallback
+ * of the guarded voice-ID <Record>. Feeds the transcript into the voice-ID
+ * state machine (fuzzy phrase match happens in verification.ts). Twilio
+ * expects a plain 200 — no TwiML is executed from this callback.
+ */
+export async function verificationVoiceprintTranscriptionHandler(c: Context) {
+  try {
+    const sid = c.req.query("sid") ?? "";
+    if (!sid) return c.text("ok");
+    const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
+    await vs.voiceIdNoteTranscript(sid, {
+      status: String(body.TranscriptionStatus ?? ""),
+      text: String(body.TranscriptionText ?? ""),
+      recordingSid: String(body.RecordingSid ?? ""),
+    });
+  } catch (err) {
+    console.error("[verify] voiceprint transcription callback error:", err);
+  }
+  return c.text("ok");
+}
+
+/**
  * Fetch + analyze the explicit voice-ID recording and store it as the
  * relayguard voice baseline. Best-effort: a missed/unusable recording never
  * blocks second-call verification or the eventual bridge.
  */
 async function processVoiceprint(
   sid: string,
-  pending: { recordingUrl: string; durationSec: number; callSid: string },
+  pending: { recordingUrl: string; durationSec: number; callSid: string; recordingSid: string },
 ): Promise<void> {
   const session = await vs.findSession(sid);
   if (!session || !session.guarded || vs.isTerminal(session)) return;
@@ -730,16 +838,31 @@ async function processVoiceprint(
       .storeVoiceRecording(sid, pending.recordingUrl, pending.durationSec || 0)
       .catch((err) => console.error("[verify] store voice recording error:", err));
   }
+  const hasRecording =
+    Boolean(pending.recordingUrl) &&
+    Number.isFinite(pending.durationSec) &&
+    pending.durationSec >= 1;
   let captured = false;
-  if (pending.recordingUrl && Number.isFinite(pending.durationSec) && pending.durationSec >= 1) {
+  let strong = false;
+  if (hasRecording) {
     try {
       const profile = await fetchVoiceProfile(pending.recordingUrl);
-      vs.setVoiceBaseline(sid, profile);
+      // D3: only install the baseline while this recording still belongs to
+      // the CURRENT attempt — a fast-failed attempt N whose fetch was still
+      // retrying when attempt N+1 began must not overwrite the baseline.
+      if (vs.voiceIdIsCurrentRecording(sid, pending.recordingSid)) {
+        vs.setVoiceBaseline(sid, profile);
+      }
+      // VAD speech seconds (512-sample hop @ 8 kHz = 64 ms/frame). The
+      // voiceprint is STRONG (usable for the voice-ID gate) only with
+      // >= VOICE_ID_MIN_SPEECH_SEC of actual speech.
+      const speechSec = profile.vad.speechFrames.length * 0.064;
+      strong = speechSec >= vs.VOICE_ID_MIN_SPEECH_SEC;
       await vs.logEvent(
         sid,
         "VOICEPRINT_CAPTURED",
         `recording=${pending.recordingUrl} duration=${pending.durationSec}s callSid=${pending.callSid} ` +
-          `speechFrames=${profile.vad.speechFrames.length} voicedFrames=${profile.voicePrint.voicedFrames} — explicit voice-ID phrase`,
+          `speechFrames=${profile.vad.speechFrames.length} speechSec=${speechSec.toFixed(2)} strong=${strong} voicedFrames=${profile.voicePrint.voicedFrames} — explicit voice-ID phrase`,
       );
       captured = true;
     } catch (err) {
@@ -750,9 +873,20 @@ async function processVoiceprint(
     await vs.logEvent(
       sid,
       "VOICEPRINT_MISSED",
-      `recording=${pending.recordingUrl || "(none)"} duration=${pending.durationSec ?? 0}s — explicit voice-ID phrase, no usable audio (voiceprint is best-effort)`,
+      `recording=${pending.recordingUrl || "(none)"} duration=${pending.durationSec ?? 0}s — explicit voice-ID phrase, no usable audio`,
     );
   }
+  // Feed the voice-ID state machine: the recording is USABLE when it exists
+  // with real audio AND profiling succeeded; STRONG when it also carries
+  // enough VAD speech. Anything less fails the attempt (re-record).
+  vs.voiceIdNoteRecording(sid, {
+    usable: hasRecording && captured,
+    strong,
+    detail: `recording=${pending.recordingUrl || "(none)"} duration=${pending.durationSec ?? 0}s captured=${captured}`,
+    // D3: stale-note guard — ignored when a re-record already began a new
+    // attempt with a different RecordingSid.
+    recordingSid: pending.recordingSid,
+  });
 }
 
 /** Download the Twilio recording as 8 kHz WAV and profile it (relayguard). */
