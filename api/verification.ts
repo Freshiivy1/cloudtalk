@@ -179,13 +179,16 @@ export function noiseEventThrottleMs(): number {
 
 /**
  * Consecutive suspicious 1s analysis windows the SpeakerphoneDetector
- * requires before the outer-call forensic system arms (challenge noise to
- * the CALLER + merge-tone backstop). Default 3 (sustained ~3s speakerphone-
- * relay detection — a brief 2-window blip must NOT fire the challenge).
- * Env-overridable via VERIFY_SPEAKERPHONE_ARM_WINDOWS, floored at 1.
+ * requires before the outer-call forensic system fires (challenge noise to
+ * the CALLER only — never the merge tone). Default 3 (sustained ~3s
+ * speakerphone-relay detection — a brief 2-window blip must NOT fire the
+ * challenge). Env-overridable via VERIFY_SPEAKERPHONE_ARM_WINDOWS, floored
+ * at 1; an unset, empty, or non-numeric value yields the default 3.
  */
 export function speakerphoneArmWindows(): number {
-  const v = Number(process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS);
+  const raw = process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
+  if (!raw) return 3; // unset OR set-but-empty → default
+  const v = Number(raw);
   if (!Number.isFinite(v)) return 3;
   return Math.max(1, Math.floor(v));
 }
@@ -625,7 +628,10 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
  * CONTINUOUS on the callee's downlink. The instant the callee presses
  * "merge", the tone crosses into Leg A's own uplink and the stream-side
  * MergeToneDetector fires: verdict within 1-3 s of the actual merge.
- * The speakerphone onSuspicious path also arms the tone as a backstop.
+ * The speakerphone onSuspicious path NEVER arms the tone — suspicion is
+ * handled by the caller-targeted challenge noise alone, so relay detection
+ * has no hangup path and the family never hears the DTMF tone during a pure
+ * speakerphone relay.
  * Unarmed tone fires are ignored (MERGE_TONE_UNARMED) so self-echo of the
  * armed tone into a NON-merged handset and ambient tone-like audio can no
  * longer false-positive a verdict.
@@ -1896,11 +1902,13 @@ export async function onSpeakerphoneCleared(
     // A later episode is a NEW suspicion, not a continuation of the previous
     // one — reset the event throttle so it is visible immediately.
     lastNoiseEventAt.delete(sessionId);
-    // Suspicion-armed merge-tone backstop (D1): if the tone was armed ONLY by
-    // speakerphone suspicion (no ACTIVE HoldDetector second-call engagement),
-    // the clear transition disarms it — otherwise the callee would keep
-    // hearing the tone for the rest of the call. While an engagement IS
-    // active the tone stays armed: the disengage path owns that disarm.
+    // Defensive disarm: if the tone is armed but there is NO ACTIVE
+    // HoldDetector second-call engagement (e.g. the disengage fired while
+    // suspicion was active and deferred the disarm to this path), the clear
+    // transition disarms it — otherwise the callee would keep hearing the
+    // tone for the rest of the call. While an engagement IS active the tone
+    // stays armed: the disengage path owns that disarm. (The speakerphone
+    // suspicion path itself NEVER arms the tone.)
     if (
       session.state === VState.BRIDGED &&
       isMergeToneArmed(sessionId) &&
@@ -1962,16 +1970,22 @@ export async function onSpeakerphoneCleared(
  * If the session has no callerCallSid the announce is skipped (logged) — we
  * do NOT fall back to the Leg A (callee) leg.
  *
- * REPEAT-SAFE: while outer-speakerphone suspicion persists during the live
- * (bridged) call, the detector re-invokes this every refireMs (default 4s —
- * the exact length of the seamless probe loop). Each call simply updates the
- * same conference announce, so repeats are idempotent — Twilio replays the
- * announcement to the caller (sustained masking). When audio returns to
- * normal, re-injection stops on the next clean 1s window and any in-progress
- * 4s loop finishes naturally. Every injection is counted;
- * SPEAKERPHONE_SUSPECTED event WRITES are throttled to one per
- * noiseEventThrottleMs() (default 30s) per episode while the announce
- * re-injection itself is unthrottled.
+ * SUSTAINED MASKING: while outer-speakerphone suspicion persists during the
+ * live (bridged) call, the SpeakerphoneDetector re-invokes the suspicion
+ * handler every refireMs (default 4s — the exact length of the seamless
+ * probe loop), and each emission re-announces the noise to the caller via
+ * this function — so the masking is CONTINUOUS for the whole suspicious
+ * episode, never a one-shot. Re-announces are NOT suppressed by anything on
+ * the forensic path: the only suppression is the mutual exclusion in
+ * handleSpeakerphoneSuspicious — while the in-call merge system owns the
+ * moment (merge tone ARMED by a HoldDetector second-call engagement, or the
+ * session MERGE_DETECTED/terminal) the noise is skipped entirely
+ * (NOISE_SUPPRESSED_MERGE_ACTIVE) so it can never interrupt the DTMF merge
+ * tone. When audio returns to normal, re-injection stops on the first clean
+ * 1s window (SPEAKERPHONE_CLEARED) and any in-progress 4s loop finishes
+ * naturally. Every injection is counted; SPEAKERPHONE_SUSPECTED event
+ * WRITES are throttled to one per noiseEventThrottleMs() (default 30s) per
+ * episode while the announce re-injection itself is unthrottled.
  *
  * Best-effort throughout: any failure is logged (and recorded as a
  * verification event) but never thrown back into the media path.

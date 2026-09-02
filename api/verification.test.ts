@@ -595,54 +595,74 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
     expect(types).toContain("MERGE_TONE_UNARMED");
   });
 
-  it("speakerphone suspicion backstop arms the continuous merge tone", async () => {
+  it("speakerphone suspicion NEVER arms the merge tone — caller-only challenge noise, no hangup path", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_bb_caller",
       legACallSid: "CA_bb_legA",
     });
     expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
+    const updBefore = updatedCalls.length;
     const partBefore = participantUpdates.length;
-    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "backstop test");
-    await tick(150); // both REST paths settle
-    expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
+    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "no-backstop test");
+    await tick(150); // let the REST path settle
+    // The suspicion path must NOT arm the merge tone: an armed recognizer +
+    // loud acoustic tone loopback would be a false-MERGE hangup path from
+    // pure relay detection, and the family would hear DTMF beeping.
+    expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
     const added = participantUpdates.slice(partBefore);
-    // Challenge noise → CALLER (inmate) participant ONLY; the armed merge
-    // tone → LEG A (callee) participant ONLY. The two NEVER cross.
-    expect(
-      added.some(
-        (p) =>
-          p.participant === "CA_bb_caller" &&
-          p.announceUrl?.includes("/api/verify/challenge-noise.wav"),
-      ),
-    ).toBe(true);
-    expect(
-      added.some(
-        (p) =>
-          p.participant === "CA_bb_legA" &&
-          p.announceUrl?.includes("/api/verify/merge-tone.wav"),
-      ),
-    ).toBe(true);
-    expect(
-      added.some(
-        (p) =>
-          p.participant === "CA_bb_legA" &&
-          p.announceUrl?.includes("/api/verify/challenge-noise.wav"),
-      ),
-    ).toBe(false);
+    // The ONLY announce is the challenge noise → CALLER (inmate) participant.
+    expect(added).toHaveLength(1);
+    expect(added[0].participant).toBe("CA_bb_caller");
+    expect(added[0].announceUrl).toContain("/api/verify/challenge-noise.wav");
+    // NO merge-tone announce to ANYONE from the suspicion path.
+    expect(added.some((p) => p.announceUrl?.includes("/api/verify/merge-tone.wav"))).toBe(false);
+    // The Leg A (callee) participant gets NOTHING — its announce channel is
+    // reserved for the in-call merge system.
+    expect(added.some((p) => p.participant === "CA_bb_legA")).toBe(false);
+    // No hangup/redirect of any leg — the call continues.
+    expect(updatedCalls.slice(updBefore)).toHaveLength(0);
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("SPEAKERPHONE_SUSPECTED");
+    expect(types).not.toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
+  });
+
+  it("sustained masking: repeated suspicion emissions (tone NOT armed) re-announce the noise to the caller every time", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_sm_caller",
+      legACallSid: "CA_sm_legA",
+    });
+    const partBefore = participantUpdates.length;
+    // Simulates the detector's refire cadence (every refireMs ~4s while
+    // suspicion persists). With the tone NOT armed, none of these are
+    // suppressed — the masking is sustained for the whole episode.
+    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "refire #1");
+    await tick(100);
+    handleSpeakerphoneSuspicious(s.sessionId, 0.91, "refire #2");
+    await tick(100);
+    handleSpeakerphoneSuspicious(s.sessionId, 0.92, "refire #3");
+    await tick(100);
+    expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
+    const added = participantUpdates.slice(partBefore);
+    // Every emission re-announced the challenge noise to the CALLER only.
+    expect(added).toHaveLength(3);
     expect(
       added.every(
         (p) =>
-          (p.participant === "CA_bb_caller" &&
-            p.announceUrl?.includes("/api/verify/challenge-noise.wav")) ||
-          (p.participant === "CA_bb_legA" &&
-            p.announceUrl?.includes("/api/verify/merge-tone.wav")),
+          p.participant === "CA_sm_caller" &&
+          p.announceUrl?.includes("/api/verify/challenge-noise.wav"),
       ),
     ).toBe(true);
-    vs.disarmMergeTone(s.sessionId);
+    expect(added.some((p) => p.participant === "CA_sm_legA")).toBe(false);
+    expect(added.some((p) => p.announceUrl?.includes("/api/verify/merge-tone.wav"))).toBe(false);
+    // No suppression events on the pure forensic path.
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).not.toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
   });
 
-  it("suspicion-armed tone disarms on SPEAKERPHONE_CLEARED while BRIDGED", async () => {
+  it("armed tone with NO active engagement disarms on SPEAKERPHONE_CLEARED while BRIDGED", async () => {
     process.env.VERIFY_MERGE_TONE_REARM_MS = "50";
     try {
       const s = await makeSession(vs.VState.BRIDGED, {
@@ -650,12 +670,14 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
         callerCallSid: "CA_sd_caller",
         legACallSid: "CA_sd_legA",
       });
-      // Arm via the suspicion backstop ONLY (no HoldDetector engagement).
-      handleSpeakerphoneSuspicious(s.sessionId, 0.9, "clear-disarm test");
-      await tick(150); // let the arm + a few 50ms re-announces settle
+      // Tone armed but NO HoldDetector engagement recorded (e.g. a disengage
+      // that fired while suspicion was active deferred the disarm to this
+      // path — the suspicion path itself never arms the tone).
+      await vs.armMergeTone(s.sessionId);
+      await tick(150); // let a few 50ms re-announces settle
       expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
       expect(vs.isSecondCallEngaged(s.sessionId)).toBe(false);
-      // Suspicion clears with no active engagement → the backstop disarms.
+      // Suspicion clears with no active engagement → the tone disarms.
       await vs.onSpeakerphoneCleared(s.sessionId, "clear-disarm test");
       expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
       const count = participantUpdates.length;
@@ -808,6 +830,8 @@ describe("speakerphoneArmWindows (3s forensic arming)", () => {
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "-4"; // floored to 1
       expect(vs.speakerphoneArmWindows()).toBe(1);
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "bogus"; // safe default
+      expect(vs.speakerphoneArmWindows()).toBe(3);
+      process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = ""; // set-but-empty → default
       expect(vs.speakerphoneArmWindows()).toBe(3);
     } finally {
       if (saved === undefined) delete process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
