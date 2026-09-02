@@ -178,6 +178,22 @@ export function noiseEventThrottleMs(): number {
 }
 
 /**
+ * Consecutive suspicious 1s analysis windows the SpeakerphoneDetector
+ * requires before the outer-call forensic system fires (challenge noise to
+ * the CALLER only — never the merge tone). Default 3 (sustained ~3s
+ * speakerphone-relay detection — a brief 2-window blip must NOT fire the
+ * challenge). Env-overridable via VERIFY_SPEAKERPHONE_ARM_WINDOWS, floored
+ * at 1; an unset, empty, or non-numeric value yields the default 3.
+ */
+export function speakerphoneArmWindows(): number {
+  const raw = process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
+  if (!raw) return 3; // unset OR set-but-empty → default
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return 3;
+  return Math.max(1, Math.floor(v));
+}
+
+/**
  * GUARDED MODE ONLY: session-scoped callee voice baseline. Captured from the
  * post-press-1 voiceprint <Record> ("my voice identifies me") by the
  * /api/verify/voiceprint webhook and compared against live Leg A audio
@@ -612,7 +628,10 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
  * CONTINUOUS on the callee's downlink. The instant the callee presses
  * "merge", the tone crosses into Leg A's own uplink and the stream-side
  * MergeToneDetector fires: verdict within 1-3 s of the actual merge.
- * The speakerphone onSuspicious path also arms the tone as a backstop.
+ * The speakerphone onSuspicious path NEVER arms the tone — suspicion is
+ * handled by the caller-targeted challenge noise alone, so relay detection
+ * has no hangup path and the family never hears the DTMF tone during a pure
+ * speakerphone relay.
  * Unarmed tone fires are ignored (MERGE_TONE_UNARMED) so self-echo of the
  * armed tone into a NON-merged handset and ambient tone-like audio can no
  * longer false-positive a verdict.
@@ -1883,11 +1902,13 @@ export async function onSpeakerphoneCleared(
     // A later episode is a NEW suspicion, not a continuation of the previous
     // one — reset the event throttle so it is visible immediately.
     lastNoiseEventAt.delete(sessionId);
-    // Suspicion-armed merge-tone backstop (D1): if the tone was armed ONLY by
-    // speakerphone suspicion (no ACTIVE HoldDetector second-call engagement),
-    // the clear transition disarms it — otherwise the callee would keep
-    // hearing the tone for the rest of the call. While an engagement IS
-    // active the tone stays armed: the disengage path owns that disarm.
+    // Defensive disarm: if the tone is armed but there is NO ACTIVE
+    // HoldDetector second-call engagement (e.g. the disengage fired while
+    // suspicion was active and deferred the disarm to this path), the clear
+    // transition disarms it — otherwise the callee would keep hearing the
+    // tone for the rest of the call. While an engagement IS active the tone
+    // stays armed: the disengage path owns that disarm. (The speakerphone
+    // suspicion path itself NEVER arms the tone.)
     if (
       session.state === VState.BRIDGED &&
       isMergeToneArmed(sessionId) &&
@@ -1906,7 +1927,7 @@ export async function onSpeakerphoneCleared(
     await logEvent(
       sessionId,
       "SPEAKERPHONE_CLEARED",
-      `callee audio returned to normal; no further challenge-noise injections | ${reason}`.slice(0, 512),
+      `callee audio returned to normal; no further challenge-noise injections (caller-targeted) | ${reason}`.slice(0, 512),
     );
     try {
       const { logCallEvent } = await import("./simulator");
@@ -1920,7 +1941,7 @@ export async function onSpeakerphoneCleared(
         await logCallEvent(callId, "speakerphone_cleared", {
           sessionId,
           reason,
-          target: "legA-callee",
+          target: "caller-inmate",
           at: new Date().toISOString(),
         });
       }
@@ -1934,26 +1955,37 @@ export async function onSpeakerphoneCleared(
 
 /**
  * OUTER SPEAKERPHONE case — inject the relayguard challenge noise toward the
- * CALLEE (Leg A, the dialed party) participant ONLY via a Twilio conference
- * announce. With the noise on the callee's downlink they can't hear the
- * inmate/caller clearly while on speakerphone and are prompted to get off
- * speaker to hear better. The caller/inmate leg NEVER gets this noise (the
- * in-call has its own separate tone — untouched here). The call CONTINUES:
- * this never hangs up or redirects any leg.
+ * CALLER (inmate, browser softphone leg) participant ONLY via a Twilio
+ * conference announce. The noise is a forensic challenge aimed at the party
+ * the suspicion is ABOUT: with the noise on the inmate's downlink they can't
+ * hear the callee clearly while the call is being relayed over speakerphone
+ * and are prompted to take it off speaker to hear better. The callee/Leg A
+ * participant NEVER gets this noise — Leg A's participant announce channel is
+ * reserved EXCLUSIVELY for the in-call merge tone (armMergeTone): a new
+ * participant announce replaces the in-progress one, so announcing noise to
+ * Leg A would kill the DTMF merge tone and mask its return path (the exact
+ * live-test bug this retarget fixes). The call CONTINUES: this never hangs
+ * up or redirects any leg.
  *
- * If the session has no legACallSid the announce is skipped (logged) — we do
- * NOT fall back to the caller leg.
+ * If the session has no callerCallSid the announce is skipped (logged) — we
+ * do NOT fall back to the Leg A (callee) leg.
  *
- * REPEAT-SAFE: while outer-speakerphone suspicion persists during the live
- * (bridged) call, the detector re-invokes this every refireMs (default 4s —
- * the exact length of the seamless probe loop). Each call simply updates the
- * same conference announce, so repeats are idempotent — Twilio replays the
- * announcement to the callee (sustained masking). When audio returns to
- * normal, re-injection stops on the next clean 1s window and any in-progress
- * 4s loop finishes naturally. Every injection is counted;
- * SPEAKERPHONE_SUSPECTED event WRITES are throttled to one per
- * noiseEventThrottleMs() (default 30s) per episode while the announce
- * re-injection itself is unthrottled.
+ * SUSTAINED MASKING: while outer-speakerphone suspicion persists during the
+ * live (bridged) call, the SpeakerphoneDetector re-invokes the suspicion
+ * handler every refireMs (default 4s — the exact length of the seamless
+ * probe loop), and each emission re-announces the noise to the caller via
+ * this function — so the masking is CONTINUOUS for the whole suspicious
+ * episode, never a one-shot. Re-announces are NOT suppressed by anything on
+ * the forensic path: the only suppression is the mutual exclusion in
+ * handleSpeakerphoneSuspicious — while the in-call merge system owns the
+ * moment (merge tone ARMED by a HoldDetector second-call engagement, or the
+ * session MERGE_DETECTED/terminal) the noise is skipped entirely
+ * (NOISE_SUPPRESSED_MERGE_ACTIVE) so it can never interrupt the DTMF merge
+ * tone. When audio returns to normal, re-injection stops on the first clean
+ * 1s window (SPEAKERPHONE_CLEARED) and any in-progress 4s loop finishes
+ * naturally. Every injection is counted; SPEAKERPHONE_SUSPECTED event
+ * WRITES are throttled to one per noiseEventThrottleMs() (default 30s) per
+ * episode while the announce re-injection itself is unthrottled.
  *
  * Best-effort throughout: any failure is logged (and recorded as a
  * verification event) but never thrown back into the media path.
@@ -1965,10 +1997,11 @@ export async function injectChallengeNoise(
   try {
     const session = await findSession(sessionId);
     if (!session) return;
-    // Only inject once the call is BRIDGED — before that, Leg A (callee) is
-    // not a conference participant yet (still ringing / in the press-1 IVR),
-    // so a conference announce would 404. Suspicion detected on pre-bridge
-    // audio (ringback, IVR prompts) is ignored by design.
+    // Only inject once the call is BRIDGED — before that there is no live
+    // inmate↔callee conversation to challenge (the caller may not even be in
+    // the conference yet), so a conference announce could 404. Suspicion
+    // detected on pre-bridge audio (ringback, IVR prompts) is ignored by
+    // design.
     if (session.state !== VState.BRIDGED) {
       console.log(
         `[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} state=${session.state} — not BRIDGED yet, skipping announce | ${reason}`,
@@ -1986,7 +2019,7 @@ export async function injectChallengeNoise(
       await logEvent(
         sessionId,
         "SPEAKERPHONE_SUSPECTED",
-        `challenge-noise injection #${injection} at ${new Date().toISOString()} target=legA-callee | ${reason}`.slice(0, 512),
+        `challenge-noise injection #${injection} at ${new Date().toISOString()} target=caller-inmate | ${reason}`.slice(0, 512),
       );
     } else {
       console.log(
@@ -1994,8 +2027,8 @@ export async function injectChallengeNoise(
       );
     }
     if (isTerminal(session)) return;
-    if (!session.legACallSid) {
-      console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no Leg A (callee) leg, skipping announce`);
+    if (!session.callerCallSid) {
+      console.warn(`[verify] SPEAKERPHONE_SUSPECTED session=${sessionId} — no caller (inmate) leg, skipping announce`);
       return;
     }
     const base = getPublicBaseUrl();
@@ -2010,15 +2043,18 @@ export async function injectChallengeNoise(
       );
       return;
     }
+    // CALLER participant ONLY — NEVER the Leg A (callee) participant: Leg A's
+    // announce channel belongs to the DTMF merge tone, and a competing
+    // announce there would replace/kill it (see the docstring above).
     await getTwilioClient()
       .conferences(confSid)
-      .participants(session.legACallSid)
+      .participants(session.callerCallSid)
       .update({
         announceUrl: `${base}/api/verify/challenge-noise.wav`,
         announceMethod: "GET",
       });
     console.log(
-      `[verify] CHALLENGE_NOISE_INJECTED session=${sessionId} legA=${session.legACallSid} target=legA-callee | ${reason}`,
+      `[verify] CHALLENGE_NOISE_INJECTED session=${sessionId} caller=${session.callerCallSid} target=caller-inmate | ${reason}`,
     );
     // Best-effort mirror into the shared call_events stream (guarded calls
     // link their calls row via clientCallId = guarded-<sessionId>).
@@ -2034,7 +2070,7 @@ export async function injectChallengeNoise(
         await logCallEvent(callId, "speakerphone_suspected", {
           sessionId,
           reason,
-          target: "legA-callee",
+          target: "caller-inmate",
           injection,
           at: new Date().toISOString(),
         });

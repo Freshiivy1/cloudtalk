@@ -268,10 +268,24 @@ export function legAStreamUrl(sessionId: string): string | null {
 
 /**
  * SpeakerphoneDetector.onSuspicious handler (exported for tests): inject the
- * challenge noise toward the callee AND arm the continuous merge tone as a
- * backstop trigger — a suspicious window is exactly when a mid-call merge is
- * most likely, so the tone starts playing immediately instead of waiting for
- * the HoldDetector's hold signature. armMergeTone is idempotent while armed.
+ * challenge noise toward the CALLER (inmate) participant ONLY. This is the
+ * OUTER-CALL FORENSIC system — it NEVER arms the continuous merge tone and
+ * NEVER hangs up: arming from here would give relay detection a hangup path
+ * (armed recognizer + loud tone loopback → false MERGE verdict) and would
+ * make the family hear DTMF beeping during a pure speakerphone relay. The
+ * merge tone is armed EXCLUSIVELY by the in-call merge system (HoldDetector
+ * second-call engagement). While suspicion persists the detector re-invokes
+ * this handler every refireMs (~4s), so the noise is SUSTAINED, not a
+ * one-shot — re-injection stops on the first clean window.
+ *
+ * MUTUAL EXCLUSION with the in-call merge system: if the merge tone is
+ * already ARMED (i.e. the HoldDetector engaged a second call first) or the
+ * session is MERGE_DETECTED/terminal, the merge system owns the moment —
+ * the challenge noise is SUPPRESSED (NOISE_SUPPRESSED_MERGE_ACTIVE event)
+ * and skipped entirely. This guarantees the noise can NEVER interrupt the
+ * DTMF merge tone or mask its detection: the two announces target different
+ * participants (caller vs Leg A), and the noise never fires while the merge
+ * system is active.
  */
 export function handleSpeakerphoneSuspicious(
   sid: string,
@@ -281,13 +295,21 @@ export function handleSpeakerphoneSuspicious(
   console.warn(
     `[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} ${detail}`,
   );
-  void vs
-    .injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`)
-    .catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
-  // Backstop trigger: arm the continuous merge tone (BRIDGED-gated inside).
-  void vs
-    .armMergeTone(sid)
-    .catch((err) => console.error("[verify-stream] armMergeTone error:", err));
+  void (async () => {
+    const mergeToneArmed = vs.isMergeToneArmed(sid);
+    const session = await vs.findSession(sid);
+    const mergeActive =
+      mergeToneArmed || !session || vs.isTerminal(session);
+    if (mergeActive) {
+      const reason =
+        `merge system active (mergeToneArmed=${mergeToneArmed} state=${session?.state ?? "unknown"}) — ` +
+        `challenge noise SUPPRESSED so it cannot interrupt the DTMF merge tone | score=${score.toFixed(2)} ${detail}`;
+      console.log(`[verify-stream] NOISE_SUPPRESSED_MERGE_ACTIVE sid=${sid} ${reason}`);
+      await vs.logEvent(sid, "NOISE_SUPPRESSED_MERGE_ACTIVE", reason.slice(0, 512));
+      return;
+    }
+    await vs.injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`);
+  })().catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
 }
 
 /** Analyzers attached to a Leg A (callee) uplink stream. */
@@ -314,6 +336,10 @@ async function legAAnalyzers(callSid: string): Promise<LegAAnalyzers | null> {
     }
     const sid = session.sessionId;
     const sp = new SpeakerphoneDetector({
+      // 3 consecutive suspicious 1s windows by default (sustained ~3s
+      // speakerphone-relay detection), env-tunable via
+      // VERIFY_SPEAKERPHONE_ARM_WINDOWS.
+      consecutiveWindows: vs.speakerphoneArmWindows(),
       onSuspicious: (score, detail) => handleSpeakerphoneSuspicious(sid, score, detail),
       onClean: (detail) => {
         console.log(`[verify-stream] SPEAKERPHONE CLEARED sid=${sid} ${detail}`);
@@ -382,7 +408,7 @@ export function attachVerificationStreamServer(server: HttpServer): void {
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const sid = new URL(req.url ?? "", "http://localhost").searchParams.get("sid") ?? "";
     // Dynamic energy floor: while the merge tone is ARMED (second call
-    // engaged / suspicion backstop) a genuine merged echo returns LOUD, so
+    // engaged via the HoldDetector) a genuine merged echo returns LOUD, so
     // the elevated VERIFY_MERGE_TONE_ENERGY_FLOOR applies; pre-bridge and
     // unarmed audio keeps the legacy 1e6 floor.
     const detector = new MergeToneDetector({
@@ -391,11 +417,13 @@ export function attachVerificationStreamServer(server: HttpServer): void {
     // Relayguard Leg A analyzers (speakerphone + second-call hold detector)
     // — attached LAZILY on the stream's `start` event, and only when the
     // Twilio CallSid resolves to a session's legACallSid. Only CALLEE-side
-    // (Leg A) audio is analyzed: the outer speakerphone case is the CALLEE
-    // having the call on speaker, so on suspicion the challenge noise goes to
-    // the callee participant — never the caller/inmate leg, and the call is
-    // NEVER hung up or redirected from here. Leg B merge detection runs on
-    // the external relay (VERIFY_STREAM_URL), so no analyzers attach there.
+    // (Leg A) audio is ANALYZED: the outer speakerphone case is detected on
+    // the callee's uplink, but on suspicion the challenge noise is announced
+    // to the CALLER (inmate) participant ONLY — the callee/Leg A participant
+    // NEVER gets it (that announce channel belongs to the DTMF merge tone),
+    // and the call is NEVER hung up or redirected from here. Leg B merge
+    // detection runs on the external relay (VERIFY_STREAM_URL), so no
+    // analyzers attach there.
     let analyzers: LegAAnalyzers | null = null;
     // Frames since the hold detector's armed flag was last refreshed from
     // the verification store (armed only while the session is BRIDGED).
@@ -474,8 +502,9 @@ export function attachVerificationStreamServer(server: HttpServer): void {
  * MergeToneDetector fire path (Leg A uplink stream / Leg B relay stream).
  *
  * BRIDGED in-call detection (v3): the continuous merge tone is announced to
- * the Leg A participant ONLY while ARMED (second call engaged, or the
- * speakerphone-suspicion backstop). A tone fire while armed is real tone
+ * the Leg A participant ONLY while ARMED (HoldDetector second-call
+ * engagement — the speakerphone suspicion path NEVER arms it). A tone fire
+ * while armed is real tone
  * leakage across a merge — and must clear the ELEVATED energy floor (see the
  * detector's dynamic energyFloor) — so the verdict fires immediately, within
  * ~1-3s of the merge. A tone fire while NOT armed is self-echo/ambient audio
@@ -497,7 +526,7 @@ export async function handleMergeToneFire(
       await vs.logEvent(
         sid,
         "MERGE_TONE_UNARMED",
-        "merge tone fired while BRIDGED but NOT armed (no second call engaged, no suspicion backstop) — ignored",
+        "merge tone fired while BRIDGED but NOT armed (no second call engaged) — ignored",
       );
       return "ignored";
     }

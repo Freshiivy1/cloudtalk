@@ -118,7 +118,7 @@ export async function challengeNoiseHandler(c: Context) {
  * a continuous DTMF-'9' render (852+1336 Hz, VERIFY_MERGE_TONE_SEC seconds,
  * default 5s) produced by relayguard/dtmf.ts. Used as the conference
  * announceUrl for the Leg A participant only while the tone is ARMED
- * (second call engaged or suspicion backstop), re-announced every
+ * (HoldDetector second-call engagement), re-announced every
  * VERIFY_MERGE_TONE_REARM_MS so it is effectively continuous; the instant
  * the callee merges, the tone crosses into Leg A's uplink and the
  * stream-side Goertzel detector fires the in-call verdict.

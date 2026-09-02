@@ -74,7 +74,7 @@ export const verificationRouter = createRouter({
    * OUTBOUND Twilio Voice SDK call carrying the sessionId as the `guarded`
    * custom param, and the TwiML App voice webhook parks the caller in the
    * session conference and starts Leg A. Speakerphone suspicion during the
-   * call triggers a callee-only challenge-noise announce — never a hangup.
+   * call triggers a caller-only (inmate) challenge-noise announce — never a hangup.
    * Any authed agent may use this (same auth as the softphone telephony router).
    */
   initiateGuarded: authedQuery

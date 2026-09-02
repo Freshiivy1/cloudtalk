@@ -8,8 +8,11 @@
  * A window counts as suspicious when the verdict pipeline says
  * 'SUSPICIOUS RELAY' or the relay fingerprint on the window is RED.
  *
- * onSuspicious(score, detail) fires after 2 CONSECUTIVE suspicious windows
- * (~2 s to first live alert). Post-fire behavior (SUSTAINED MASKING —
+ * onSuspicious(score, detail) fires after `consecutiveWindows` CONSECUTIVE
+ * suspicious windows (default 3 — ~3 s of SUSTAINED speakerphone-relay
+ * detection before the forensic challenge arms; wired from
+ * VERIFY_SPEAKERPHONE_ARM_WINDOWS by verification-stream.ts). Post-fire
+ * behavior (SUSTAINED MASKING —
  * replaces the old 30 s cooldown): while suspicion persists, onSuspicious
  * KEEPS firing on subsequent suspicious windows, throttled to one emission
  * per refireMs (default 4 s, matching the seamless challenge-noise loop) so
@@ -32,7 +35,7 @@ const BASELINE_MODE = "poor" as const;
 export interface SpeakerphoneDetectorOptions {
   /** Analysis window in seconds (default 1). */
   windowSec?: number;
-  /** Consecutive suspicious windows required before (re-)firing (default 2). */
+  /** Consecutive suspicious windows required before (re-)firing (default 3). */
   consecutiveWindows?: number;
   /**
    * Minimum wall-clock ms between emissions while suspicion persists
@@ -63,7 +66,7 @@ export class SpeakerphoneDetector {
 
   constructor(opts: SpeakerphoneDetectorOptions = {}) {
     this.win = Math.round((opts.windowSec ?? 1) * SAMPLE_RATE);
-    this.need = opts.consecutiveWindows ?? 2;
+    this.need = opts.consecutiveWindows ?? 3;
     this.refire = opts.refireMs ?? 4_000;
     this.onSuspicious = opts.onSuspicious;
     this.onClean = opts.onClean;
