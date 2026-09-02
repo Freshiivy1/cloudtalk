@@ -8,7 +8,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const dsp = vi.hoisted(() => ({ suspicious: false }));
+const dsp = vi.hoisted(() => ({ suspicious: false, amberOnly: false }));
 
 vi.mock("./features", () => ({
   // Any non-empty speechFrames lets the first window seed the baseline.
@@ -21,7 +21,23 @@ vi.mock("./compare", () => ({
       ? { verdict: "SUSPICIOUS RELAY", weightedScore: 0.9, confidence: 90, flags: ["test-flag"] }
       : { verdict: "MATCH", weightedScore: 0.05, confidence: 95, flags: [] },
   relayFingerprint: () =>
-    dsp.suspicious ? { state: "RED", score: 0.9 } : { state: "GREEN", score: 0.1 },
+    dsp.suspicious
+      ? dsp.amberOnly
+        ? {
+            state: "AMBER",
+            score: 0.5,
+            components: { flatness: 0.5, gapContrast: 0.4, noiseBed: 0.3, hfLeakage: 0.2, fragmentation: 0.1 },
+          }
+        : {
+            state: "RED",
+            score: 0.9,
+            components: { flatness: 0.9, gapContrast: 0.8, noiseBed: 0.7, hfLeakage: 0.6, fragmentation: 0.5 },
+          }
+      : {
+          state: "GREEN",
+          score: 0.1,
+          components: { flatness: 0.1, gapContrast: 0.1, noiseBed: 0.1, hfLeakage: 0.1, fragmentation: 0.1 },
+        },
 }));
 
 import { SpeakerphoneDetector } from "./speakerphone-detector";
@@ -146,5 +162,174 @@ describe("SpeakerphoneDetector sustained repeat-fire", () => {
     expect(fires).toHaveLength(1);
     push(true); // streak 2 — fresh trigger
     expect(fires).toHaveLength(2);
+  });
+
+  it("uncapped: keeps emitting every refire interval for as long as suspicion persists", () => {
+    const { fires, push } = setup(); // refireMs 9s
+    push(true);
+    push(true); // fire #1
+    expect(fires).toHaveLength(1);
+    // Six more refire cycles — nothing caps the repeats (the ~4s production
+    // refire runs until SPEAKERPHONE_CLEARED).
+    for (let i = 0; i < 6; i++) {
+      now += 9_000;
+      push(true);
+    }
+    expect(fires).toHaveLength(7);
+  });
+});
+
+describe("SpeakerphoneDetector RED arming bar", () => {
+  function setupBar() {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 3,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+    });
+    const push = (suspicious: boolean, amberOnly = false) => {
+      dsp.suspicious = suspicious;
+      dsp.amberOnly = amberOnly;
+      d.pushSamples(WINDOW);
+      dsp.amberOnly = false;
+    };
+    push(false); // baseline seed
+    return { fires, push };
+  }
+
+  it("AMBER×3 (SUSPICIOUS RELAY verdict but fingerprint < 0.6) NEVER arms", () => {
+    const { fires, push } = setupBar();
+    push(true, true); // streak would be 1 under the old OR rule
+    now += 1_000;
+    push(true, true);
+    now += 1_000;
+    push(true, true); // 3 consecutive AMBER suspicious-verdict windows
+    now += 1_000;
+    push(true, true); // one more for good measure
+    expect(fires).toHaveLength(0);
+  });
+
+  it("RED×3 (verdict SUSPICIOUS RELAY AND fingerprint >= 0.6) arms", () => {
+    const { fires, push } = setupBar();
+    push(true);
+    now += 1_000;
+    push(true);
+    expect(fires).toHaveLength(0);
+    now += 1_000;
+    push(true); // 3rd consecutive RED+SUSPICIOUS window → arm
+    expect(fires).toHaveLength(1);
+    expect(fires[0].detail).toContain("relayState=RED");
+    expect(fires[0].detail).toContain("streak=3");
+  });
+
+  it("an AMBER window inside a RED streak breaks the streak", () => {
+    const { fires, push } = setupBar();
+    push(true); // RED streak 1
+    now += 1_000;
+    push(true, true); // AMBER → streak resets to 0
+    now += 1_000;
+    push(true); // RED streak 1 again
+    now += 1_000;
+    push(true); // streak 2
+    expect(fires).toHaveLength(0);
+    now += 1_000;
+    push(true); // streak 3 → arm
+    expect(fires).toHaveLength(1);
+  });
+});
+
+describe("SpeakerphoneDetector calibration warm-up", () => {
+  it("does NOT arm during the post-BRIDGED warm-up, then logs completion and arms normally", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const fires: Array<{ score: number; detail: string }> = [];
+    const warmups: string[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 3,
+      warmupMs: 8_000,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+      onWarmupComplete: (detail) => warmups.push(detail),
+    });
+    const push = (suspicious: boolean) => {
+      dsp.suspicious = suspicious;
+      d.pushSamples(WINDOW);
+    };
+    push(false); // pre-bridge baseline seed (ringback/IVR audio)
+    push(true);
+    push(true);
+    // Enter BRIDGED: baseline resets, warm-up starts.
+    d.setBridged(true);
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("FORENSICS_WARMUP_START"))).toBe(
+      true,
+    );
+    // Suspicious windows DURING the warm-up can never arm, even far past the
+    // 3-window streak requirement.
+    for (let i = 0; i < 5; i++) {
+      now += 1_000;
+      push(true);
+    }
+    expect(fires).toHaveLength(0);
+    expect(warmups).toHaveLength(0);
+    // Cross the 8s warm-up boundary → completion logged exactly once…
+    now += 4_000; // t = bridge + 9s
+    push(true); // first post-warm-up suspicious window (streak 1)
+    expect(warmups).toHaveLength(1);
+    expect(
+      logSpy.mock.calls.some((c) => String(c[0]).includes("FORENSICS_WARMUP_COMPLETE")),
+    ).toBe(true);
+    expect(fires).toHaveLength(0); // streak restarted after the warm-up
+    now += 1_000;
+    push(true); // streak 2
+    now += 1_000;
+    push(true); // streak 3 → arm
+    expect(fires).toHaveLength(1);
+    // Warm-up completion is a one-shot.
+    now += 5_000;
+    push(false);
+    expect(warmups).toHaveLength(1);
+    logSpy.mockRestore();
+  });
+
+  it("logs throttled FORENSIC_WINDOW score lines while BRIDGED (verdict, fp score/state, top features)", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const d = new SpeakerphoneDetector({ warmupMs: 0 });
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // baseline seed
+    d.setBridged(true);
+    d.pushSamples(WINDOW); // first bridged window → logs immediately
+    d.pushSamples(WINDOW); // inside the 5s throttle → no second line
+    let lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("FORENSIC_WINDOW"));
+    expect(lines).toHaveLength(1);
+    const line = String(lines[0][0]);
+    expect(line).toContain("verdict=MATCH");
+    expect(line).toContain("relayState=GREEN");
+    expect(line).toContain("relayScore=0.10");
+    expect(line).toContain("top=flatness="); // top contributing features
+    now += 6_000; // past the throttle
+    d.pushSamples(WINDOW);
+    lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("FORENSIC_WINDOW"));
+    expect(lines).toHaveLength(2);
+    logSpy.mockRestore();
+  });
+
+  it("a session already BRIDGED at construction warm-ups from t0", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: number[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 1,
+      warmupMs: 8_000,
+      bridged: true,
+      onSuspicious: (score) => fires.push(score),
+    });
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // baseline seed
+    dsp.suspicious = true;
+    now += 1_000;
+    d.pushSamples(WINDOW); // inside warm-up → suppressed despite need=1
+    expect(fires).toHaveLength(0);
+    now += 8_000;
+    d.pushSamples(WINDOW); // warm-up done → arms
+    expect(fires).toHaveLength(1);
   });
 });

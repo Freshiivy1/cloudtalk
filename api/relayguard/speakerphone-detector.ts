@@ -11,7 +11,27 @@
  * onSuspicious(score, detail) fires after `consecutiveWindows` CONSECUTIVE
  * suspicious windows (default 3 — ~3 s of SUSTAINED speakerphone-relay
  * detection before the forensic challenge arms; wired from
- * VERIFY_SPEAKERPHONE_ARM_WINDOWS by verification-stream.ts). Post-fire
+ * VERIFY_SPEAKERPHONE_ARM_WINDOWS by verification-stream.ts).
+ *
+ * ARMING BAR (forensic precision): a window only counts as ARMING-suspicious
+ * when the verdict pipeline says 'SUSPICIOUS RELAY' AND the window's relay
+ * fingerprint is RED (score >= 0.6). AMBER (or a RED fingerprint with a
+ * non-suspicious verdict) NEVER arms — handset speech/ringback/IVR audio
+ * routinely scores AMBER, and the live-test false arm came from exactly that.
+ *
+ * CALIBRATION WARM-UP: the stream layer calls setBridged(true) when the
+ * session enters BRIDGED. That moment RESETS the rolling baseline (the
+ * pre-bridge baseline was built from ringback/IVR audio — comparing live
+ * conversation against it is what false-armed the detector ~3 s into the
+ * bridge) and starts a warm-up window (warmupMs, wired from
+ * VERIFY_FORENSICS_WARMUP_MS, default 8000): windows are still scored
+ * internally (baseline rebuild + forensic logging) but CANNOT arm. The
+ * warm-up completion is logged (FORENSICS_WARMUP_COMPLETE).
+ *
+ * FORENSIC SCORE LOGGING: while BRIDGED, every analysis window's verdict /
+ * fingerprint score+state / top contributing fingerprint features are logged,
+ * throttled to one line per ~5 s, so production logs prove what the detector
+ * saw. Post-fire
  * behavior (SUSTAINED MASKING —
  * replaces the old 30 s cooldown): while suspicion persists, onSuspicious
  * KEEPS firing on subsequent suspicious windows, throttled to one emission
@@ -25,12 +45,26 @@
  * to do; nothing here ever touches the call legs.
  */
 import { analyzeClip, type ClipProfile } from "./features";
-import { compareClips, relayFingerprint, type Verdict } from "./compare";
+import {
+  compareClips,
+  relayFingerprint,
+  type RelayFingerprint,
+  type Verdict,
+} from "./compare";
 import { decodeMulaw } from "../verification-stream";
 
 const SAMPLE_RATE = 8000;
 /** Prison-phone channel model: the live legs are 8 kHz μ-law telephony. */
 const BASELINE_MODE = "poor" as const;
+
+/** Top-3 contributing relay-fingerprint features, highest score first. */
+function topFingerprintFeatures(fp: RelayFingerprint): string {
+  return Object.entries(fp.components)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([k, v]) => `${k}=${v.toFixed(2)}`)
+    .join(",");
+}
 
 export interface SpeakerphoneDetectorOptions {
   /** Analysis window in seconds (default 1). */
@@ -45,31 +79,85 @@ export interface SpeakerphoneDetectorOptions {
    * window resets to idle.
    */
   refireMs?: number;
+  /**
+   * Calibration warm-up (ms) after entering BRIDGED during which arming is
+   * suppressed while the rolling baseline rebuilds (default 0 = no warm-up;
+   * verification-stream.ts wires VERIFY_FORENSICS_WARMUP_MS, default 8000).
+   */
+  warmupMs?: number;
+  /**
+   * Initial BRIDGED flag (default false). The stream layer flips it via
+   * setBridged() when the verification session enters BRIDGED.
+   */
+  bridged?: boolean;
   /** Called when speakerphone use is suspected. score ∈ 0..1 (relay fp). */
   onSuspicious?: (score: number, detail: string) => void;
   /** Called once when a fired suspicion clears on a clean analysis window. */
   onClean?: (detail: string) => void;
+  /** Called once when the post-BRIDGED calibration warm-up completes. */
+  onWarmupComplete?: (detail: string) => void;
 }
+
+/** Min wall-clock ms between throttled per-window forensic score logs. */
+const FORENSIC_LOG_THROTTLE_MS = 5_000;
 
 export class SpeakerphoneDetector {
   private readonly win: number;
   private readonly need: number;
   private readonly refire: number;
+  private readonly warmup: number;
   private readonly onSuspicious?: (score: number, detail: string) => void;
   private readonly onClean?: (detail: string) => void;
+  private readonly onWarmupComplete?: (detail: string) => void;
   private buf: number[] = [];
   private baseline: ClipProfile | null = null;
   private streak = 0;
   private windows = 0;
   private lastFiredAt = 0;
   private suspecting = false;
+  /** BRIDGED state + warm-up bookkeeping. */
+  private bridged: boolean;
+  private bridgedAt = 0;
+  private warmupDone: boolean;
+  private warmupWindows = 0;
+  private lastForensicLogAt = 0;
 
   constructor(opts: SpeakerphoneDetectorOptions = {}) {
     this.win = Math.round((opts.windowSec ?? 1) * SAMPLE_RATE);
     this.need = opts.consecutiveWindows ?? 3;
     this.refire = opts.refireMs ?? 4_000;
+    this.warmup = Math.max(0, opts.warmupMs ?? 0);
     this.onSuspicious = opts.onSuspicious;
     this.onClean = opts.onClean;
+    this.onWarmupComplete = opts.onWarmupComplete;
+    this.bridged = opts.bridged ?? false;
+    this.warmupDone = this.warmup <= 0;
+    if (this.bridged) this.bridgedAt = Date.now();
+  }
+
+  /**
+   * Stream-layer hook: the verification session entered/left BRIDGED. On the
+   * false → true transition the rolling baseline is RESET (it was built from
+   * pre-bridge ringback/IVR audio — comparing live conversation against it is
+   * what false-armed the detector seconds into the live-test bridge) and the
+   * calibration warm-up starts: windows keep being scored internally but
+   * cannot arm for warmupMs. Idempotent while already bridged.
+   */
+  setBridged(bridged: boolean): void {
+    if (bridged === this.bridged) return;
+    this.bridged = bridged;
+    if (!bridged) return;
+    this.bridgedAt = Date.now();
+    this.warmupDone = this.warmup <= 0;
+    this.warmupWindows = 0;
+    this.baseline = null;
+    this.streak = 0;
+    this.suspecting = false;
+    if (!this.warmupDone) {
+      console.log(
+        `[speakerphone-detector] FORENSICS_WARMUP_START warmup=${this.warmup}ms — baseline rebuilding, arming suppressed`,
+      );
+    }
   }
 
   /** Feed one Twilio media payload (base64 μ-law, 8 kHz mono). */
@@ -133,7 +221,43 @@ export class SpeakerphoneDetector {
     const result = compareClips(this.baseline, profile, BASELINE_MODE);
     const fp = relayFingerprint(profile);
     const verdict: Verdict = result.verdict;
-    const suspicious = verdict === "SUSPICIOUS RELAY" || fp.state === "RED";
+
+    // FORENSIC SCORE LOGGING (BRIDGED only, throttled): every window's
+    // verdict / fingerprint score+state / top contributing features — the
+    // production log proves exactly what the detector saw.
+    if (this.bridged && Date.now() - this.lastForensicLogAt >= FORENSIC_LOG_THROTTLE_MS) {
+      this.lastForensicLogAt = Date.now();
+      console.log(
+        `[speakerphone-detector] FORENSIC_WINDOW window=${this.windows} verdict=${verdict} ` +
+          `relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
+          `weighted=${result.weightedScore.toFixed(2)} top=${topFingerprintFeatures(fp)} ` +
+          `streak=${this.streak} warmup=${this.warmupDone ? "done" : "active"}`,
+      );
+    }
+
+    // CALIBRATION WARM-UP: after entering BRIDGED the detector scores windows
+    // internally (baseline rebuild above + logging) but CANNOT arm for
+    // warmupMs. The completion transition is logged exactly once.
+    if (this.bridged && !this.warmupDone) {
+      this.warmupWindows++;
+      if (Date.now() - this.bridgedAt < this.warmup) {
+        // Rolling baseline keeps absorbing the fresh in-call audio.
+        if (verdict === "MATCH") this.baseline = profile;
+        return;
+      }
+      this.warmupDone = true;
+      const detail =
+        `elapsed=${Date.now() - this.bridgedAt}ms windows=${this.warmupWindows} — ` +
+        `baseline rebuilt, forensic arming live`;
+      console.log(`[speakerphone-detector] FORENSICS_WARMUP_COMPLETE ${detail}`);
+      this.onWarmupComplete?.(detail);
+    }
+
+    // ARMING BAR: a window counts as suspicious ONLY when the verdict is
+    // 'SUSPICIOUS RELAY' AND the relay fingerprint is RED (>= 0.6). AMBER —
+    // or a bare RED with a non-suspicious verdict — never arms (handset
+    // speech / ringback / IVR routinely score AMBER).
+    const suspicious = verdict === "SUSPICIOUS RELAY" && fp.state === "RED";
 
     if (suspicious) {
       this.streak++;
