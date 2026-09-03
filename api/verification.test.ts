@@ -35,6 +35,8 @@ const twilioMock = vi.hoisted(() => ({
     announceMethod?: string;
   }>,
   conferenceUpdates: [] as Array<{ conference: string; status?: string }>,
+  /** SMS sent via the Messages API (SMS_PROVIDER=twilio transport). */
+  sentMessages: [] as Array<{ to: string; from: string; body: string }>,
   // Optional override for conferences.list: null (default) = a live
   // conference always exists for any friendly name; set to [] to simulate
   // "no in-progress conference" (the pre-start-lobby case).
@@ -84,10 +86,21 @@ vi.mock("twilio", async (importOriginal) => {
           twilioMock.listResult ?? [{ sid: opts?.friendlyName ?? "CF_mock" }],
       },
     ),
+    messages: {
+      create: async (opts: { to: string; from: string; body: string }) => {
+        twilioMock.sentMessages.push(opts);
+        return { sid: `SM_mock_${twilioMock.sentMessages.length}` };
+      },
+    },
   };
   const factory = (() => fakeClient) as unknown as typeof realTwilio;
-  // verification-webhooks.ts uses twilio.twiml.VoiceResponse for real TwiML.
-  Object.assign(factory, { twiml: realTwilio.twiml, jwt: realTwilio.jwt });
+  // verification-webhooks.ts uses twilio.twiml.VoiceResponse for real TwiML,
+  // and the SMS-inbound webhook uses validateRequest for signed posts.
+  Object.assign(factory, {
+    twiml: realTwilio.twiml,
+    jwt: realTwilio.jwt,
+    validateRequest: realTwilio.validateRequest,
+  });
   return { ...actual, default: factory };
 });
 
@@ -2739,7 +2752,7 @@ interface CapturedFetch {
 
 /** Save/restore the SMS env vars a test mutates. */
 function smsEnvSnapshot() {
-  const keys = ["SMS_ENABLED", "SMS_API_TOKEN", "SMS_MAX_ATTEMPTS", "SMS_INBOUND_TOKEN"];
+  const keys = ["SMS_ENABLED", "SMS_API_TOKEN", "SMS_MAX_ATTEMPTS", "SMS_INBOUND_TOKEN", "SMS_PROVIDER", "SMS_FROM"];
   const saved: Record<string, string | undefined> = {};
   for (const k of keys) saved[k] = process.env[k];
   return () => {
@@ -2755,6 +2768,7 @@ describe("smart SMS notifications (Crazytel)", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
       // Ignore stray non-Crazytel fetches from earlier tests' fire-and-forget work.
@@ -2789,6 +2803,7 @@ describe("smart SMS notifications (Crazytel)", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     process.env.SMS_MAX_ATTEMPTS = "3";
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
@@ -2816,6 +2831,7 @@ describe("smart SMS notifications (Crazytel)", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_bad_token";
+    process.env.SMS_PROVIDER = "crazytel";
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
       if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
@@ -2861,6 +2877,7 @@ describe("smart SMS notifications (Crazytel)", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
       if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
@@ -2889,6 +2906,7 @@ describe("smart SMS notifications (Crazytel)", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
       if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
@@ -2948,6 +2966,7 @@ describe("smart SMS notifications (Crazytel)", () => {
     try {
       const result = await vs.deliverSms(
         {
+          provider: "crazytel",
           baseUrl: "https://sms.example.com/send",
           token: "t",
           from: "CallVerify",
@@ -2996,6 +3015,7 @@ describe("inbound AI SMS", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     delete process.env.SMS_INBOUND_TOKEN;
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
@@ -3030,6 +3050,7 @@ describe("inbound AI SMS", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     delete process.env.SMS_INBOUND_TOKEN;
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
@@ -3054,6 +3075,7 @@ describe("inbound AI SMS", () => {
     const restore = smsEnvSnapshot();
     process.env.SMS_ENABLED = "true";
     process.env.SMS_API_TOKEN = "ct_test_token";
+    process.env.SMS_PROVIDER = "crazytel";
     delete process.env.SMS_INBOUND_TOKEN;
     const calls: CapturedFetch[] = [];
     vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
@@ -3092,6 +3114,183 @@ describe("inbound AI SMS", () => {
     try {
       const res = await postJson("/api/verify/sms/inbound", { from: "+61499990097" });
       expect(res.status).toBe(400);
+    } finally {
+      restore();
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Twilio SMS provider — same account as voice, no second vendor              */
+/* -------------------------------------------------------------------------- */
+
+describe("Twilio SMS provider", () => {
+  it("sends via the Twilio Messages API (auto-selected when Twilio creds exist)", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    delete process.env.SMS_PROVIDER; // auto-select → twilio (creds are set globally)
+    delete process.env.SMS_FROM; // falls back to TWILIO_CALLER_ID
+    delete process.env.SMS_API_TOKEN;
+    const calls: CapturedFetch[] = [];
+    vi.stubGlobal("fetch", async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes("crazytel")) return new Response("{}", { status: 200 });
+      calls.push({ url: String(url), init });
+      return new Response("{}", { status: 200 });
+    });
+    twilioMock.sentMessages.length = 0;
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990030" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      // Went through the Twilio SDK — NOT the Crazytel HTTP endpoint.
+      expect(calls).toHaveLength(0);
+      expect(twilioMock.sentMessages).toHaveLength(1);
+      expect(twilioMock.sentMessages[0].to).toBe("+61499990030");
+      expect(twilioMock.sentMessages[0].from).toBe("+61400000001"); // TWILIO_CALLER_ID fallback
+      expect(twilioMock.sentMessages[0].body).toContain("call waiting");
+      const sent = (await events(s.sessionId)).find((e) => e.eventType === "SMS_SENT");
+      expect(sent?.details).toContain("via=twilio");
+      expect(sent?.details).toContain("providerId=SM_mock_1");
+    } finally {
+      vi.unstubAllGlobals();
+      restore();
+    }
+  });
+
+  it("SMS_FROM overrides the caller-ID fallback on the twilio provider", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_PROVIDER = "twilio";
+    process.env.SMS_FROM = "+61477778888";
+    twilioMock.sentMessages.length = 0;
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990031" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(twilioMock.sentMessages[0].from).toBe("+61477778888");
+    } finally {
+      restore();
+    }
+  });
+
+  it("twilio provider: repeat-offender escalation also applies", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_PROVIDER = "twilio";
+    delete process.env.SMS_FROM;
+    twilioMock.sentMessages.length = 0;
+    try {
+      await makeSession(vs.VState.CALL_WAITING_OFF, { calleeNumber: "+61499990032" });
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990032" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(twilioMock.sentMessages[0].body).toContain("*43#");
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("SMS_REPEAT_OFFENDER");
+    } finally {
+      restore();
+    }
+  });
+
+  it("SMS_SKIPPED when twilio REST creds are absent and provider=twilio", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_PROVIDER = "twilio";
+    const savedSid = process.env.TWILIO_ACCOUNT_SID;
+    const savedTok = process.env.TWILIO_AUTH_TOKEN;
+    delete process.env.TWILIO_ACCOUNT_SID;
+    delete process.env.TWILIO_AUTH_TOKEN;
+    twilioMock.sentMessages.length = 0;
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { calleeNumber: "+61499990033" });
+      await vs.onVoicemailDetected(s.sessionId, "machine_start");
+      expect(twilioMock.sentMessages).toHaveLength(0);
+      const skipped = (await events(s.sessionId)).find((e) => e.eventType === "SMS_SKIPPED");
+      expect(skipped?.details).toContain("provider=twilio");
+    } finally {
+      process.env.TWILIO_ACCOUNT_SID = savedSid;
+      process.env.TWILIO_AUTH_TOKEN = savedTok;
+      restore();
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Twilio-format inbound SMS (From/Body form post + signature validation)     */
+/* -------------------------------------------------------------------------- */
+
+import nodeCrypto from "crypto";
+
+/** Twilio request signature: base64 HMAC-SHA1 of url + sorted params. */
+function twilioSign(authToken: string, url: string, params: Record<string, string>): string {
+  const data =
+    url +
+    Object.keys(params)
+      .sort()
+      .map((k) => k + params[k])
+      .join("");
+  return nodeCrypto.createHmac("sha1", authToken).update(data).digest("base64");
+}
+
+describe("Twilio-format inbound SMS", () => {
+  it("accepts Twilio's From/Body form post and replies with the walkthrough", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_PROVIDER = "twilio";
+    delete process.env.SMS_FROM;
+    delete process.env.SMS_INBOUND_TOKEN;
+    twilioMock.sentMessages.length = 0;
+    try {
+      const s = await makeSession(vs.VState.CALL_WAITING_OFF, { calleeNumber: "+61499990040" });
+      const res = await postForm("/api/verify/sms/inbound", {
+        From: "+61499990040",
+        To: "+61400000001",
+        Body: "iPhone 15",
+      });
+      expect(res.status).toBe(200);
+      // Twilio gets empty TwiML (no auto-reply) — we reply via REST ourselves.
+      expect(await res.text()).toContain("<Response/>");
+      expect(twilioMock.sentMessages).toHaveLength(1);
+      expect(twilioMock.sentMessages[0].to).toBe("+61499990040");
+      expect(twilioMock.sentMessages[0].body).toContain("iPhone");
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("SMS_INBOUND");
+      expect(types).toContain("SMS_AI_REPLY");
+    } finally {
+      restore();
+    }
+  });
+
+  it("valid signed Twilio request passes; bad signature → 403", async () => {
+    const restore = smsEnvSnapshot();
+    process.env.SMS_ENABLED = "true";
+    process.env.SMS_PROVIDER = "twilio";
+    delete process.env.SMS_FROM;
+    delete process.env.SMS_INBOUND_TOKEN;
+    twilioMock.sentMessages.length = 0;
+    const url = "https://verify-test.example.com/api/verify/sms/inbound";
+    const params = { From: "+61499990041", To: "+61400000001", Body: "pixel 8" };
+    try {
+      await makeSession(vs.VState.CALL_WAITING_OFF, { calleeNumber: "+61499990041" });
+      const good = twilioSign("test_auth_token", url, params);
+      const res = await hookApp.request("/api/verify/sms/inbound", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Twilio-Signature": good,
+        },
+        body: new URLSearchParams(params),
+      });
+      expect(res.status).toBe(200);
+      expect(twilioMock.sentMessages).toHaveLength(1);
+
+      const bad = await hookApp.request("/api/verify/sms/inbound", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Twilio-Signature": "forged-signature",
+        },
+        body: new URLSearchParams(params),
+      });
+      expect(bad.status).toBe(403);
+      expect(twilioMock.sentMessages).toHaveLength(1); // forged request never replied
     } finally {
       restore();
     }

@@ -885,15 +885,34 @@ export function conferenceName(sessionId: string): string {
   return `verify-${sessionId}`;
 }
 
-/** SMS (Crazytel HTTP API) — ported from application.yml `sms:` block. */
+/**
+ * SMS provider config. Two transports are supported:
+ *   - "twilio"   — sends via the Twilio Messages API using the SAME account
+ *                  already configured for voice (no extra vendor, inbound
+ *                  replies arrive on the Twilio number's SMS webhook);
+ *   - "crazytel" — the original Asterisk SmsService HTTP port (Bearer auth).
+ * SMS_PROVIDER picks explicitly; otherwise it auto-selects "twilio" whenever
+ * Twilio REST credentials are present, falling back to "crazytel".
+ */
 function smsCfg() {
   const e = process.env;
   const maxAttempts = Number.parseInt(e.SMS_MAX_ATTEMPTS ?? "3", 10);
   const timeoutMs = Number.parseInt(e.SMS_HTTP_TIMEOUT_MS ?? "6000", 10);
+  const explicit = (e.SMS_PROVIDER ?? "").trim().toLowerCase();
+  const provider: "twilio" | "crazytel" =
+    explicit === "twilio" || explicit === "crazytel"
+      ? explicit
+      : e.TWILIO_ACCOUNT_SID && e.TWILIO_AUTH_TOKEN
+        ? "twilio"
+        : "crazytel";
   return {
     enabled: (e.SMS_ENABLED ?? "false") === "true",
+    provider,
     token: e.SMS_API_TOKEN ?? "",
-    from: e.SMS_FROM ?? "CallVerify",
+    // Twilio needs a real SMS-capable Twilio number (E.164). When SMS_FROM is
+    // unset and the provider is twilio, fall back to the verified voice caller
+    // ID — it is the one Twilio number we know the account owns.
+    from: e.SMS_FROM ?? (provider === "twilio" ? (e.TWILIO_CALLER_ID ?? "") : "CallVerify"),
     baseUrl: e.SMS_BASE_URL ?? "https://sms.crazytel.net.au/api/v1/sms/send",
     /** Delivery attempts incl. the first (transient 5xx/timeouts are retried). */
     maxAttempts: Number.isFinite(maxAttempts) && maxAttempts >= 1 ? Math.min(maxAttempts, 5) : 3,
@@ -2510,64 +2529,119 @@ export interface SmsDeliveryResult {
  *   - delivery audit: the provider's message id/reference is captured into the
  *     SMS_SENT event so every outbound text is traceable end-to-end.
  */
+export interface SmsTransportCfg {
+  provider: "twilio" | "crazytel";
+  baseUrl: string;
+  token: string;
+  from: string;
+  maxAttempts: number;
+  timeoutMs: number;
+}
+
+interface SmsAttempt extends SmsDeliveryResult {
+  /** true = retrying cannot help (bad credentials/number/payload) */
+  permanent?: boolean;
+}
+
+/** One Crazytel send attempt — exact SmsService.java wire contract. */
+async function sendViaCrazytel(cfg: SmsTransportCfg, to: string, message: string): Promise<SmsAttempt> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+  try {
+    const res = await fetch(cfg.baseUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // SmsService.java: .header("Authorization", "Bearer " + props.getToken())
+        Authorization: `Bearer ${cfg.token}`,
+      },
+      body: JSON.stringify({ to, from: cfg.from, message }),
+      signal: controller.signal,
+    });
+    const text = await res.text().catch(() => "");
+    if (res.ok) {
+      let providerId: string | undefined;
+      try {
+        const j = JSON.parse(text) as Record<string, unknown>;
+        const id = j.id ?? j.messageId ?? j.message_id ?? j.reference;
+        if (id != null) providerId = String(id);
+      } catch {
+        // non-JSON success body — fine, delivery still confirmed by 2xx
+      }
+      return { ok: true, status: res.status, providerId };
+    }
+    // 4xx = permanent (bad token/number/payload) — retrying cannot help.
+    return { ok: false, status: res.status, error: text.slice(0, 200), permanent: res.status >= 400 && res.status < 500 };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        controller.signal.aborted
+          ? `timeout after ${cfg.timeoutMs}ms`
+          : err instanceof Error
+            ? err.message
+            : String(err),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** One Twilio Messages API attempt — same account as voice, no extra vendor. */
+async function sendViaTwilio(cfg: SmsTransportCfg, to: string, message: string): Promise<SmsAttempt> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const client = getTwilioClient();
+    const timeout = new Promise<never>((_r, reject) => {
+      timer = setTimeout(() => reject(new Error(`timeout after ${cfg.timeoutMs}ms`)), cfg.timeoutMs);
+    });
+    const msg = (await Promise.race([
+      client.messages.create({ to, from: cfg.from, body: message }),
+      timeout,
+    ])) as { sid?: string };
+    return { ok: true, providerId: msg.sid };
+  } catch (err) {
+    // Twilio REST errors carry an HTTP status: 4xx permanent, 5xx retryable.
+    // Network/SDK errors carry no status → retryable.
+    const status =
+      typeof (err as { status?: unknown })?.status === "number"
+        ? (err as { status: number }).status
+        : undefined;
+    return {
+      ok: false,
+      status,
+      error: err instanceof Error ? err.message : String(err),
+      permanent: status != null && status >= 400 && status < 500,
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * SMS delivery with provider transports ("twilio" default when Twilio creds
+ * exist; "crazytel" = the Asterisk SmsService HTTP port), upgraded with:
+ *   - per-attempt timeout so a hung provider can't wedge the session engine;
+ *   - retry with exponential backoff on network errors and 5xx (transient
+ *     provider faults); 4xx is a permanent config problem → no retry;
+ *   - delivery audit: the provider's message id/SID is captured into the
+ *     SMS_SENT event so every outbound text is traceable end-to-end.
+ */
 export async function deliverSms(
-  cfg: {
-    baseUrl: string;
-    token: string;
-    from: string;
-    maxAttempts: number;
-    timeoutMs: number;
-  },
+  cfg: SmsTransportCfg,
   to: string,
   message: string,
 ): Promise<SmsDeliveryResult> {
-  const body = JSON.stringify({ to, from: cfg.from, message });
+  const transport = cfg.provider === "twilio" ? sendViaTwilio : sendViaCrazytel;
   let last: SmsDeliveryResult = { ok: false, error: "no attempt made" };
   for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
-    try {
-      const res = await fetch(cfg.baseUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          // SmsService.java: .header("Authorization", "Bearer " + props.getToken())
-          Authorization: `Bearer ${cfg.token}`,
-        },
-        body,
-        signal: controller.signal,
-      });
-      const text = await res.text().catch(() => "");
-      if (res.ok) {
-        let providerId: string | undefined;
-        try {
-          const j = JSON.parse(text) as Record<string, unknown>;
-          const id = j.id ?? j.messageId ?? j.message_id ?? j.reference;
-          if (id != null) providerId = String(id);
-        } catch {
-          // non-JSON success body — fine, delivery still confirmed by 2xx
-        }
-        return { ok: true, status: res.status, providerId };
-      }
-      last = { ok: false, status: res.status, error: text.slice(0, 200) };
-      // 4xx = permanent (bad token/number/payload) — retrying cannot help.
-      if (res.status >= 400 && res.status < 500) return last;
-    } catch (err) {
-      last = {
-        ok: false,
-        error:
-          controller.signal.aborted
-            ? `timeout after ${cfg.timeoutMs}ms`
-            : err instanceof Error
-              ? err.message
-              : String(err),
-      };
-    } finally {
-      clearTimeout(timer);
-    }
+    const r = await transport(cfg, to, message);
+    if (r.ok) return r;
+    last = r;
+    if (r.permanent) return last;
     if (attempt < cfg.maxAttempts) {
       // Backoff: 800ms, 1600ms, 3200ms, … (capped at 4s)
-      await new Promise((r) => setTimeout(r, Math.min(800 * 2 ** (attempt - 1), 4000)));
+      await new Promise((res) => setTimeout(res, Math.min(800 * 2 ** (attempt - 1), 4000)));
     }
   }
   return last;
@@ -2604,8 +2678,16 @@ async function sendSmsOnce(
   await logEvent(session.sessionId, "SMS_QUEUED", `trigger=${trigger} to=${session.calleeNumber}`);
 
   const cfg = smsCfg();
-  if (!cfg.enabled || !cfg.token) {
-    await logEvent(session.sessionId, "SMS_SKIPPED", "SMS disabled or missing SMS_API_TOKEN");
+  const providerReady =
+    cfg.provider === "twilio" ? twilioRestConfigured() : Boolean(cfg.token);
+  if (!cfg.enabled || !providerReady) {
+    await logEvent(
+      session.sessionId,
+      "SMS_SKIPPED",
+      cfg.enabled
+        ? `SMS provider credentials missing (provider=${cfg.provider})`
+        : "SMS disabled",
+    );
     return;
   }
 
@@ -2633,7 +2715,7 @@ async function sendSmsOnce(
     await logEvent(
       session.sessionId,
       "SMS_SENT",
-      `to=${session.calleeNumber} template=${priorFailures > 0 ? "repeat" : confirmed ? "confirmed" : "hangup"}${result.providerId ? ` providerId=${result.providerId}` : ""}`,
+      `to=${session.calleeNumber} via=${cfg.provider} template=${priorFailures > 0 ? "repeat" : confirmed ? "confirmed" : "hangup"}${result.providerId ? ` providerId=${result.providerId}` : ""}`,
     ).catch(() => {});
   } else {
     console.error(`[verify] SMS_FAILED to=${session.calleeNumber}`, result.error);
@@ -2735,9 +2817,11 @@ export async function handleInboundSms(fromRaw: string, text: string): Promise<s
   }
 
   const cfg = smsCfg();
-  if (!cfg.enabled || !cfg.token) {
+  const providerReady =
+    cfg.provider === "twilio" ? twilioRestConfigured() : Boolean(cfg.token);
+  if (!cfg.enabled || !providerReady) {
     if (session) {
-      await logEvent(session.sessionId, "SMS_SKIPPED", "inbound reply — SMS disabled or missing SMS_API_TOKEN");
+      await logEvent(session.sessionId, "SMS_SKIPPED", `inbound reply — SMS disabled or provider credentials missing (provider=${cfg.provider})`);
     }
     return "sms-disabled";
   }

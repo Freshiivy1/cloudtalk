@@ -1082,44 +1082,93 @@ export async function verificationGatherHandler(c: Context) {
 }
 
 /**
- * POST /api/verify/sms/inbound — Crazytel Virtual Mobile Number "JSON Web
- * Request" webhook (two-way AI SMS — the upgrade the Asterisk version never
- * had). Crazytel posts JSON {"from":"+614…","to":"+614…","text":"iphone 13"};
- * we answer with a model-specific call-waiting walkthrough (see
- * vs.handleInboundSms). Form-encoded posts are tolerated as a fallback.
+ * POST /api/verify/sms/inbound — inbound SMS webhook for the two-way AI SMS
+ * reply channel (the upgrade the Asterisk version never had). Two provider
+ * formats are accepted:
+ *   - Twilio (default): the number's "A message comes in" webhook — form posts
+ *     with From/To/Body, optionally signed (X-Twilio-Signature);
+ *   - Crazytel: Virtual Mobile Number "JSON Web Request" — JSON
+ *     {"from":"+614…","to":"+614…","text":"iphone 13"}.
+ * The reply itself is a model-specific call-waiting walkthrough (see
+ * vs.handleInboundSms).
  *
- * Auth: the provider cannot sign requests, so when SMS_INBOUND_TOKEN is
- * configured the ?token= query must match (shared-secret URL). Always returns
- * 200 on processing errors so the provider doesn't retry-storm us.
+ * Auth (first match wins):
+ *   1. SMS_INBOUND_TOKEN set → ?token= query must match (works for both
+ *      providers — put the token in the webhook URL you give them);
+ *   2. otherwise, an X-Twilio-Signature header is cryptographically validated
+ *      against the request URL + form params (invalid → 403);
+ *   3. otherwise the request is accepted unsigned (Crazytel cannot sign).
+ * Processing errors always return 200 so providers don't retry-storm us.
  */
 export async function verificationSmsInboundHandler(c: Context) {
-  const expected = process.env.SMS_INBOUND_TOKEN;
-  if (expected && c.req.query("token") !== expected) {
-    return c.json({ ok: false, error: "unauthorized" }, 401);
-  }
+  // 1) Parse (JSON = Crazytel; form = Twilio). Hono caches the body, so the
+  //    parsed form is reused for signature validation below.
   let from = "";
   let text = "";
-  try {
-    const body = (await c.req.json()) as { from?: string; text?: string; message?: string };
-    from = String(body.from ?? "");
-    text = String(body.text ?? body.message ?? "");
-  } catch {
+  let formParams: Record<string, string> | null = null;
+  if ((c.req.header("Content-Type") ?? "").includes("application/json")) {
+    try {
+      const body = (await c.req.json()) as { from?: string; text?: string; message?: string };
+      from = String(body.from ?? "");
+      text = String(body.text ?? body.message ?? "");
+    } catch {
+      /* fall through to validation */
+    }
+  } else {
     try {
       const form = await c.req.parseBody();
-      from = String(form.from ?? "");
-      text = String(form.text ?? form.message ?? "");
+      formParams = {};
+      for (const [k, v] of Object.entries(form)) {
+        if (typeof v === "string") formParams[k] = v;
+      }
+      // Twilio posts capitalised From/Body; Crazytel-style forms use lowercase.
+      from = String(form.From ?? form.from ?? "");
+      text = String(form.Body ?? form.text ?? form.message ?? "");
     } catch {
       /* fall through to validation */
     }
   }
+
+  // 2) Auth
+  const expected = process.env.SMS_INBOUND_TOKEN;
+  if (expected) {
+    if (c.req.query("token") !== expected) {
+      return c.json({ ok: false, error: "unauthorized" }, 401);
+    }
+  } else {
+    const sig = c.req.header("X-Twilio-Signature");
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const base = process.env.PUBLIC_BASE_URL;
+    if (sig && authToken && base) {
+      const raw = new URL(c.req.url);
+      const url = `${base.replace(/\/$/, "")}${raw.pathname}${raw.search}`;
+      if (!twilio.validateRequest(authToken, sig, url, formParams ?? {})) {
+        return c.json({ ok: false, error: "invalid signature" }, 403);
+      }
+    }
+  }
+
+  // 3) Validate + handle
   if (!from || !text) {
     return c.json({ ok: false, error: "missing from/text" }, 400);
   }
   try {
     const result = await vs.handleInboundSms(from, text);
+    // Twilio expects TwiML; an empty <Response/> means "no auto-reply SMS"
+    // (we reply ourselves via REST). JSON keeps Crazytel/simple probes happy.
+    if (formParams) {
+      return c.body("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>", 200, {
+        "Content-Type": "application/xml",
+      });
+    }
     return c.json({ ok: true, result });
   } catch (err) {
     console.error("[verify] SMS_INBOUND_ERROR", err);
+    if (formParams) {
+      return c.body("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>", 200, {
+        "Content-Type": "application/xml",
+      });
+    }
     return c.json({ ok: false, error: "internal" }, 200);
   }
 }
