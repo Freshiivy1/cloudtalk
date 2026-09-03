@@ -22,6 +22,7 @@
 import type { Server as HttpServer, IncomingMessage } from "http";
 import type { Duplex } from "stream";
 import type { Context } from "hono";
+import { createHmac } from "crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import * as vs from "./verification";
 import { getTwilioClient } from "./twilio-voice";
@@ -30,21 +31,57 @@ import { HoldDetector } from "./relayguard/hold-detector";
 import { analyzeClip } from "./relayguard/features";
 import { compareVoicePanel } from "./relayguard/voice";
 
+/* -------------------------------------------------------------------------- */
+/* Cross-service contract (cloudtalk ↔ merge relay)                             */
+/* -------------------------------------------------------------------------- */
+
+/** Shared-secret check used by every relay → cloudtalk callback. */
+function relayAuthorized(c: Context): boolean {
+  const secret = process.env.VERIFY_STREAM_SECRET;
+  return Boolean(secret) && c.req.header("x-verify-secret") === secret;
+}
+
 /**
- * POST /api/verify/stream-detected?sid=… — called by the EXTERNAL relay
- * service (see relay/ folder) when its real-time Goertzel detector fires.
- * This is the sub-0.5s merge-detection path: the relay hosts the WebSocket
- * (this platform blocks WS), detects the tone in ~300ms of live audio, and
- * posts here. Protected by the VERIFY_STREAM_SECRET shared secret.
+ * Per-session stream token placed in Leg B's <Start><Stream> as
+ * <Parameter name="token">: hex(HMAC-SHA256(key=VERIFY_STREAM_SECRET,
+ * message="merge-relay-stream:" + sid)). The relay recomputes it and rejects
+ * missing/invalid tokens with WS close 4403. The raw secret never travels
+ * inside TwiML.
+ */
+export function streamToken(sessionId: string): string {
+  const secret = process.env.VERIFY_STREAM_SECRET ?? "";
+  return createHmac("sha256", secret)
+    .update(`merge-relay-stream:${sessionId}`)
+    .digest("hex");
+}
+
+/**
+ * POST /api/verify/stream-detected — relay callback: the detector fired.
+ * JSON body { sid, verdict: "MERGE_DETECTED", phase: "PROMPT_LIGHT" |
+ * "LOUD_DTMF", detectedAt, evidence }. Both phases are independent and final:
+ * Phase 1 fired only on prompt fingerprint AND overlapping light DTMF, Phase
+ * 2 on the loud tone alone — cloudtalk trusts the relay's phase decision and
+ * applies the standard merge verdict + teardown. Idempotent via the
+ * terminal-state guard in onMergeDetected.
  */
 export async function verificationStreamDetectedHandler(c: Context) {
-  const secret = process.env.VERIFY_STREAM_SECRET;
-  if (!secret || c.req.header("x-verify-secret") !== secret) {
-    return c.text("forbidden", 403);
+  if (!relayAuthorized(c)) return c.text("forbidden", 403);
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    /* sid may still arrive via the legacy query param */
   }
-  const sid = c.req.query("sid") ?? "";
+  const sid = String(body.sid ?? c.req.query("sid") ?? "");
   if (!sid) return c.text("ok", 200);
   try {
+    const phase = String(body.phase ?? "");
+    const evidence = body.evidence ? JSON.stringify(body.evidence) : "";
+    await vs.logEvent(
+      sid,
+      "STREAM_DETECTED_CALLBACK",
+      `phase=${phase || "n/a"} detectedAt=${String(body.detectedAt ?? "")} evidence=${evidence}`.slice(0, 512),
+    );
     await fireMergeDetected(sid);
   } catch (err) {
     console.error("[verify-stream] callback fire error:", err);
@@ -52,23 +89,161 @@ export async function verificationStreamDetectedHandler(c: Context) {
   return c.text("ok", 200);
 }
 
-/** wss:// URL for the external relay, or null when not configured. */
-export function relayStreamUrl(sessionId: string): string | null {
-  const u = process.env.VERIFY_STREAM_URL?.trim();
-  if (!u || !/^wss:\/\//.test(u)) return null;
-  return `${u}${u.includes("?") ? "&" : "?"}sid=${sessionId}`;
+/**
+ * POST /api/verify/stream-ready — relay callback: the Leg B inbound stream
+ * is live and the detector armed. Body { sid, streamSid, readyAt }. The Leg A
+ * challenge starts ONLY here (vs.onStreamReady). When the challenge cannot be
+ * started (e.g. the Leg A redirect failed) we answer 500 so the relay's
+ * bounded retry delivers it again — no silent success.
+ */
+export async function verificationStreamReadyHandler(c: Context) {
+  if (!relayAuthorized(c)) return c.text("forbidden", 403);
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    return c.json({ ok: false, error: "invalid JSON body" }, 400);
+  }
+  const sid = String(body.sid ?? "");
+  if (!sid) return c.json({ ok: false, error: "missing sid" }, 400);
+  try {
+    const r = await vs.onStreamReady(
+      sid,
+      String(body.streamSid ?? ""),
+      body.readyAt ? String(body.readyAt) : undefined,
+    );
+    if (!r.ok) {
+      return c.json({ ok: false, error: r.reason }, 500);
+    }
+    return c.json({ ok: true, reason: r.reason }, 200);
+  } catch (err) {
+    console.error("[verify-stream] stream-ready handler error:", err);
+    return c.json({ ok: false, error: "internal" }, 500);
+  }
 }
 
 /**
- * HTTPS URL of the relay's /arm endpoint (derived from VERIFY_STREAM_URL).
- * The app POSTs {sid, legA} here when originating Leg B so the relay can
- * speak the verdict in-band and tear down Leg A the instant the merge tone
- * fires — the sub-0.5s path needs no Twilio REST round-trip.
+ * POST /api/verify/stream-failed — relay callback: the stream/detector
+ * failed, timed out, or stopped before a verdict. Body { sid, verdict:
+ * "DETECTION_FAILED" | "DETECTION_INCONCLUSIVE", reason, failedAt }. The
+ * outcome is NEVER a pass.
  */
-export function relayArmUrl(): string | null {
+export async function verificationStreamFailedHandler(c: Context) {
+  if (!relayAuthorized(c)) return c.text("forbidden", 403);
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    return c.json({ ok: false, error: "invalid JSON body" }, 400);
+  }
+  const sid = String(body.sid ?? "");
+  if (!sid) return c.json({ ok: false, error: "missing sid" }, 400);
+  const verdict =
+    String(body.verdict ?? "") === "DETECTION_INCONCLUSIVE"
+      ? ("DETECTION_INCONCLUSIVE" as const)
+      : ("DETECTION_FAILED" as const);
+  const reason = String(body.reason ?? "relay reported stream failure").slice(0, 400);
+  try {
+    await vs.onStreamFailed(sid, verdict, reason);
+  } catch (err) {
+    console.error("[verify-stream] stream-failed handler error:", err);
+  }
+  // Always 200 once authenticated: the terminal state is idempotent, and a
+  // 4xx/5xx would only trigger pointless retries of an already-final outcome.
+  return c.json({ ok: true }, 200);
+}
+
+/** True when the external merge relay is configured (VERIFY_STREAM_URL). */
+export function relayConfigured(): boolean {
+  const u = process.env.VERIFY_STREAM_URL?.trim();
+  return Boolean(u && /^wss:\/\//.test(u));
+}
+
+/**
+ * wss:// URL for the external relay, or null when not configured. The stream
+ * identity travels EXCLUSIVELY in <Start><Stream> customParameters (sid, leg,
+ * mode, token) — no query-string session id is added or relied upon.
+ */
+export function relayStreamUrl(): string | null {
   const u = process.env.VERIFY_STREAM_URL?.trim();
   if (!u || !/^wss:\/\//.test(u)) return null;
-  return `${u.replace(/^wss:\/\//, "https://").replace(/[/?].*$/, "")}/arm`;
+  return u;
+}
+
+/** HTTPS base of the relay (derived from VERIFY_STREAM_URL). */
+function relayHttpBase(): string | null {
+  const u = process.env.VERIFY_STREAM_URL?.trim();
+  if (!u || !/^wss:\/\//.test(u)) return null;
+  return u.replace(/^wss:\/\//, "https://").replace(/[/?].*$/, "");
+}
+
+/**
+ * HTTPS URL of the relay's /arm endpoint. The app POSTs
+ * { sid, legA, legB, mode, tone: { low: 852, high: 1336 },
+ *   promptLightDurationMs, promptEndsAt } here when originating Leg B.
+ */
+export function relayArmUrl(): string | null {
+  const base = relayHttpBase();
+  return base ? `${base}/arm` : null;
+}
+
+/** HTTPS URL of the relay's /challenge-start endpoint. */
+export function relayChallengeStartUrl(): string | null {
+  const base = relayHttpBase();
+  return base ? `${base}/challenge-start` : null;
+}
+
+export interface RelayPostResult {
+  ok: boolean;
+  status?: number;
+  error?: string;
+}
+
+/**
+ * Authenticated JSON POST to the relay with a per-attempt timeout and bounded
+ * retries with backoff. 4xx is permanent (no retry); network errors, timeouts
+ * and 5xx are retried. Never throws — the caller decides what a failure means
+ * (and it must never become a silent success).
+ */
+export async function postRelayJson(
+  url: string,
+  body: unknown,
+  opts: { attempts?: number; timeoutMs?: number } = {},
+): Promise<RelayPostResult> {
+  const secret = process.env.VERIFY_STREAM_SECRET ?? "";
+  const attempts = Math.max(1, Math.min(opts.attempts ?? 2, 5));
+  const timeoutMs = opts.timeoutMs ?? 5_000;
+  let last: RelayPostResult = { ok: false, error: "no attempt made" };
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": secret },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (res.ok) return { ok: true, status: res.status };
+      last = { ok: false, status: res.status, error: (await res.text().catch(() => "")).slice(0, 200) };
+      if (res.status >= 400 && res.status < 500) return last; // permanent
+    } catch (err) {
+      last = {
+        ok: false,
+        error: controller.signal.aborted
+          ? `timeout after ${timeoutMs}ms`
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt < attempts) {
+      await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 2000)));
+    }
+  }
+  return last;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -479,7 +654,7 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       analyzers?.sp.push(msg.media.payload);
       if (analyzers) {
         analyzers.hold.push(msg.media.payload);
-        // D2: event-driven bridge sync — maybeBridgeGuarded() flips an
+        // D2: event-driven bridge sync — bridgeGuardedLive() flips an
         // in-process registry flag SYNCHRONOUSLY with the bridge, so the
         // detectors see BRIDGED on the very next media frame (not the next
         // DB poll below) and the forensic warm-up starts immediately.

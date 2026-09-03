@@ -22,6 +22,7 @@ import { and, desc, eq, gt, lt, ne, notInArray, or } from "drizzle-orm";
 import * as schema from "@db/schema";
 import type { VerificationSession } from "@db/schema";
 import type { ClipProfile } from "./relayguard/features";
+import { PROMPT_LIGHT_DURATION_MS } from "./generated/prompt-light-asset";
 import { getDb } from "./queries/connection";
 import {
   getTwilioClient,
@@ -54,6 +55,19 @@ export const VState = {
   MERGE_DETECTED: "MERGE_DETECTED",
   VOIP_DETECTED: "VOIP_DETECTED",
   CALL_WAITING_OFF: "CALL_WAITING_OFF",
+  /**
+   * The merge-detection pipeline itself failed (stream error/timeout, missing
+   * readiness, arm/challenge-start callback failure after retry, relay
+   * detector failure). NEVER a pass — an unmonitored call is not a verified
+   * call.
+   */
+  DETECTION_FAILED: "DETECTION_FAILED",
+  /**
+   * The call ran or ended without a verified live outcome (stream never
+   * became ready, canary lost, Leg B ended before monitoring was confirmed).
+   * NEVER a pass.
+   */
+  DETECTION_INCONCLUSIVE: "DETECTION_INCONCLUSIVE",
   FAILED: "FAILED",
 } as const;
 export type VerificationState = (typeof VState)[keyof typeof VState];
@@ -63,6 +77,8 @@ export const TERMINAL_STATES: readonly VerificationState[] = [
   VState.MERGE_DETECTED,
   VState.VOIP_DETECTED,
   VState.CALL_WAITING_OFF,
+  VState.DETECTION_FAILED,
+  VState.DETECTION_INCONCLUSIVE,
   VState.FAILED,
 ];
 
@@ -75,14 +91,31 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
   // voicemail verdict can legitimately arrive before the callee finishes the
   // voice-ID step. Guarded sessions now use the same second-call verification
   // path as the legacy flow and only bridge after LEG_B_ANSWERED + merge watch.
-  LEG_A_DIALING: [VState.CALL_ACCEPTED, VState.CALL_WAITING_OFF, VState.FAILED],
-  CALL_ACCEPTED: [VState.CALLEE_READY, VState.CALL_WAITING_OFF, VState.FAILED],
-  CALLEE_READY: [VState.LEG_B_DIALING, VState.CALL_WAITING_OFF, VState.FAILED],
+  LEG_A_DIALING: [
+    VState.CALL_ACCEPTED,
+    VState.CALL_WAITING_OFF,
+    VState.DETECTION_FAILED,
+    VState.FAILED,
+  ],
+  CALL_ACCEPTED: [
+    VState.CALLEE_READY,
+    VState.CALL_WAITING_OFF,
+    VState.DETECTION_FAILED,
+    VState.FAILED,
+  ],
+  CALLEE_READY: [
+    VState.LEG_B_DIALING,
+    VState.CALL_WAITING_OFF,
+    VState.DETECTION_FAILED,
+    VState.FAILED,
+  ],
   LEG_B_DIALING: [
     VState.LEG_B_ANSWERED,
     VState.VOIP_DETECTED,
     VState.CALL_WAITING_OFF,
     VState.COMPLETED,
+    VState.DETECTION_FAILED,
+    VState.DETECTION_INCONCLUSIVE,
     VState.FAILED,
   ],
   LEG_B_ANSWERED: [
@@ -91,6 +124,8 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
     VState.MERGE_DETECTED,
     VState.VOIP_DETECTED,
     VState.CALL_WAITING_OFF,
+    VState.DETECTION_FAILED,
+    VState.DETECTION_INCONCLUSIVE,
     VState.FAILED,
   ],
   // Post-bridge merge/voip detection via the media-stream path keeps the
@@ -99,12 +134,16 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
     VState.COMPLETED,
     VState.MERGE_DETECTED,
     VState.VOIP_DETECTED,
+    VState.DETECTION_FAILED,
+    VState.DETECTION_INCONCLUSIVE,
     VState.FAILED,
   ],
   COMPLETED: [],
   MERGE_DETECTED: [],
   VOIP_DETECTED: [],
   CALL_WAITING_OFF: [],
+  DETECTION_FAILED: [],
+  DETECTION_INCONCLUSIVE: [],
   FAILED: [],
 };
 
@@ -112,11 +151,13 @@ export type VerifyLeg = "caller" | "legA" | "legB" | "ringTest";
 
 const SMS_WINDOW_SECONDS = 15;
 /**
- * The merge-test tone on Leg A is ONE continuous in-band DTMF stream of this
- * digit (852+1336 Hz for '9'). Leg B's silent <Gather numDigits=1> fires the
- * instant it leaks across a merge — single digit, no inter-digit delay.
+ * The merge-test tone is the existing merge-tone pair 852 Hz + 1336 Hz — that
+ * is DTMF digit '8' (852 Hz row, 1336 Hz column), NOT '9' (which would be
+ * 852+1477). Frequencies are unchanged; only the naming is corrected. Leg B's
+ * silent <Gather numDigits=1> (legacy path) fires the instant it leaks across
+ * a merge — single digit, no inter-digit delay.
  */
-export const MERGE_TONE_DIGIT = "9";
+export const MERGE_TONE_DIGIT = "8";
 const STALE_TIMEOUT_MS = 10 * 60 * 1000; // mirrors StaleSessionCleanupJob (10min)
 /** Guarded INITIATED sessions whose caller SDK call never arrived (2min). */
 const GUARDED_CALLER_TIMEOUT_MS = 2 * 60 * 1000;
@@ -131,37 +172,83 @@ const GUARDED_CALLER_TIMEOUT_MS = 2 * 60 * 1000;
  */
 const pendingLegBAnswer = new Map<string, string>();
 
+/* -------------------------------------------------------------------------- */
+/* Two-phase Call Waiting challenge (corrected architecture)                    */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Merge-detection watch window (ms). A GUARDED session is deemed PASSED —
- * and the live bridge is allowed — only after Leg B was answered by a human
- * (LEG_B_ANSWERED: the callee's line did NOT take the second call, so it is
- * a single cellular line) AND this much time has elapsed with no merge-tone
- * leak. The engine otherwise has no "no merge" pass point (COMPLETED only
- * fires when Leg B hangs up), so this window defines it cleanly.
- * Env-overridable via VERIFY_MERGE_WATCH_MS (mainly for tests).
- *
- * Default 60s: the callee must be able to reach their phone's merge button
- * and have the tone leak across BEFORE the watch elapses — 15s proved too
- * short in live testing (the bridge fired and the second call became
- * irrelevant before a merge could be attempted). The tone keeps playing on
- * Leg A for the whole window; a detected merge still terminates everything
- * within ~3-4s.
+ * Detection phases, persisted on verification_sessions.detectionPhase so a
+ * restart can reconstruct where the challenge stood without process memory.
+ *  - AWAITING_STREAM_READY: Leg B answered; the relay has not yet confirmed
+ *    the inbound stream. Missing readiness by streamReadyBy is
+ *    DETECTION_FAILED — never a silent pass.
+ *  - PROMPT_LIGHT: Phase 1 — Leg A plays the prompt-light asset (speech +
+ *    attenuated 852+1336 Hz watermark). A merge is detected by prompt
+ *    fingerprint AND overlapping light DTMF.
+ *  - LOUD_DTMF: Phase 2 — Leg A loops the existing loud verify-tone.wav; the
+ *    relay's existing loud Goertzel detector alone is decisive.
  */
-export function mergeWatchMs(): number {
-  const v = Number(process.env.VERIFY_MERGE_WATCH_MS);
-  return Number.isFinite(v) && v >= 0 ? v : 60_000;
+export const DetectionPhase = {
+  AWAITING_STREAM_READY: "AWAITING_STREAM_READY",
+  PROMPT_LIGHT: "PROMPT_LIGHT",
+  LOUD_DTMF: "LOUD_DTMF",
+} as const;
+export type DetectionPhaseValue = (typeof DetectionPhase)[keyof typeof DetectionPhase];
+
+/**
+ * Readiness deadline (ms) after Leg B answers. If the relay's stream-ready
+ * callback has not arrived by then, the session is DETECTION_FAILED (missing
+ * readiness) — a live call without monitoring is never allowed to continue.
+ * Env-overridable via VERIFY_STREAM_READY_TIMEOUT_MS (mainly for tests).
+ */
+export function streamReadyTimeoutMs(): number {
+  const v = Number(process.env.VERIFY_STREAM_READY_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 15_000;
 }
 
 /**
- * In-process record of when the merge watch was armed per session (LEG_B_
- * ANSWERED). Short-lived, mirrors the pendingLegBAnswer pattern. Used by the
- * leg-a-tone TwiML poll fallback so the bridge also happens on runtimes
- * where setTimeout callbacks are not guaranteed to run.
+ * Tolerance (ms) added to promptEndsAt before the LOUD_DTMF phase is
+ * considered active. Env-overridable via VERIFY_TRANSITION_TOLERANCE_MS.
  */
-const mergeWatchArmedAt = new Map<string, number>();
+export function transitionToleranceMs(): number {
+  const v = Number(process.env.VERIFY_TRANSITION_TOLERANCE_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 1_000;
+}
 
 /**
- * D2: event-driven BRIDGED notification registry. maybeBridgeGuarded() sets
+ * The phase the challenge is in RIGHT NOW, derived from the persisted
+ * timestamps (restart-safe — no process memory involved). Returns null when
+ * no challenge has started.
+ */
+export function currentDetectionPhase(
+  session: Pick<
+    VerificationSession,
+    "challengeStartedAt" | "promptEndsAt" | "detectionPhase"
+  >,
+): DetectionPhaseValue | null {
+  if (!session.challengeStartedAt) {
+    return session.detectionPhase === DetectionPhase.AWAITING_STREAM_READY
+      ? DetectionPhase.AWAITING_STREAM_READY
+      : null;
+  }
+  if (session.promptEndsAt) {
+    const endsAt = new Date(session.promptEndsAt).getTime() + transitionToleranceMs();
+    return Date.now() < endsAt
+      ? DetectionPhase.PROMPT_LIGHT
+      : DetectionPhase.LOUD_DTMF;
+  }
+  return (session.detectionPhase as DetectionPhaseValue | null) ?? null;
+}
+
+/** True when the session's merge detection was confirmed live (stream ready). */
+export function detectionIsLive(
+  session: Pick<VerificationSession, "streamReadyAt" | "challengeStartedAt">,
+): boolean {
+  return Boolean(session.streamReadyAt && session.challengeStartedAt);
+}
+
+/**
+ * D2: event-driven BRIDGED notification registry. bridgeGuardedLive() sets
  * the flag SYNCHRONOUSLY on the successful LEG_B_ANSWERED → BRIDGED
  * transition, so the media-stream analyzer path (verification-stream.ts)
  * sees the bridge on the very next audio window instead of waiting for the
@@ -686,7 +773,7 @@ export async function onVoiceMismatch(sessionId: string, detail: string): Promis
  */
 function cleanupSessionMaps(sessionId: string): void {
   pendingLegBAnswer.delete(sessionId);
-  mergeWatchArmedAt.delete(sessionId);
+  clearReadinessTimer(sessionId);
   bridgedSessions.delete(sessionId);
   noiseInjectionCount.delete(sessionId);
   lastNoiseEventAt.delete(sessionId);
@@ -733,14 +820,16 @@ export function twimlUrl(kind: string, sessionId: string): string {
 }
 
 /**
- * Guarded live-bridge TwiML URL. The `leg` param tells the webhook which
- * conference ROLE to serve: Leg A is the ANCHOR (startConferenceOnEnter:
- * true — the conference exists the moment the callee enters), the caller is
- * the JOINER (false — it can never spawn a duplicate same-name conference,
- * the classic Twilio race that strands both parties alone in silence; if the
- * caller arrives first it simply waits in the lobby for the anchor).
+ * Live-bridge TwiML URL. The `leg` param tells the webhook which conference
+ * ROLE to serve (corrected architecture): Leg B (the callee's live leg) is
+ * the ANCHOR (startConferenceOnEnter: true — the conference exists the moment
+ * the callee enters), the browser caller is the JOINER (false — it can never
+ * spawn a duplicate same-name conference, the classic Twilio race that
+ * strands both parties alone in silence; if the caller arrives first it
+ * simply waits in the lobby for the anchor). Leg A is the Call Waiting
+ * canary and NEVER joins the conference.
  */
-export function bridgeUrl(sessionId: string, leg: "caller" | "legA"): string {
+export function bridgeUrl(sessionId: string, leg: "caller" | "legA" | "legB"): string {
   return `${twimlUrl("guarded-bridge", sessionId)}&leg=${leg}`;
 }
 
@@ -1034,6 +1123,14 @@ async function save(session: VerificationSession): Promise<void> {
       bridgeRecordingUrl: session.bridgeRecordingUrl,
       bridgeRecordingDurationSec: session.bridgeRecordingDurationSec,
       bridgeRecordedAt: session.bridgeRecordedAt,
+      // Two-phase challenge readiness/phase (restart-safe persistence).
+      streamSid: session.streamSid,
+      streamReadyAt: session.streamReadyAt,
+      streamReadyBy: session.streamReadyBy,
+      challengeStartedAt: session.challengeStartedAt,
+      promptLightDurationMs: session.promptLightDurationMs,
+      promptEndsAt: session.promptEndsAt,
+      detectionPhase: session.detectionPhase,
     })
     .where(eq(schema.verificationSessions.sessionId, session.sessionId));
 }
@@ -1093,21 +1190,13 @@ async function originate(
     console.log(
       `[verify] ORIGINATE leg=${leg} to=${number} sid=${call.sid} session=${session.sessionId}`,
     );
-    // Duplex verdict path: when Leg B's TwiML opens a <Connect><Stream> to the
-    // relay, arm the relay with this session's Leg A callSid so the instant
-    // the merge tone fires, the relay can speak the verdict into Leg B AND
-    // tear down Leg A with zero extra round-trips.
+    // Arm the merge relay for Leg B's inbound-only detection stream. The arm
+    // call is authenticated (x-verify-secret), retried once, and a failure is
+    // OBSERVABLE (RELAY_ARM_FAILED event) — it prevents silent success because
+    // the readiness deadline (streamReadyBy, set at Leg B answer) turns a
+    // missing stream-ready into DETECTION_FAILED.
     if (leg === "legB") {
-      const { relayArmUrl } = await import("./verification-stream");
-      const armUrl = relayArmUrl();
-      const secret = process.env.VERIFY_STREAM_SECRET;
-      if (armUrl && secret) {
-        fetch(armUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-verify-secret": secret },
-          body: JSON.stringify({ sid: session.sessionId, legA: session.legACallSid ?? "" }),
-        }).catch((err) => console.error("[verify] relay arm failed:", err));
-      }
+      await armRelay(session, call.sid);
     }
     return call.sid;
   } catch (err) {
@@ -1143,6 +1232,136 @@ async function liveConferenceSid(sessionId: string): Promise<string | null> {
     );
     return null;
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Relay control channel (cloudtalk → relay): /arm + /challenge-start           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST the relay /arm contract:
+ *   { sid, legA, legB, mode: "merge-detection",
+ *     tone: { low: 852, high: 1336 }, promptLightDurationMs, promptEndsAt }
+ * promptEndsAt is null at arm time — the challenge only starts after the
+ * relay's stream-ready callback, at which point /challenge-start carries the
+ * exact timestamps. One retry on transient failure; a non-2xx/timeout final
+ * result logs RELAY_ARM_FAILED (observable) and the readiness deadline still
+ * guarantees no silent success.
+ */
+async function armRelay(
+  session: VerificationSession,
+  legBCallSid: string,
+): Promise<boolean> {
+  const { relayArmUrl, postRelayJson } = await import("./verification-stream");
+  const url = relayArmUrl();
+  if (!url) return false; // relay not configured — Leg B TwiML path fails closed
+  const body = {
+    sid: session.sessionId,
+    legA: session.legACallSid ?? "",
+    legB: legBCallSid,
+    mode: "merge-detection",
+    // Existing merge-tone pair = DTMF-8 (852 Hz row + 1336 Hz column).
+    tone: { low: 852, high: 1336 },
+    promptLightDurationMs: PROMPT_LIGHT_DURATION_MS,
+    promptEndsAt: null,
+  };
+  const r = await postRelayJson(url, body, { attempts: 2 });
+  if (!r.ok) {
+    console.error(
+      `[verify] RELAY_ARM_FAILED session=${session.sessionId} status=${r.status ?? "n/a"} err=${r.error ?? ""}`,
+    );
+    await logEvent(
+      session.sessionId,
+      "RELAY_ARM_FAILED",
+      `status=${r.status ?? "n/a"} ${r.error ?? ""} — readiness deadline will fail the detection if the stream never becomes ready`.slice(0, 512),
+    ).catch(() => {});
+  }
+  return r.ok;
+}
+
+/**
+ * POST the relay /challenge-start contract after stream-ready:
+ *   { sid, challengeStartedAt, promptLightDurationMs, promptEndsAt,
+ *     transitionToleranceMs }
+ * The relay persists this and reconstructs the phase after restart. Bounded
+ * retries with backoff; a final failure is a callback failure after retry →
+ * the caller turns it into DETECTION_FAILED (never a pass).
+ */
+async function sendChallengeStart(
+  session: VerificationSession,
+): Promise<boolean> {
+  const { relayChallengeStartUrl, postRelayJson } = await import(
+    "./verification-stream"
+  );
+  const url = relayChallengeStartUrl();
+  if (!url) return false;
+  const body = {
+    sid: session.sessionId,
+    challengeStartedAt: session.challengeStartedAt
+      ? new Date(session.challengeStartedAt).toISOString()
+      : null,
+    promptLightDurationMs: session.promptLightDurationMs,
+    promptEndsAt: session.promptEndsAt
+      ? new Date(session.promptEndsAt).toISOString()
+      : null,
+    transitionToleranceMs: transitionToleranceMs(),
+  };
+  const r = await postRelayJson(url, body, { attempts: 3 });
+  if (!r.ok) {
+    console.error(
+      `[verify] CHALLENGE_START_FAILED session=${session.sessionId} status=${r.status ?? "n/a"} err=${r.error ?? ""}`,
+    );
+    await logEvent(
+      session.sessionId,
+      "CHALLENGE_START_FAILED",
+      `relay /challenge-start failed after retries: status=${r.status ?? "n/a"} ${r.error ?? ""}`.slice(0, 512),
+    ).catch(() => {});
+  }
+  return r.ok;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Stream readiness watchdog (restart-safe: deadline persisted on the session)  */
+/* -------------------------------------------------------------------------- */
+
+/** In-process readiness timers (the DB deadline is the restart-safe truth). */
+const readinessTimers = new Map<string, NodeJS.Timeout>();
+
+function clearReadinessTimer(sessionId: string): void {
+  const t = readinessTimers.get(sessionId);
+  if (t) clearTimeout(t);
+  readinessTimers.delete(sessionId);
+}
+
+function scheduleReadinessWatchdog(sessionId: string): void {
+  clearReadinessTimer(sessionId);
+  const t = setTimeout(() => {
+    void checkStreamReadiness(sessionId).catch((err) =>
+      console.error("[verify] readiness watchdog error:", err),
+    );
+  }, streamReadyTimeoutMs() + 500);
+  t.unref?.();
+  readinessTimers.set(sessionId, t);
+}
+
+/**
+ * Readiness gate: if the relay's stream-ready has NOT arrived by the persisted
+ * streamReadyBy deadline the session is DETECTION_FAILED (missing readiness) —
+ * never a silent pass. Called by the in-process timer AND by the Leg A hold
+ * poll (fallback for runtimes without guaranteed background timers / after a
+ * restart). No-op once streamReadyAt is set or the session is terminal.
+ */
+export async function checkStreamReadiness(sessionId: string): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session)) return;
+  if (session.streamReadyAt) return; // ready — nothing to enforce
+  if (!session.streamReadyBy) return; // detection not armed (pre-Leg B answer)
+  if (Date.now() < new Date(session.streamReadyBy).getTime()) return;
+  await onStreamFailed(
+    sessionId,
+    "DETECTION_FAILED",
+    `stream-ready not received within ${streamReadyTimeoutMs()}ms of Leg B answer (missing readiness)`,
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1354,13 +1573,20 @@ export async function onSecondCallDisengaged(sessionId: string): Promise<void> {
   }
 }
 
+/**
+ * AMI RedirectAction equivalent — point a live call at new TwiML.
+ * Returns true on success; on failure the error is logged AND recorded as a
+ * REDIRECT_FAILED verification event so a failed redirect is always
+ * observable on the session timeline (no silent success). State transitions
+ * that depend on the redirect MUST check the return value.
+ */
 async function redirectCall(
   callSid: string | null,
   twimlKind: string,
   sessionId: string,
-  bridgeLeg?: "caller" | "legA",
-): Promise<void> {
-  if (!callSid) return;
+  bridgeLeg?: "caller" | "legA" | "legB",
+): Promise<boolean> {
+  if (!callSid) return false;
   try {
     // Bridge redirects carry the leg role so the webhook serves the right
     // conference attributes (anchor vs joiner — see bridgeUrl).
@@ -1372,8 +1598,15 @@ async function redirectCall(
       .calls(callSid)
       .update({ url, method: "POST" });
     console.log(`[verify] REDIRECT sid=${callSid} kind=${twimlKind}${bridgeLeg ? ` leg=${bridgeLeg}` : ""}`);
+    return true;
   } catch (err) {
-    console.error(`[verify] REDIRECT_FAILED sid=${callSid}`, err);
+    console.error(`[verify] REDIRECT_FAILED sid=${callSid} kind=${twimlKind}`, err);
+    await logEvent(
+      sessionId,
+      "REDIRECT_FAILED",
+      `sid=${callSid} kind=${twimlKind}${bridgeLeg ? ` leg=${bridgeLeg}` : ""} err=${err instanceof Error ? err.message : String(err)}`.slice(0, 512),
+    ).catch(() => {});
+    return false;
   }
 }
 
@@ -1777,7 +2010,17 @@ async function originateLegB(sessionId: string): Promise<void> {
   }
 }
 
-/** Leg B answered → LEG_B_ANSWERED, arm the merge test. */
+/**
+ * Leg B answered → LEG_B_ANSWERED. Corrected architecture:
+ *  - Leg B is the LIVE call: its TwiML opened the non-blocking inbound-only
+ *    <Start><Stream> (mode=merge-detection) and continues straight into
+ *    <Dial><Conference> with the browser caller.
+ *  - The readiness deadline (streamReadyBy, persisted) is armed HERE: if the
+ *    relay's stream-ready callback does not arrive in time the session is
+ *    DETECTION_FAILED — an unmonitored live call is never a pass.
+ *  - Leg A (the canary) does NOT get the challenge tone yet: Phase 1 starts
+ *    only after stream-ready (see onStreamReady).
+ */
 export async function onLegBAnswered(
   sessionId: string,
   callSid: string,
@@ -1795,8 +2038,8 @@ export async function onLegBAnswered(
 
   // With answer-time pre-origination Leg B can be answered BEFORE the callee
   // presses 1 (FSM still pre-LEG_B_DIALING). Buffer the answer — originateLegB
-  // drains it the moment the FSM reaches LEG_B_DIALING, so the tone on Leg A
-  // still only starts after the callee has accepted.
+  // drains it the moment the FSM reaches LEG_B_DIALING, so the challenge on
+  // Leg A still only starts after the callee has accepted.
   if (session.state !== VState.LEG_B_DIALING && session.state !== VState.LEG_B_ANSWERED) {
     pendingLegBAnswer.set(sessionId, callSid);
     await logEvent(
@@ -1809,148 +2052,94 @@ export async function onLegBAnswered(
 
   if (await transition(session, VState.LEG_B_ANSWERED, `Leg B answered, sid=${callSid}`)) {
     session.legBCallSid = callSid;
+    // Arm the stream-readiness deadline (persisted — restart-safe). Without a
+    // configured relay there is no detection path at all (the record-chunk
+    // fallback was removed): guarded sessions fail closed immediately, and
+    // non-guarded sessions arm the deadline anyway so a missing stream-ready
+    // becomes DETECTION_FAILED rather than a silent pass.
+    const { relayConfigured } = await import("./verification-stream");
+    if (session.guarded && !relayConfigured()) {
+      await save(session);
+      await onStreamFailed(
+        sessionId,
+        "DETECTION_FAILED",
+        "merge relay not configured (VERIFY_STREAM_URL) — cannot monitor the live call",
+      );
+      return;
+    }
+    session.streamReadyBy = new Date(Date.now() + streamReadyTimeoutMs());
+    session.detectionPhase = DetectionPhase.AWAITING_STREAM_READY;
     await save(session);
-
-    // Twilio constraint: a call inside a <Conference> cannot also run a
-    // <Gather>, so merge detection takes priority over live listen-in —
-    // Leg B STAYS in the Gather loop listening for leaked DTMF tones from
-    // Leg A (the "conference-leg-b" TwiML is kept but unused), and the
-    // caller leg stays parked on hold; when the session reaches any terminal
-    // state the caller is redirected to the matching notify-* verdict TwiML.
+    scheduleReadinessWatchdog(sessionId);
     await logEvent(
       sessionId,
-      "LEG_B_ANSWERED_NOTE",
-      "Merge-detection priority over live audio: Leg B remains in the DTMF " +
-        "Gather loop; caller hears the verdict announcement at the end " +
-        "(also shown live on the dashboard) instead of listening in.",
+      "STREAM_READINESS_ARMED",
+      `deadline=${session.streamReadyBy.toISOString()} — missing stream-ready is DETECTION_FAILED, never a pass`,
     );
 
-    // Always redirect Leg A to the DTMF tone loop — a 3-way merge leaks the
-    // tones into Leg B's <Gather> (replaces the Asterisk 1400Hz TONE_DETECT).
-    if (session.legACallSid) {
-      await redirectCall(session.legACallSid, "leg-a-tone", sessionId);
-      console.log(`[verify] Redirected Leg A to DTMF tone loop, sid=${session.legACallSid}`);
-    }
-
-    // GUARDED MODE ONLY: arm the merge-detection watch. If no merge fires
-    // within mergeWatchMs() the session has PASSED and the live bridge runs.
-    // Two triggers, both funnelling into the idempotent maybeBridgeGuarded():
-    //  1. this setTimeout (primary path on a long-lived server);
-    //  2. the leg-a-tone TwiML self-redirect loop, which polls
-    //     maybeBridgeGuarded() on every fetch (fallback for runtimes where
-    //     background timers are not guaranteed — see sweepStaleSessions).
+    // GUARDED MODE ONLY: bridge the browser caller into the live conference
+    // with Leg B immediately (Leg B's TwiML dials the conference itself as
+    // the anchor). There is no watch-window pass anymore: the call is live
+    // from this point and the two-phase canary challenge + relay detection
+    // supervise it; any detection-pipeline failure tears it down as
+    // DETECTION_FAILED / DETECTION_INCONCLUSIVE.
     if (session.guarded) {
-      mergeWatchArmedAt.set(sessionId, Date.now());
-      const watchMs = mergeWatchMs();
-      await logEvent(
-        sessionId,
-        "GUARDED_MERGE_WATCH_ARMED",
-        `merge-detection watch window=${watchMs}ms — live bridge on pass`,
-      );
-      setTimeout(() => {
-        void maybeBridgeGuarded(sessionId).catch((err) =>
-          console.error("[verify] guarded bridge timer error:", err),
-        );
-      }, watchMs).unref?.();
+      await bridgeGuardedLive(session);
     }
   }
 }
 
 /**
- * Guarded pass point: LEG_B_ANSWERED (callee accepted via press-1 AND the
- * second simultaneous call was answered by a human, i.e. call waiting works
- * and the line is cellular) + the merge-detection watch window elapsed with
- * NO merge detected. Idempotent: any later invocation is a no-op because the
- * session has left LEG_B_ANSWERED. NON-GUARDED sessions return immediately —
- * their engine behavior is bit-for-bit unchanged.
- *
- * Returns true when this call performed the bridge. When `legAInline` is
- * true the caller of this function is the leg-a-tone TwiML fetch itself and
- * serves the guarded-bridge TwiML directly — so Leg A is NOT REST-redirected
- * (a mid-fetch redirect would race the response Twilio is about to execute).
- * `force` skips the merge-watch timing checks — used when Leg B itself hung
- * up (the legacy pass signal: call completed normally, no merge leaked).
+ * GUARDED MODE ONLY: move LEG_B_ANSWERED → BRIDGED and redirect the parked
+ * browser caller into the live conference (JOINER; Leg B is the anchor and
+ * enters from its own TwiML). Registry clearing happens BEFORE the redirect
+ * so a fast participant-join callback can never be erased by a later delete.
+ * The join watchdog then PROVES both parties joined (conference status
+ * callbacks); a failed redirect is observable (REDIRECT_FAILED event) and
+ * re-issued by the watchdog — no silent success.
  */
-export async function maybeBridgeGuarded(
-  sessionId: string,
-  opts: { legAInline?: boolean; force?: boolean } = {},
-): Promise<boolean> {
-  const session = await findSession(sessionId);
-  if (!session || !session.guarded) return false;
-  if (session.state !== VState.LEG_B_ANSWERED) return false; // merge fired or already bridged/terminal
-  if (!opts.force) {
-    const armedAt = mergeWatchArmedAt.get(sessionId);
-    if (armedAt === undefined) {
-      // Watch timestamp unknown in this process (e.g. fresh instance serving
-      // the leg-a-tone poll fallback) — arm from first sight and defer one
-      // poll cycle rather than bridging before the window has elapsed.
-      mergeWatchArmedAt.set(sessionId, Date.now());
-      return false;
-    }
-    if (Date.now() - armedAt < mergeWatchMs()) return false;
-  }
-
+async function bridgeGuardedLive(session: VerificationSession): Promise<void> {
+  const sessionId = session.sessionId;
   if (
     await transition(
       session,
       VState.BRIDGED,
-      "verification passed (callee accepted, no merge) — live guarded bridge",
+      "Leg B answered — browser caller + callee bridged live (two-phase canary challenge supervises)",
     )
   ) {
-    mergeWatchArmedAt.delete(sessionId);
     // D2: flip the event-driven registry flag SYNCHRONOUSLY with the bridge
-    // so the media-stream analyzer path starts the forensic warm-up on the
-    // next audio window — not on the next DB refresh poll.
+    // so the media-stream analyzer path (Leg A uplink forensics) starts the
+    // warm-up on the next audio window — not on the next DB refresh poll.
     bridgedSessions.add(sessionId);
     await logEvent(
       sessionId,
       "GUARDED_BRIDGED",
-      `caller=${session.callerCallSid ?? "(none)"} legA=${session.legACallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A media stream persists`,
+      `caller=${session.callerCallSid ?? "(none)"} legB=${session.legBCallSid ?? "(none)"} — two-way live conference ${conferenceName(sessionId)}; Leg A canary stream persists`,
     );
-    // Verification is done: hang up the ring-test leg. Leg A's
-    // <Start><Stream> survives the bridge redirect, so speakerphone
-    // detection keeps running in-call.
     await hangupAll(session, { ringTest: true });
-    // Bridge the two real parties into the same conference (LIVE, two-way).
-    // LEG A ENTERS FIRST and is the conference anchor: in the inline path
-    // (legAInline) the leg-a-tone fetch serves the anchor TwiML directly;
-    // otherwise Leg A is REST-redirected here BEFORE the caller. The caller
-    // always joins with startConferenceOnEnter: false (bridgeUrl role), so a
-    // near-simultaneous arrival can never spawn a duplicate same-name
-    // conference stranding both parties alone in silence.
-    if (!opts.legAInline) {
-      await redirectCall(session.legACallSid, "guarded-bridge", sessionId, "legA");
-    }
-    await redirectCall(session.callerCallSid, "guarded-bridge", sessionId, "caller");
-    // LEG B TEARDOWN — the two-way-audio fix. Reaching LEG_B_ANSWERED means
-    // the callee ANSWERED the verification second call via call waiting,
-    // which puts Leg A ON HOLD on their handset. Bridging a held line
-    // conferences silence both ways (the caller talks to a muted held call;
-    // the callee is listening to Leg B's silent detector loop). Ending Leg B
-    // server-side makes the handset return to Leg A — now the live
-    // conference — restoring two-way audio. Leg B's completion status then
-    // lands while BRIDGED and is ignored by onCallCompleted (verified path).
-    if (session.legBCallSid) {
+    // ORDER MATTERS: clear the join registry BEFORE issuing the redirect so
+    // participant-join callbacks that land immediately after the redirect are
+    // never erased (the old ordering cleared the registry AFTER the redirects
+    // and could silently drop a recorded join).
+    bridgeJoinRegistry.delete(sessionId);
+    const redirected = await redirectCall(
+      session.callerCallSid,
+      "guarded-bridge",
+      sessionId,
+      "caller",
+    );
+    if (!redirected && session.callerCallSid) {
+      // Observable: the caller is still parked in caller-wait; its self-heal
+      // poll joins the conference on the next fetch, and the join watchdog
+      // re-issues this redirect.
       await logEvent(
         sessionId,
-        "LEG_B_PASS_TEARDOWN",
-        `sid=${session.legBCallSid} — verification second call ended at bridge time so the callee's handset returns to Leg A (call waiting had it on hold)`,
+        "BRIDGE_CALLER_REDIRECT_FAILED",
+        `caller=${session.callerCallSid} — caller-wait self-heal + join watchdog will recover`,
       );
-      await hangupCall(session.legBCallSid);
     }
-    // The pre-bridge merge tone stops here. Mid-call merge detection is
-    // TRIGGER-driven (v3): the HoldDetector on Leg A's uplink arms the
-    // continuous merge tone when the callee engages a second call, and the
-    // stream-side MergeToneDetector fires the instant the tone crosses a
-    // merge. Nothing to start at bridge time.
-    // SUPERVISOR: prove both parties actually JOINED the room (conference
-    // status callbacks) and re-redirect any leg that didn't — a silently
-    // failed redirect otherwise presents as "I can't hear the other person".
-    bridgeJoinRegistry.delete(sessionId);
     scheduleBridgeWatchdog(sessionId);
-    return true;
   }
-  return false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2010,9 +2199,11 @@ async function bridgeJoinWatchdog(sessionId: string): Promise<void> {
       return;
     }
     const joined = bridgeJoinRegistry.get(sessionId) ?? new Set<string>();
-    const expected: Array<["caller" | "legA", string | null]> = [
+    // The live bridge parties are the browser caller and the callee's LIVE
+    // leg (Leg B). Leg A is the canary — it NEVER joins the conference.
+    const expected: Array<["caller" | "legB", string | null]> = [
       ["caller", session.callerCallSid],
-      ["legA", session.legACallSid],
+      ["legB", session.legBCallSid],
     ];
     for (const [leg, callSid] of expected) {
       if (callSid && !joined.has(callSid)) {
@@ -2084,17 +2275,27 @@ async function recallCalleeIntoBridge(
       from: twilioCallerId(),
       url: twimlUrl("bridge-recall", session.sessionId),
       method: "POST",
-      statusCallback: statusUrl("legA", session.sessionId),
+      statusCallback: statusUrl("legB", session.sessionId),
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["completed"],
       timeout: 30,
     });
-    session.legACallSid = call.sid;
+    // The recall call is the callee's NEW live leg (Leg B role): its TwiML
+    // re-opens the inbound detection stream and re-joins the conference as
+    // anchor. The readiness deadline is re-armed — a recall that never
+    // re-establishes monitoring is DETECTION_FAILED, not a silent pass.
+    session.legBCallSid = call.sid;
+    session.streamReadyAt = null;
+    session.streamSid = null;
+    session.streamReadyBy = new Date(Date.now() + streamReadyTimeoutMs());
+    session.detectionPhase = DetectionPhase.AWAITING_STREAM_READY;
     await save(session);
+    scheduleReadinessWatchdog(session.sessionId);
+    await armRelay(session, call.sid);
     await logEvent(
       session.sessionId,
       "BRIDGE_RECALL_DIALED",
-      `newLegA=${call.sid} to=${session.calleeNumber} — session stays BRIDGED`,
+      `newLegB=${call.sid} to=${session.calleeNumber} — session stays BRIDGED, readiness re-armed`,
     );
     scheduleBridgeWatchdog(session.sessionId);
     return true;
@@ -2182,6 +2383,135 @@ export async function onMergeDetected(
       redirectCall(session.legACallSid, "notify-merge", sessionId),
       hangupCall(session.ringTestCallSid),
     ]);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Relay callbacks — stream-ready / stream-detected / stream-failed             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Relay → cloudtalk `stream-ready`: the Leg B inbound stream is live and the
+ * detector is armed. ONLY NOW does the Leg A two-phase challenge start:
+ *  1. redirect the Leg A canary to the challenge TwiML (Phase 1 prompt-light,
+ *     then the loud tone loop) — if the redirect fails the callback reports
+ *    failure so the relay retries (no silent success);
+ *  2. persist challengeStartedAt / promptLightDurationMs / promptEndsAt and
+ *     detectionPhase=PROMPT_LIGHT (restart-safe);
+ *  3. post /challenge-start to the relay (bounded retries); a callback
+ *     failure after retry is DETECTION_FAILED, never a pass.
+ * Idempotent: a duplicate stream-ready for an already-started challenge is a
+ * 200 no-op.
+ */
+export async function onStreamReady(
+  sessionId: string,
+  streamSid: string,
+  readyAt?: string,
+): Promise<{ ok: boolean; reason: string }> {
+  const session = await findSession(sessionId);
+  if (!session) return { ok: false, reason: "unknown session" };
+  if (isTerminal(session)) return { ok: true, reason: "session already terminal (idempotent)" };
+  if (session.challengeStartedAt) {
+    // Idempotent retry (relay restart / callback retry): already started.
+    return { ok: true, reason: "challenge already started (idempotent)" };
+  }
+  if (session.state !== VState.LEG_B_ANSWERED && session.state !== VState.BRIDGED) {
+    console.warn(
+      `[verify] STREAM_READY_IGNORED session=${sessionId} state=${session.state} — Leg B not answered`,
+    );
+    return { ok: false, reason: `unexpected state ${session.state}` };
+  }
+
+  const startedAt = readyAt && !Number.isNaN(Date.parse(readyAt)) ? new Date(readyAt) : new Date();
+  const promptEndsAt = new Date(startedAt.getTime() + PROMPT_LIGHT_DURATION_MS);
+
+  // 1) Start the canary challenge on Leg A. The redirect MUST succeed before
+  //    we record the challenge as started — otherwise the relay would count
+  //    Phase 1 against a prompt that was never played.
+  if (session.legACallSid) {
+    const ok = await redirectCall(session.legACallSid, "leg-a-challenge", sessionId);
+    if (!ok) {
+      await logEvent(
+        sessionId,
+        "CHALLENGE_REDIRECT_FAILED",
+        `legA=${session.legACallSid} — challenge NOT started; relay will retry stream-ready`,
+      );
+      return { ok: false, reason: "leg A challenge redirect failed" };
+    }
+  }
+
+  // 2) Persist the challenge timeline (restart-safe) + phase.
+  session.streamSid = streamSid || session.streamSid;
+  session.streamReadyAt = new Date();
+  session.challengeStartedAt = startedAt;
+  session.promptLightDurationMs = PROMPT_LIGHT_DURATION_MS;
+  session.promptEndsAt = promptEndsAt;
+  session.detectionPhase = DetectionPhase.PROMPT_LIGHT;
+  await save(session);
+  clearReadinessTimer(sessionId);
+  await logEvent(
+    sessionId,
+    "CHALLENGE_STARTED",
+    `streamSid=${streamSid} challengeStartedAt=${startedAt.toISOString()} promptLightDurationMs=${PROMPT_LIGHT_DURATION_MS} promptEndsAt=${promptEndsAt.toISOString()} phase=${DetectionPhase.PROMPT_LIGHT}`,
+  );
+
+  // 3) Tell the relay the exact challenge window (persisted relay-side; the
+  //    relay reconstructs the phase after restart). Callback failure after
+  //    retry → DETECTION_FAILED (never a pass).
+  const delivered = await sendChallengeStart(session);
+  if (!delivered) {
+    await onStreamFailed(
+      sessionId,
+      "DETECTION_FAILED",
+      "relay /challenge-start callback failed after retries",
+    );
+    return { ok: false, reason: "challenge-start delivery failed" };
+  }
+  return { ok: true, reason: "challenge started" };
+}
+
+/**
+ * Relay → cloudtalk `stream-failed` (or an internal readiness/canary-loss
+ * detection): the merge-detection pipeline cannot vouch for this call.
+ * Transitions to DETECTION_FAILED / DETECTION_INCONCLUSIVE — NEVER a pass —
+ * and tears the call down exactly once (end Leg A canary, complete the
+ * conference so both live parties drop, terminal state persisted).
+ */
+export async function onStreamFailed(
+  sessionId: string,
+  verdict: "DETECTION_FAILED" | "DETECTION_INCONCLUSIVE",
+  reason: string,
+): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session)) return;
+  const target =
+    verdict === "DETECTION_INCONCLUSIVE"
+      ? VState.DETECTION_INCONCLUSIVE
+      : VState.DETECTION_FAILED;
+
+  if (await transition(session, target, `merge detection cannot verify this call — ${reason}`.slice(0, 400))) {
+    session.completedAt = new Date();
+    session.failureReason = `Detection ${verdict === "DETECTION_INCONCLUSIVE" ? "inconclusive" : "failed"}: ${reason}`.slice(0, 512);
+    await save(session);
+    await logEvent(sessionId, verdict, reason.slice(0, 512));
+
+    // Full teardown: canary (Leg A), both live parties, conference room.
+    // REST status=completed pulls a leg out of <Dial><Conference>; completing
+    // the conference by SID is the belt-and-braces guarantee (same convention
+    // as the in-call merge verdict).
+    await hangupAll(session, { caller: true, legA: true, legB: true, ringTest: true });
+    const confSid = await liveConferenceSid(sessionId);
+    if (confSid) {
+      try {
+        await getTwilioClient().conferences(confSid).update({ status: "completed" });
+        console.log(`[verify] CONFERENCE_COMPLETED session=${sessionId} conf=${confSid} (${verdict})`);
+      } catch (err) {
+        console.warn(
+          `[verify] conference complete failed session=${sessionId} conf=${confSid}:`,
+          (err as Error).message,
+        );
+      }
+    }
   }
 }
 
@@ -2275,32 +2605,37 @@ export async function onCallWaitingOff(
   }
 }
 
-/** Leg B AMD returned MACHINE — voicemail → call waiting OFF. */
+/**
+ * Leg B AMD returned MACHINE — voicemail answered the second call. AMD is
+ * asynchronous and a machine answer NEVER human-confirms anything: the old
+ * guarded "late machine = ignore" exception is removed (a voicemail beep and
+ * a human answering call waiting are no longer conflated). Pre-answer machine
+ * verdicts keep the legacy semantics (call waiting OFF); once the session is
+ * LEG_B_ANSWERED/BRIDGED the call cannot be a verified human answer, so the
+ * outcome is DETECTION_INCONCLUSIVE with a full teardown.
+ */
 export async function onVoicemailDetected(
   sessionId: string,
   amdStatus: string,
 ): Promise<void> {
   const session = await findSession(sessionId);
   if (!session || isTerminal(session)) return;
-  // GUARDED MODE ONLY: Leg B is originated with asyncAmd, so the machine
-  // verdict ALWAYS arrives a few seconds AFTER the answer callback already
-  // took the human path (LEG_B_ANSWERED). Answering a call-waiting call plays
-  // a switch beep that Twilio AMD routinely misreads as a voicemail beep —
-  // the false positive then killed the second call mid-verification. Once a
-  // guarded session is LEG_B_ANSWERED or later, a late machine verdict is
-  // log-only: the callee provably answered (they requested this exact call
-  // via the second press-1 seconds earlier).
   if (
-    session.guarded &&
-    (session.state === VState.LEG_B_ANSWERED || session.state === VState.BRIDGED)
+    session.state === VState.LEG_B_ANSWERED ||
+    session.state === VState.BRIDGED
   ) {
     console.warn(
-      `[verify] AMD_LATE_MACHINE_IGNORED amd=${amdStatus} state=${session.state} — guarded second call stays up`,
+      `[verify] AMD_MACHINE_AFTER_ANSWER amd=${amdStatus} state=${session.state} — voicemail/machine NEVER human-confirms`,
     );
     await logEvent(
       sessionId,
-      "AMD_LATE_MACHINE_IGNORED",
-      `amd=${amdStatus} arrived after Leg B answer (state=${session.state}) — async-AMD false positive guard, call continues`,
+      "AMD_MACHINE_AFTER_ANSWER",
+      `amd=${amdStatus} arrived after Leg B answer (state=${session.state}) — machine answer cannot confirm a human; detection inconclusive`,
+    );
+    await onStreamFailed(
+      sessionId,
+      "DETECTION_INCONCLUSIVE",
+      `Leg B answered by a machine/voicemail (amd=${amdStatus}) — not a human confirmation`,
     );
     return;
   }
@@ -2416,65 +2751,69 @@ export async function onCallCompleted(
 
   await logEvent(sessionId, `HANGUP_${leg.toUpperCase()}`, `sid=${callSid} ${statusDetail}`);
 
-  // GUARDED MODE ONLY: the live bridge ends when either party hangs up.
-  // endConferenceOnExit=true on both bridge legs makes Twilio drop the other
-  // participant too; the surviving leg then hears the partner-ended notice
-  // via its post-Dial <Redirect> (see below). Leg B / ring test completions
-  // while BRIDGED are expected (the ring test was hung up and Leg B was torn
-  // down at bridge time) and fall through untouched.
-  if (session.state === VState.BRIDGED && (leg === "caller" || leg === "legA")) {
-    // CALLEE DROP AUTO-RECALL: the callee's bridged leg ended while the caller
-    // is still live (handset glitch, accidental hold-end, carrier blip).
-    // Verification already passed — dial them back straight into the live
-    // conference instead of ending the call. Once per session.
+  // GUARDED MODE ONLY (corrected architecture): the live bridge parties are
+  // the browser caller and the callee's Leg B. Leg A is the Call Waiting
+  // canary — its loss while BRIDGED means the challenge can no longer run:
+  // DETECTION_INCONCLUSIVE (lost canary), never a pass.
+  if (session.state === VState.BRIDGED && leg === "legA" && session.legACallSid === callSid) {
+    console.warn(`[verify] CANARY_LOST session=${sessionId} — Leg A ended mid-call`);
+    await logEvent(sessionId, "CANARY_LOST", `Leg A (canary) ended mid-call sid=${callSid} ${statusDetail}`);
+    await onStreamFailed(sessionId, "DETECTION_INCONCLUSIVE", "canary (Leg A) lost mid-call");
+    return;
+  }
+
+  if (session.state === VState.BRIDGED && (leg === "caller" || leg === "legB")) {
+    // CALLEE DROP AUTO-RECALL: the callee's live leg (Leg B) ended while the
+    // caller is still live (handset glitch, accidental hold-end, carrier
+    // blip). Dial them back once, straight into the live conference with a
+    // fresh detection stream. Once per session.
     if (
-      leg === "legA" &&
-      session.legACallSid === callSid &&
+      leg === "legB" &&
+      session.legBCallSid === callSid &&
       (await recallCalleeIntoBridge(session, callSid, statusDetail))
     ) {
       return; // session stays BRIDGED; the recall call continues the bridge
     }
-    if (
-      await transition(
-        session,
-        VState.COMPLETED,
-        `${leg} hung up — guarded live call ended`,
-      )
-    ) {
+    // Leg B (callee) ending the live call is only a clean COMPLETED when the
+    // detection pipeline was live for the call (stream-ready had arrived and
+    // the challenge started). Without a verified live outcome a Leg B
+    // completion is DETECTION_INCONCLUSIVE — never a forced pass.
+    const monitored = detectionIsLive(session);
+    const target = monitored ? VState.COMPLETED : VState.DETECTION_INCONCLUSIVE;
+    const why = monitored
+      ? `${leg} hung up — guarded live call ended (detection was live)`
+      : `${leg} hung up before stream readiness was confirmed — no verified live outcome`;
+    if (await transition(session, target, why)) {
       session.completedAt = new Date();
+      if (!monitored) {
+        session.failureReason = "Leg B ended without a verified live outcome (detection inconclusive)";
+      }
       await save(session);
       await logEvent(
         sessionId,
-        "GUARDED_CALL_ENDED",
+        monitored ? "GUARDED_CALL_ENDED" : "DETECTION_INCONCLUSIVE",
         `leg=${leg} sid=${callSid} ${statusDetail}`,
       );
-      if (session.guarded && (leg === "legA" || leg === "caller")) {
-        // Either party ended the live bridge. The REMAINING party is inside
-        // an active <Dial><Conference>, which a REST redirect CANNOT pull
-        // them out of — so the "partner ended" notice is delivered by the
-        // bridge TwiML itself: endConferenceOnExit on the departed leg ends
-        // the conference, the surviving leg's Dial verb returns, and its
-        // post-Dial <Redirect> plays notify-partner-ended and hangs up.
-        // The ONE case that needs a REST hangup is a remaining leg that
-        // never reached the started conference (e.g. the caller still in the
-        // pre-start lobby because the anchor died before entering) — that
-        // lobby has no end trigger, so detect it via the absence of a live
-        // conference and hang the leg up directly.
-        const remaining =
-          leg === "legA" ? session.callerCallSid : session.legACallSid;
-        const confSid = await liveConferenceSid(sessionId);
-        if (!confSid) {
-          await hangupCall(remaining);
-        }
-        await hangupAll(session, { legB: true, ringTest: true });
-      } else {
-        await hangupAll(session, {
-          caller: leg !== "caller",
-          legA: leg !== "legA",
-          legB: true,
-          ringTest: true,
-        });
+      // The REMAINING party is inside an active <Dial><Conference>, which a
+      // REST redirect CANNOT pull them out of — so the "partner ended" notice
+      // is delivered by the bridge TwiML itself: endConferenceOnExit on the
+      // caller leg ends the conference when the caller leaves, and the
+      // surviving leg's Dial verb returns into its post-Dial <Redirect>. The
+      // ONE case that needs a REST hangup is a remaining leg that never
+      // reached the started conference (pre-start lobby) — detect it via the
+      // absence of a live conference and hang the leg up directly.
+      const remaining =
+        leg === "legB" ? session.callerCallSid : session.legBCallSid;
+      const confSid = await liveConferenceSid(sessionId);
+      if (!confSid) {
+        await hangupCall(remaining);
+      } else if (leg === "caller") {
+        // Caller gone: endConferenceOnExit ends the room, but release the
+        // callee leg explicitly in case the exit raced.
+        await hangupCall(session.legBCallSid);
       }
+      // The canary (Leg A) and the ring test always end with the live call.
+      await hangupAll(session, { legA: true, ringTest: true });
     }
     return;
   }
@@ -2532,11 +2871,28 @@ export async function onCallCompleted(
   }
 
   if (leg === "legB" && session.state === VState.LEG_B_ANSWERED) {
-    // GUARDED MODE ONLY: Leg B hanging up with no merge leaked is the legacy
-    // PASS signal — bridge caller + callee LIVE (guarded-bridge TwiML)
-    // instead of the notify-completed announcement + hangupAll. Non-guarded
-    // sessions fall through to the unchanged legacy completion below.
-    if (session.guarded && (await maybeBridgeGuarded(sessionId, { force: true }))) {
+    // CORRECTED ARCHITECTURE: a Leg B completion is NEVER a forced pass. The
+    // old force-bridge and time-only watch are gone — Leg B ending while
+    // LEG_B_ANSWERED completes COMPLETED only when the detection pipeline was
+    // confirmed live (stream-ready + challenge started); otherwise the call
+    // ran unmonitored and the outcome is DETECTION_INCONCLUSIVE.
+    const monitored = detectionIsLive(session);
+    if (session.guarded && !monitored) {
+      await onStreamFailed(
+        sessionId,
+        "DETECTION_INCONCLUSIVE",
+        "Leg B ended before stream readiness was confirmed — no verified live outcome",
+      );
+      return;
+    }
+    if (!session.guarded && !monitored && session.streamReadyBy) {
+      // Detection was armed (Leg B answered) but never confirmed ready — the
+      // record-chunk fallback no longer exists, so this call was unmonitored.
+      await onStreamFailed(
+        sessionId,
+        "DETECTION_INCONCLUSIVE",
+        "Leg B ended with no confirmed detection stream — outcome inconclusive",
+      );
       return;
     }
     if (await transition(session, VState.COMPLETED, "Leg B hung up — call completed normally")) {

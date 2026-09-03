@@ -53,6 +53,8 @@ const TERMINAL_LABEL: Record<string, string> = {
   MERGE_DETECTED: 'Merge detected',
   VOIP_DETECTED: 'VoIP / multi-line',
   CALL_WAITING_OFF: 'Call waiting off',
+  DETECTION_FAILED: 'Detection failed',
+  DETECTION_INCONCLUSIVE: 'Detection inconclusive',
   FAILED: 'Failed',
 };
 
@@ -67,7 +69,9 @@ function stateTone(state: string): Tone {
     case 'VOIP_DETECTED':
       return 'violet';
     case 'CALL_WAITING_OFF':
+    case 'DETECTION_INCONCLUSIVE':
       return 'sky';
+    case 'DETECTION_FAILED':
     case 'FAILED':
       return 'danger';
     default:

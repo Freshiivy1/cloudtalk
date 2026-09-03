@@ -10,6 +10,7 @@ import { statusCallbackHandler, voiceWebhookHandler } from "./twilio-voice";
 import {
   challengeNoiseHandler,
   mergeToneHandler,
+  promptLightHandler,
   verificationGatherHandler,
   verificationGatherLegAAcceptHandler,
   verificationConferenceHandler,
@@ -28,7 +29,11 @@ import {
   verificationRecordingHandler,
 } from "./verification-record";
 import { testCalleeBotHandler, testCalleeBotRecordHandler } from "./test-bot";
-import { verificationStreamDetectedHandler } from "./verification-stream";
+import {
+  verificationStreamDetectedHandler,
+  verificationStreamFailedHandler,
+  verificationStreamReadyHandler,
+} from "./verification-stream";
 import { Paths } from "@contracts/constants";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
@@ -57,6 +62,10 @@ app.post("/api/test/callee-bot", testCalleeBotHandler);
 app.get("/api/test/callee-bot", testCalleeBotHandler);
 app.post("/api/test/callee-bot-record", testCalleeBotRecordHandler);
 app.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
+// Relay readiness/failure callbacks (x-verify-secret authenticated): the
+// Leg A challenge starts only on stream-ready; failures are never a pass.
+app.post("/api/verify/stream-ready", verificationStreamReadyHandler);
+app.post("/api/verify/stream-failed", verificationStreamFailedHandler);
 // Two-way AI SMS: Crazytel Virtual Mobile Number inbound webhook (JSON
 // {from, to, text}) — replies with model-specific call-waiting walkthroughs.
 app.post("/api/verify/sms/inbound", verificationSmsInboundHandler);
@@ -67,6 +76,9 @@ app.get("/api/verify/version", verificationVersionHandler);
 // Serve the in-band DTMF verification tone with a proper audio/wav Content-Type
 // (the generic static server returns octet-stream; Twilio refuses it — error 12300).
 app.get("/api/verify/tone.wav", verificationToneHandler);
+// Phase 1 challenge asset (prompt + light DTMF-8 watermark), audio/wav,
+// no-store, measured duration surfaced via X-Prompt-Light-Duration-Ms.
+app.get("/api/verify/prompt-light.wav", promptLightHandler);
 // Relayguard challenge-noise probe (conference announce on suspected speakerphone).
 app.get("/api/verify/challenge-noise.wav", challengeNoiseHandler);
 // BRIDGED in-call merge tone (Leg A participant announce while ARMED — the

@@ -227,6 +227,23 @@ export const verificationSessions = mysqlTable(
     bridgeRecordingUrl: varchar("bridgeRecordingUrl", { length: 512 }),
     bridgeRecordingDurationSec: int("bridgeRecordingDurationSec"),
     bridgeRecordedAt: timestamp("bridgeRecordedAt"),
+    /**
+     * Two-phase Call Waiting challenge (corrected architecture) — persisted so
+     * a restart can reconstruct readiness/phase without process memory:
+     *  - streamSid / streamReadyAt: the relay's stream-ready acknowledgement;
+     *  - streamReadyBy: readiness deadline set at Leg B answer (a miss is
+     *    DETECTION_FAILED, never a silent pass);
+     *  - challengeStartedAt / promptLightDurationMs / promptEndsAt: Phase 1
+     *    (prompt-light) window, started ONLY after stream-ready;
+     *  - detectionPhase: AWAITING_STREAM_READY | PROMPT_LIGHT | LOUD_DTMF.
+     */
+    streamSid: varchar("streamSid", { length: 64 }),
+    streamReadyAt: timestamp("streamReadyAt"),
+    streamReadyBy: timestamp("streamReadyBy"),
+    challengeStartedAt: timestamp("challengeStartedAt"),
+    promptLightDurationMs: int("promptLightDurationMs"),
+    promptEndsAt: timestamp("promptEndsAt"),
+    detectionPhase: varchar("detectionPhase", { length: 32 }),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     completedAt: timestamp("completedAt"),
     failureReason: varchar("failureReason", { length: 512 }),

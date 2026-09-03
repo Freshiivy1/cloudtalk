@@ -29,7 +29,8 @@ import type { Context } from "hono";
 import fs from "fs";
 import path from "path";
 import * as vs from "./verification";
-import { legAStreamUrl, relayStreamUrl } from "./verification-stream";
+import { legAStreamUrl, relayStreamUrl, streamToken } from "./verification-stream";
+import { PROMPT_LIGHT_DURATION_MS, PROMPT_LIGHT_WAV_FILE } from "./generated/prompt-light-asset";
 import {
   CHALLENGE_NOISE_LEVEL,
   CHALLENGE_NOISE_LOOP_SEC,
@@ -116,14 +117,47 @@ export async function challengeNoiseHandler(c: Context) {
 }
 
 /**
+ * GET /api/verify/prompt-light.wav — serves the PHASE 1 challenge asset:
+ * pre-rendered speech + the existing merge-tone pair (852+1336 Hz, DTMF-8)
+ * attenuated 21 dB below prompt RMS, 8 kHz mono PCM16. The exact measured
+ * duration is exported from the generated asset module
+ * (api/generated/prompt-light-asset.ts) and surfaced as a response header so
+ * deploys can be verified against the constant.
+ */
+export async function promptLightHandler(c: Context) {
+  const candidates = [
+    path.resolve(import.meta.dirname, "public", PROMPT_LIGHT_WAV_FILE), // prod bundle: dist/
+    path.resolve(import.meta.dirname, "..", "dist", "public", PROMPT_LIGHT_WAV_FILE),
+    path.resolve(import.meta.dirname, "..", "public", PROMPT_LIGHT_WAV_FILE), // tsx/vitest: api/
+    path.resolve(process.cwd(), "dist", "public", PROMPT_LIGHT_WAV_FILE),
+    path.resolve(process.cwd(), "public", PROMPT_LIGHT_WAV_FILE), // dev
+  ];
+  for (const p of candidates) {
+    try {
+      const buf = await fs.promises.readFile(p);
+      return c.body(new Uint8Array(buf), 200, {
+        "Content-Type": "audio/wav",
+        "Content-Length": String(buf.byteLength),
+        "Cache-Control": "no-store",
+        "X-Prompt-Light-Duration-Ms": String(PROMPT_LIGHT_DURATION_MS),
+      });
+    } catch {
+      // try next candidate
+    }
+  }
+  return c.text("prompt-light not found", 404);
+}
+
+/**
  * GET /api/verify/merge-tone.wav — serves the BRIDGED in-call merge tone:
- * a DTMF-'9' beep render (852+1336 Hz, VERIFY_MERGE_TONE_SEC seconds,
- * default 0.5s) produced by relayguard/dtmf.ts. Used as the conference
- * announceUrl for the Leg A participant only while the tone is ARMED
- * (HoldDetector second-call engagement), re-announced every
- * VERIFY_MERGE_TONE_REARM_MS so it is effectively continuous; the instant
- * the callee merges, the tone crosses into Leg A's uplink and the
- * stream-side Goertzel detector fires the in-call verdict.
+ * a beep render of the existing merge-tone pair (852+1336 Hz = DTMF-8,
+ * VERIFY_MERGE_TONE_SEC seconds, default 0.5s) produced by
+ * relayguard/dtmf.ts. Used as the conference announceUrl for the Leg A
+ * participant only while the tone is ARMED (HoldDetector second-call
+ * engagement), re-announced every VERIFY_MERGE_TONE_REARM_MS so it is
+ * effectively continuous; the instant the callee merges, the tone crosses
+ * into Leg A's uplink and the stream-side Goertzel detector fires the
+ * in-call verdict.
  */
 export async function mergeToneHandler(c: Context) {
   try {
@@ -132,7 +166,7 @@ export async function mergeToneHandler(c: Context) {
       "Content-Type": "audio/wav",
       "Content-Length": String(buf.byteLength),
       "Cache-Control": "no-store",
-      "X-Merge-Tone": `dtmf=9;freq=852+1336Hz;duration=${vs.mergeToneSec()}s`,
+      "X-Merge-Tone": `dtmf=8;freq=852+1336Hz;duration=${vs.mergeToneSec()}s`,
     });
   } catch (err) {
     console.error("[verify] merge-tone render failed:", err);
@@ -144,6 +178,34 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 
 function xml(c: Context, vr: twilio.twiml.VoiceResponse) {
   return c.text(vr.toString(), 200, { "Content-Type": "text/xml" });
+}
+
+/**
+ * Optional Twilio request-signature validation for the /api/verify/*
+ * webhooks. Enabled with VERIFY_TWILIO_SIGNATURE_REQUIRED=true (off by
+ * default so unsigned dev/test environments keep working). When enabled,
+ * requests without a VALID X-Twilio-Signature over the public URL + form
+ * params are rejected with 403. Hono caches the parsed body, so the
+ * parseBody() here does not consume the stream for the handler.
+ */
+async function twilioSignatureOk(c: Context): Promise<boolean> {
+  if ((process.env.VERIFY_TWILIO_SIGNATURE_REQUIRED ?? "false") !== "true") return true;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const sig = c.req.header("X-Twilio-Signature");
+  const base = vs.getPublicBaseUrl();
+  if (!authToken || !sig || !base) return false;
+  let formParams: Record<string, string> = {};
+  try {
+    const form = await c.req.parseBody();
+    for (const [k, v] of Object.entries(form)) {
+      if (typeof v === "string") formParams[k] = v;
+    }
+  } catch {
+    /* no form body — validate against the URL alone */
+  }
+  const raw = new URL(c.req.url);
+  const url = `${base.replace(/\/$/, "")}${raw.pathname}${raw.search}`;
+  return twilio.validateRequest(authToken, sig, url, formParams);
 }
 
 /** DTMF tone loop replacing the Asterisk 1400Hz merge-test tone. */
@@ -160,15 +222,16 @@ const CALLER_WAIT_PAUSE_SEC = 10;
 
 /**
  * The live two-way bridge conference TwiML, shared by the `guarded-bridge`
- * document, the caller-wait self-heal path and the leg-a-tone inline bridge.
+ * document, the `leg-b` document (corrected architecture) and the caller-wait
+ * self-heal path.
  *
- * Leg A is the ANCHOR (startConferenceOnEnter: true) — the conference exists
- * the moment the callee enters. The caller is the JOINER (false): a leg that
- * cannot start the conference can never spawn a duplicate same-name
- * conference (the classic Twilio race that strands both parties alone in
- * silence); if the caller arrives first it waits in the lobby the few
- * hundred ms until the anchor dials in. endConferenceOnExit on both legs:
- * when either party hangs up, the other is dropped out of the conference.
+ * Leg B (the callee's LIVE leg) is the ANCHOR (startConferenceOnEnter: true)
+ * — the conference exists the moment the callee enters. The browser caller is
+ * the JOINER (false): a leg that cannot start the conference can never spawn
+ * a duplicate same-name conference (the classic Twilio race that strands both
+ * parties alone in silence); if the caller arrives first it waits in the
+ * lobby the few hundred ms until the anchor dials in. Leg A is the Call
+ * Waiting canary and NEVER joins the conference.
  *
  * The post-Dial <Redirect> is the ONLY way to tell the surviving party the
  * call is over: a REST redirect cannot reach a call inside an active
@@ -179,19 +242,20 @@ const CALLER_WAIT_PAUSE_SEC = 10;
 function serveBridgeConference(
   vr: twilio.twiml.VoiceResponse,
   sid: string,
-  leg: "caller" | "legA" | "recall",
+  leg: "caller" | "legB" | "recall",
 ) {
   vr.dial().conference(
     {
       beep: "false",
-      // Anchor rules: Leg A (or the recall leg) STARTS the room; the caller
+      // Anchor rules: Leg B (or the recall leg) STARTS the room; the caller
       // only ever joins it — a leg that cannot start the conference can never
       // spawn a duplicate same-name conference stranding both in silence.
       startConferenceOnEnter: leg !== "caller",
       // endConferenceOnExit ONLY on the caller leg: the caller hanging up
-      // ends the call for everyone. The CALLEE leg exiting must NOT end the
-      // room — the bridge supervisor re-dials a dropped callee straight back
-      // into this same conference while the caller waits (BRIDGE_RECALL).
+      // ends the call for everyone. The CALLEE leg (Leg B) exiting must NOT
+      // end the room — the bridge supervisor re-dials a dropped callee
+      // straight back into this same conference while the caller waits
+      // (BRIDGE_RECALL).
       endConferenceOnExit: leg === "caller",
       record: "record-from-start",
       recordingStatusCallback: vs.recordingBridgeUrl(sid),
@@ -234,6 +298,7 @@ function amdIsMachine(answeredBy: string): boolean {
 /* -------------------------------------------------------------------------- */
 
 export async function verificationTwimlHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   try {
     vs.setRuntimeBaseUrl(new URL(c.req.url).origin);
   } catch {
@@ -270,7 +335,7 @@ export async function verificationTwimlHandler(c: Context) {
           vr.hangup();
           break;
         }
-        // SELF-HEALING BRIDGE: the REST redirect in maybeBridgeGuarded is the
+        // SELF-HEALING BRIDGE: the REST redirect in bridgeGuardedLive is the
         // fast path into the conference, but if it raced an in-flight
         // self-redirect fetch or the REST update failed (transient API error,
         // region mismatch on the SDK leg), the caller would otherwise be
@@ -423,78 +488,82 @@ export async function verificationTwimlHandler(c: Context) {
       }
 
       case "leg-a-hold": {
-        // CALLEE_READY → Leg A waits (Java Wait(300)) while Leg B + ring test
+        // CALLEE_READY → Leg A (the canary) waits while Leg B + the ring test
         // run. Long <Pause> loop via self-redirect keeps the call alive; the
-        // state machine redirects/hangs up this leg on terminal states.
-        const session = sid ? await vs.findSession(sid) : null;
+        // state machine redirects/hangs up this leg on terminal states and on
+        // stream-ready (→ leg-a-challenge). Leg A NEVER joins the conference.
+        let session = sid ? await vs.findSession(sid) : null;
         if (!session || vs.isTerminal(session)) {
           vr.hangup();
           break;
         }
-        // SELF-HEALING BRIDGE (same contract as caller-wait): if the session
-        // is already BRIDGED, join the conference from this fetch instead of
-        // waiting for a REST redirect that may have raced or failed. Leg A is
-        // the conference ANCHOR.
-        if (session.guarded && session.state === vs.VState.BRIDGED) {
-          serveBridgeConference(vr, sid, "legA");
-          break;
+        // RESTART-SAFE READINESS FALLBACK: enforce the persisted stream-ready
+        // deadline even on runtimes without guaranteed background timers (and
+        // after a process restart, when the in-process watchdog is gone).
+        if (session.detectionPhase === "AWAITING_STREAM_READY") {
+          await vs.checkStreamReadiness(sid);
+          session = await vs.findSession(sid);
+          if (!session || vs.isTerminal(session)) {
+            vr.hangup();
+            break;
+          }
         }
         vr.pause({ length: 60 });
         vr.redirect({ method: "POST" }, vs.legAHoldUrl(sid));
         break;
       }
 
-      case "leg-a-tone": {
-        // Merge-test phase: Leg A loops an IN-BAND audio tone (real sound
-        // file — <Play digits> is out-of-band RFC2833 and never traverses a
-        // phone's local 3-way merge). If the callee merges, the tone leaks
-        // into Leg B's <Gather> → MERGE_DETECTED.
-        // Served via /api/verify/tone.wav (explicit audio/wav Content-Type —
-        // the static server returns octet-stream and Twilio refuses to fetch it).
-        //
-        // GUARDED MODE ONLY: this self-redirect loop doubles as the timer-free
-        // poll for the merge-detection watch (fallback for runtimes without
-        // guaranteed background timers). Once the watch elapses with no merge
-        // the session has PASSED: bridge inline (this fetch IS Leg A, so we
-        // serve the bridge TwiML directly instead of a REST redirect) and the
-        // caller leg is redirected by maybeBridgeGuarded. Guarded sessions get
-        // loop=1 so the poll cadence is one tone-play instead of ten.
-        // NON-guarded sessions render the exact legacy TwiML below.
-        if (sid) {
-          const session = await vs.findSession(sid);
-          if (session?.guarded) {
-            const bridged =
-              session.state === vs.VState.BRIDGED ||
-              (await vs.maybeBridgeGuarded(sid, { legAInline: true }));
-            if (bridged) {
-              // Leg A is the conference ANCHOR (starts the conference; the
-              // caller joins with startConferenceOnEnter: false).
-              serveBridgeConference(vr, sid, "legA");
-              break;
-            }
-            vr.play({ loop: 1 }, `${vs.requirePublicBaseUrl()}/api/verify/tone.wav`);
-            vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-tone", sid));
-            break;
-          }
+      case "leg-a-challenge": {
+        // TWO-PHASE CANARY CHALLENGE (corrected architecture). Leg A stays
+        // OUTSIDE the conference and plays the deterministic challenge:
+        //   Phase 1 — the prompt-light asset ONCE (speech + attenuated
+        //             852+1336 Hz watermark, exact measured duration);
+        //   Phase 2 — the existing loud verify-tone.wav loop (this document
+        //             redirects into leg-a-challenge-tone after Phase 1).
+        // Served only after the relay confirmed stream-ready (onStreamReady
+        // redirects Leg A here); before that, hold and re-poll.
+        const session = sid ? await vs.findSession(sid) : null;
+        if (!session || vs.isTerminal(session)) {
+          vr.hangup();
+          break;
+        }
+        if (!session.challengeStartedAt) {
+          // Challenge not started yet (or a redirect raced a restart): wait
+          // for stream-ready instead of playing an untimed prompt.
+          vr.pause({ length: 5 });
+          vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-challenge", sid));
+          break;
+        }
+        const base = vs.requirePublicBaseUrl();
+        vr.play({ loop: 1 }, `${base}/api/verify/prompt-light.wav`);
+        vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-challenge-tone", sid));
+        break;
+      }
+
+      case "leg-a-challenge-tone": {
+        // Phase 2: loop the existing loud merge tone (852+1336 Hz pair —
+        // DTMF-8). A merge leaks it into Leg B's inbound audio where the
+        // relay's loud Goertzel detector is decisive on its own.
+        const session = sid ? await vs.findSession(sid) : null;
+        if (!session || vs.isTerminal(session)) {
+          vr.hangup();
+          break;
         }
         vr.play({ loop: 10 }, `${vs.requirePublicBaseUrl()}/api/verify/tone.wav`);
-        vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-tone", sid));
+        vr.redirect({ method: "POST" }, vs.twimlUrl("leg-a-challenge-tone", sid));
         break;
       }
 
       case "guarded-bridge": {
-        // GUARDED MODE ONLY: verification passed — bridge the caller (inmate
-        // softphone) and the callee (Leg A) into a LIVE two-way conference.
-        // endConferenceOnExit on both legs: when either party hangs up the
-        // other is dropped and the status callback marks the session
-        // COMPLETED. Leg A's <Start><Stream> persists across the redirect
-        // into this TwiML, so speakerphone detection continues in-call.
+        // GUARDED MODE ONLY (corrected architecture): the caller (inmate
+        // softphone) and the callee's LIVE Leg B share a two-way conference.
+        // The `leg` query param selects the conference role (see
+        // serveBridgeConference): "caller" is the JOINER; anything else
+        // (legB / recall / legacy URLs without the param) is the ANCHOR.
         // record-from-start captures the whole conversation for call review;
         // Twilio posts the finished recording to /api/verify/recording/bridge
-        // when the conference ends. The `leg` query param selects the
-        // conference role (see serveBridgeConference); URLs without it are
-        // treated as the anchor for backwards compatibility.
-        const legParam = c.req.query("leg") === "caller" ? "caller" : "legA";
+        // when the conference ends.
+        const legParam = c.req.query("leg") === "caller" ? "caller" : "legB";
         serveBridgeConference(vr, sid, legParam);
         break;
       }
@@ -512,9 +581,21 @@ export async function verificationTwimlHandler(c: Context) {
       }
 
       case "bridge-recall": {
-        // GUARDED MODE ONLY: the callee's bridged leg dropped mid-call and the
-        // supervisor is re-dialling them straight into the live conference
-        // (verification already passed — no second-call dance on recovery).
+        // GUARDED MODE ONLY: the callee's live leg (Leg B) dropped mid-call
+        // and the supervisor is re-dialling them straight into the live
+        // conference. The recall leg is the NEW detection leg: it re-opens
+        // the inbound-only relay stream (same customParameters identity — the
+        // relay dedupes/re-arms by sid) and the readiness deadline is
+        // re-armed engine-side, so a recall that cannot be monitored is
+        // DETECTION_FAILED, never a silent pass.
+        const relayUrl = relayStreamUrl();
+        if (relayUrl && process.env.VERIFY_STREAM_SECRET) {
+          const start = vr.start().stream({ url: relayUrl, track: "inbound_track" });
+          start.parameter({ name: "sid", value: sid });
+          start.parameter({ name: "leg", value: "legB" });
+          start.parameter({ name: "mode", value: "merge-detection" });
+          start.parameter({ name: "token", value: streamToken(sid) });
+        }
         vr.say("Reconnecting your call now.");
         serveBridgeConference(vr, sid, "recall");
         break;
@@ -529,56 +610,63 @@ export async function verificationTwimlHandler(c: Context) {
       }
 
       case "leg-b": {
-        // Leg B stays in the silent record-chunk loop — merge detection takes
-        // priority over live audio (a call in a <Conference> cannot also
-        // record). AMD (async) reports voicemail via the status callback;
-        // sync AnsweredBy handled too. Anything not MACHINE → human path.
+        // CORRECTED ARCHITECTURE: Leg B is the LIVE browser-caller ↔ callee
+        // call. It opens a NON-BLOCKING inbound-only <Start><Stream> for the
+        // merge relay and IMMEDIATELY continues — no prompt, no <Gather>, no
+        // keypress, no tone, no blocking <Connect><Stream>, no <Record>
+        // fallback, and no dependence on relay audio.
+        // AMD (async) reports voicemail via the status callback; sync
+        // AnsweredBy handled too. A machine answer NEVER human-confirms.
         if (answeredBy && amdIsMachine(answeredBy)) {
           void vs
             .onVoicemailDetected(sid, answeredBy)
             .catch((err) => console.error("[verify] leg-b AMD error:", err));
         }
-        // Merge detection strategy:
-        // PRIMARY (when VERIFY_STREAM_URL is configured): DUPLEX stream —
-        // <Connect><Stream> holds Leg B on the relay's WebSocket; the relay's
-        // Goertzel detector fires on ~300ms of leaked tone and speaks the
-        // verdict straight into the open socket (merge→verdict ≈ 0.3–0.4s,
-        // no Twilio round-trip). Leg A is torn down by the armed relay.
-        // FALLBACK (no relay): tight loop of 1-second <Record> chunks —
-        // each chunk's callback is Goertzel-scanned (~2s detection).
-        const relayUrl = relayStreamUrl(sid);
-        if (relayUrl) {
-          const connect = vr.connect();
-          const stream = connect.stream({ url: relayUrl });
-          stream.parameter({ name: "sid", value: sid });
-          stream.parameter({ name: "mode", value: "duplex" });
+        const relayUrl = relayStreamUrl();
+        if (!relayUrl || !process.env.VERIFY_STREAM_SECRET) {
+          // Fail CLOSED: without the relay there is no detection path — this
+          // must surface as DETECTION_FAILED, never a silent pass.
+          void vs
+            .onStreamFailed(
+              sid,
+              "DETECTION_FAILED",
+              "merge relay not configured (VERIFY_STREAM_URL/VERIFY_STREAM_SECRET)",
+            )
+            .catch((err) => console.error("[verify] leg-b fail-closed error:", err));
+          vr.hangup();
           break;
         }
-        // SILENT on Leg B: no words, no beep. 1s chunks → merge-to-termination
-        // ≈1.5–2.5s typical (chunk + processing + analysis + REST hangups).
-        vr.record({
-          maxLength: 1,
-          timeout: 1,
-          playBeep: false,
-          trim: "do-not-trim",
-          recordingStatusCallback: vs.recordingMergeUrl(sid),
-          recordingStatusCallbackMethod: "POST",
-        });
-        vr.redirect({ method: "POST" }, vs.twimlUrl("leg-b-record", sid));
+        // Stream identity travels ONLY in customParameters (sid / leg=legB /
+        // mode=merge-detection / token) — the query string is never used.
+        const start = vr.start().stream({ url: relayUrl, track: "inbound_track" });
+        start.parameter({ name: "sid", value: sid });
+        start.parameter({ name: "leg", value: "legB" });
+        start.parameter({ name: "mode", value: "merge-detection" });
+        start.parameter({ name: "token", value: streamToken(sid) });
+        const session = sid ? await vs.findSession(sid) : null;
+        if (session?.guarded) {
+          // Join the browser caller in the live conference (Leg B = anchor).
+          serveBridgeConference(vr, sid, "legB");
+        } else {
+          // Non-guarded sessions have no live bridge party: hold silently
+          // while the relay monitors; the state machine ends the call.
+          vr.pause({ length: 30 });
+          vr.redirect({ method: "POST" }, vs.twimlUrl("leg-b-hold", sid));
+        }
         break;
       }
 
-      case "leg-b-record": {
-        // Re-arm the next recording chunk (loop target — keeps TwiML tiny).
-        vr.record({
-          maxLength: 1,
-          timeout: 1,
-          playBeep: false,
-          trim: "do-not-trim",
-          recordingStatusCallback: vs.recordingMergeUrl(sid),
-          recordingStatusCallbackMethod: "POST",
-        });
-        vr.redirect({ method: "POST" }, vs.twimlUrl("leg-b-record", sid));
+      case "leg-b-hold": {
+        // Non-guarded Leg B park loop (replaces the removed record-chunk
+        // fallback): the relay's inbound stream keeps monitoring while Leg B
+        // waits. Terminal sessions hang up immediately.
+        const session = sid ? await vs.findSession(sid) : null;
+        if (!session || vs.isTerminal(session)) {
+          vr.hangup();
+          break;
+        }
+        vr.pause({ length: 30 });
+        vr.redirect({ method: "POST" }, vs.twimlUrl("leg-b-hold", sid));
         break;
       }
 
@@ -705,6 +793,7 @@ export async function verificationTwimlHandler(c: Context) {
 const LEGS = new Set(["caller", "legA", "legB", "ringTest"]);
 
 export async function verificationStatusHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   try {
     const leg = c.req.param("leg") as vs.VerifyLeg;
     const sid = c.req.query("sid") ?? "";
@@ -778,6 +867,7 @@ export async function verificationStatusHandler(c: Context) {
 /* -------------------------------------------------------------------------- */
 
 export async function verificationGatherLegAAcceptHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   const sid = c.req.query("sid") ?? "";
   const a = attemptFrom(c);
   const vr = new VoiceResponse();
@@ -834,6 +924,7 @@ export async function verificationGatherLegAAcceptHandler(c: Context) {
 }
 
 export async function verificationGatherLegAReadyHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   const sid = c.req.query("sid") ?? "";
   const a = attemptFrom(c);
   const vr = new VoiceResponse();
@@ -889,6 +980,7 @@ export async function verificationGatherLegAReadyHandler(c: Context) {
  * press through gather/leg-a-ready → onCalleeReady().
  */
 export async function verificationVoiceprintHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   const sid = c.req.query("sid") ?? "";
   const vr = new VoiceResponse();
   try {
@@ -936,6 +1028,7 @@ export async function verificationVoiceprintHandler(c: Context) {
  * expects a plain 200 — no TwiML is executed from this callback.
  */
 export async function verificationVoiceprintTranscriptionHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   try {
     const sid = c.req.query("sid") ?? "";
     if (!sid) return c.text("ok");
@@ -1057,6 +1150,7 @@ async function fetchVoiceProfile(recordingUrl: string): Promise<ClipProfile> {
 /* -------------------------------------------------------------------------- */
 
 export async function verificationGatherHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   const sid = c.req.query("sid") ?? "";
   const vr = new VoiceResponse();
   const P = vs.verifyPrompts();
@@ -1212,6 +1306,7 @@ export async function verificationSmsInboundHandler(c: Context) {
  * diagnosed from the dashboard instead of guesswork.
  */
 export async function verificationConferenceHandler(c: Context) {
+  if (!(await twilioSignatureOk(c))) return c.text("forbidden", 403);
   try {
     const sid = c.req.query("sid") ?? "";
     const body = await c.req.parseBody();

@@ -29,6 +29,13 @@
       "when": 1788271200000,
       "tag": "0003_verification_recordings",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1788360000000,
+      "tag": "0004_two_phase_challenge",
+      "breakpoints": true
     }
   ]
 }
