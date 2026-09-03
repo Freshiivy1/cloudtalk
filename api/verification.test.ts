@@ -169,18 +169,76 @@ describe("normalizeE164", () => {
   });
 });
 
-describe("merge watch window", () => {
-  it("defaults to 60s so the callee has time to merge (env-overridable)", () => {
-    const saved = process.env.VERIFY_MERGE_WATCH_MS;
-    delete process.env.VERIFY_MERGE_WATCH_MS;
+describe("two-phase challenge config (corrected architecture)", () => {
+  it("stream readiness timeout defaults to 15s (env-overridable)", () => {
+    const saved = process.env.VERIFY_STREAM_READY_TIMEOUT_MS;
+    delete process.env.VERIFY_STREAM_READY_TIMEOUT_MS;
     try {
-      expect(vs.mergeWatchMs()).toBe(60_000);
-      process.env.VERIFY_MERGE_WATCH_MS = "5000";
-      expect(vs.mergeWatchMs()).toBe(5_000);
+      expect(vs.streamReadyTimeoutMs()).toBe(15_000);
+      process.env.VERIFY_STREAM_READY_TIMEOUT_MS = "5000";
+      expect(vs.streamReadyTimeoutMs()).toBe(5_000);
     } finally {
-      if (saved === undefined) delete process.env.VERIFY_MERGE_WATCH_MS;
-      else process.env.VERIFY_MERGE_WATCH_MS = saved;
+      if (saved === undefined) delete process.env.VERIFY_STREAM_READY_TIMEOUT_MS;
+      else process.env.VERIFY_STREAM_READY_TIMEOUT_MS = saved;
     }
+  });
+
+  it("transition tolerance defaults to 1000ms (env-overridable)", () => {
+    const saved = process.env.VERIFY_TRANSITION_TOLERANCE_MS;
+    delete process.env.VERIFY_TRANSITION_TOLERANCE_MS;
+    try {
+      expect(vs.transitionToleranceMs()).toBe(1_000);
+      process.env.VERIFY_TRANSITION_TOLERANCE_MS = "2500";
+      expect(vs.transitionToleranceMs()).toBe(2_500);
+    } finally {
+      if (saved === undefined) delete process.env.VERIFY_TRANSITION_TOLERANCE_MS;
+      else process.env.VERIFY_TRANSITION_TOLERANCE_MS = saved;
+    }
+  });
+
+  it("currentDetectionPhase derives from persisted timestamps (restart-safe)", () => {
+    // No challenge started: only the armed readiness phase is visible.
+    expect(
+      vs.currentDetectionPhase({
+        challengeStartedAt: null,
+        promptEndsAt: null,
+        detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+      }),
+    ).toBe(vs.DetectionPhase.AWAITING_STREAM_READY);
+    expect(
+      vs.currentDetectionPhase({
+        challengeStartedAt: null,
+        promptEndsAt: null,
+        detectionPhase: null,
+      }),
+    ).toBeNull();
+    // Phase 1 while now < promptEndsAt + tolerance.
+    const started = new Date(Date.now() - 1_000);
+    expect(
+      vs.currentDetectionPhase({
+        challengeStartedAt: started,
+        promptEndsAt: new Date(Date.now() + 5_000),
+        detectionPhase: vs.DetectionPhase.PROMPT_LIGHT,
+      }),
+    ).toBe(vs.DetectionPhase.PROMPT_LIGHT);
+    // Phase 2 once promptEndsAt + tolerance has passed.
+    expect(
+      vs.currentDetectionPhase({
+        challengeStartedAt: new Date(Date.now() - 60_000),
+        promptEndsAt: new Date(Date.now() - 30_000),
+        detectionPhase: vs.DetectionPhase.PROMPT_LIGHT,
+      }),
+    ).toBe(vs.DetectionPhase.LOUD_DTMF);
+  });
+
+  it("detectionIsLive requires BOTH stream-ready and a started challenge", () => {
+    expect(vs.detectionIsLive({ streamReadyAt: null, challengeStartedAt: null })).toBe(false);
+    expect(vs.detectionIsLive({ streamReadyAt: new Date(), challengeStartedAt: null })).toBe(false);
+    expect(vs.detectionIsLive({ streamReadyAt: new Date(), challengeStartedAt: new Date() })).toBe(true);
+  });
+
+  it("merge tone pair 852+1336 Hz is DTMF-8 (frequencies unchanged)", () => {
+    expect(vs.MERGE_TONE_DIGIT).toBe("8");
   });
 });
 
@@ -285,10 +343,11 @@ describe("state machine", () => {
     expect(after.smsSent).toBe(true);
   });
 
-  it("guarded: late async-AMD machine verdict after Leg B answer is log-only", async () => {
-    // With asyncAmd the machine verdict arrives AFTER the answer callback took
-    // the human path — and the call-waiting switch beep is a classic AMD
-    // false positive. The second call must NOT be killed mid-verification.
+  it("machine/voicemail AMD NEVER human-confirms: late verdict after Leg B answer is DETECTION_INCONCLUSIVE", async () => {
+    // With asyncAmd the machine verdict arrives AFTER the answer callback.
+    // A machine answer cannot confirm a human took the call — the old
+    // log-only ignore (an effective human-confirmation) is gone; the session
+    // is torn down as inconclusive, never a pass.
     const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
       guarded: true,
       callerCallSid: "CA_amd_caller",
@@ -297,15 +356,19 @@ describe("state machine", () => {
     });
     await vs.onVoicemailDetected(s.sessionId, "machine_end_beep");
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.state).toBe(vs.VState.LEG_B_ANSWERED);
-    // Leg B stays up — no hangup, no redirect, no call-waiting announcements.
-    expect(updatedCalls.some((u) => u.sid === "CA_amd_legB")).toBe(false);
-    expect(updatedCalls.some((u) => u.sid === "CA_amd_legA")).toBe(false);
+    expect(after.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
+    // Full teardown: every leg hung up (a REST status=completed pulls legs
+    // out of <Dial><Conference>) and the conference completed by SID.
+    expect(updatedCalls.some((u) => u.sid === "CA_amd_legB" && u.status === "completed")).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_amd_legA" && u.status === "completed")).toBe(true);
+    expect(conferenceUpdates.some((u) => u.status === "completed")).toBe(true);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("AMD_LATE_MACHINE_IGNORED");
+    expect(types).toContain("AMD_MACHINE_AFTER_ANSWER");
+    expect(types).toContain("DETECTION_INCONCLUSIVE");
+    expect(types).not.toContain("AMD_LATE_MACHINE_IGNORED");
   });
 
-  it("non-guarded: AMD machine verdict still ends the call (legacy)", async () => {
+  it("non-guarded: machine verdict after Leg B answer is also DETECTION_INCONCLUSIVE (never human-confirmed)", async () => {
     const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
       callerCallSid: "CA_amdn_caller",
       legACallSid: "CA_amdn_legA",
@@ -313,7 +376,7 @@ describe("state machine", () => {
     });
     await vs.onVoicemailDetected(s.sessionId, "machine_end_beep");
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.state).toBe(vs.VState.CALL_WAITING_OFF);
+    expect(after.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
     expect(updatedCalls.some((u) => u.sid === "CA_amdn_legB" && u.status === "completed")).toBe(
       true,
     );
@@ -615,6 +678,10 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
         guarded: true,
         callerCallSid: "CA_tm_caller",
         legACallSid: "CA_tm_legA",
+        // A monitored BRIDGED call ends COMPLETED; without these persisted
+        // readiness/challenge facts the corrected engine must be inconclusive.
+        streamReadyAt: new Date(),
+        challengeStartedAt: new Date(),
       });
       await vs.armMergeTone(s.sessionId);
       expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
@@ -938,8 +1005,9 @@ describe("speakerphoneArmWindows (3s forensic arming)", () => {
 });
 
 describe("guarded live bridge (verification pass → BRIDGED)", () => {
-  it("guarded: bridges caller + Leg A live once the merge watch elapses with no merge", async () => {
-    process.env.VERIFY_MERGE_WATCH_MS = "0";
+  it("guarded: bridges the browser caller into the conference IMMEDIATELY at Leg B answer (no watch pass)", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
     try {
       const s = await makeSession(vs.VState.LEG_B_DIALING, {
         guarded: true,
@@ -948,136 +1016,156 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
         ringTestCallSid: "CA_g_rt",
       });
       const updBefore = updatedCalls.length;
-      // Leg B answered by a human → LEG_B_ANSWERED arms the merge watch.
+      // Leg B answered → LEG_B_ANSWERED arms the readiness deadline, and the
+      // guarded bridge happens at once (Leg B's own TwiML dials the
+      // conference as anchor; the caller is redirected in as joiner).
       await vs.onLegBAnswered(s.sessionId, "CA_g_legB");
-      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
-      // Watch window (0ms here) elapses with no merge → PASS → live bridge.
-      await tick(150);
       const after = (await vs.findSession(s.sessionId))!;
       expect(after.state).toBe(vs.VState.BRIDGED);
+      // Readiness armed (persisted): no stream-ready by the deadline is
+      // DETECTION_FAILED — never a silent pass.
+      expect(after.streamReadyBy).not.toBeNull();
+      expect(after.detectionPhase).toBe(vs.DetectionPhase.AWAITING_STREAM_READY);
       const added = updatedCalls.slice(updBefore);
-      // Caller + Leg A redirected into the live two-way conference, each with
-      // its conference role in the URL (caller=joiner, legA=anchor)…
+      // The CALLER is redirected into the live conference as joiner…
       expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("guarded-bridge") && String(u.url).includes("leg=caller"))).toBe(true);
-      expect(added.some((u) => u.sid === "CA_g_legA" && String(u.url).includes("guarded-bridge") && String(u.url).includes("leg=legA"))).toBe(true);
-      // …the ring-test leg is hung up, AND Leg B is torn down at bridge time:
-      // the callee answered it via call waiting (Leg A went on hold on their
-      // handset), so ending Leg B server-side returns the handset to Leg A —
-      // now the live conference. Leaving Leg B up was the both-sides-deaf bug.
+      // …Leg A is the canary and is NEVER redirected into the conference…
+      expect(added.some((u) => u.sid === "CA_g_legA" && String(u.url).includes("guarded-bridge"))).toBe(false);
+      // …Leg B is the live leg and is NOT torn down at bridge time…
+      expect(added.some((u) => u.sid === "CA_g_legB" && u.status === "completed")).toBe(false);
+      // …the ring-test leg is hung up…
       expect(added.some((u) => u.sid === "CA_g_rt" && u.status === "completed")).toBe(true);
-      expect(added.some((u) => u.sid === "CA_g_legB" && u.status === "completed")).toBe(true);
-      // …and the caller is NEVER sent to the legacy verdict announcement.
+      // …and the caller is NEVER sent to a legacy verdict announcement.
       expect(added.some((u) => u.sid === "CA_g_caller" && String(u.url).includes("notify-"))).toBe(false);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
-      expect(types).toContain("GUARDED_MERGE_WATCH_ARMED");
+      expect(types).toContain("STREAM_READINESS_ARMED");
       expect(types).toContain(vs.VState.BRIDGED);
       expect(types).toContain("GUARDED_BRIDGED");
-      expect(types).toContain("LEG_B_PASS_TEARDOWN");
+      expect(types).not.toContain("GUARDED_MERGE_WATCH_ARMED");
+      expect(types).not.toContain("LEG_B_PASS_TEARDOWN");
     } finally {
-      delete process.env.VERIFY_MERGE_WATCH_MS;
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
     }
   });
 
-  it("non-guarded: watch never bridges — LEG_B_ANSWERED behavior bit-for-bit unchanged", async () => {
-    process.env.VERIFY_MERGE_WATCH_MS = "0";
+  it("guarded without a configured relay fails CLOSED at Leg B answer (DETECTION_FAILED)", async () => {
+    delete process.env.VERIFY_STREAM_URL;
+    const s = await makeSession(vs.VState.LEG_B_DIALING, {
+      guarded: true,
+      callerCallSid: "CA_norel_caller",
+      legACallSid: "CA_norel_legA",
+    });
+    await vs.onLegBAnswered(s.sessionId, "CA_norel_legB");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.DETECTION_FAILED);
+    // An unmonitored call never bridges the caller.
+    expect(
+      updatedCalls.some((u) => u.sid === "CA_norel_caller" && String(u.url).includes("guarded-bridge")),
+    ).toBe(false);
+  });
+
+  it("non-guarded: Leg B answer arms readiness, never bridges the caller", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
     try {
       const s = await makeSession(vs.VState.LEG_B_DIALING, {
         callerCallSid: "CA_ng_caller",
         legACallSid: "CA_ng_legA",
       });
-      // Assert only on THIS test's REST updates — earlier guarded-bridge
-      // tests legitimately redirect to guarded-bridge, so the global array
-      // must not be consulted whole.
       const updBefore = updatedCalls.length;
       await vs.onLegBAnswered(s.sessionId, "CA_ng_legB");
-      await tick(200);
-      // No bridge, no guarded events, no hangups — session waits for the
-      // legacy merge/verdict outcomes exactly as before.
-      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
+      await tick(100);
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.LEG_B_ANSWERED);
+      expect(after.streamReadyBy).not.toBeNull();
+      expect(after.detectionPhase).toBe(vs.DetectionPhase.AWAITING_STREAM_READY);
       const added = updatedCalls.slice(updBefore);
       expect(added.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
-      expect(types).not.toContain("GUARDED_MERGE_WATCH_ARMED");
+      expect(types).toContain("STREAM_READINESS_ARMED");
       expect(types).not.toContain("GUARDED_BRIDGED");
     } finally {
-      delete process.env.VERIFY_MERGE_WATCH_MS;
-    }
-  });
-
-  it("maybeBridgeGuarded(legAInline): redirects the caller only (Leg A is served inline)", async () => {
-    process.env.VERIFY_MERGE_WATCH_MS = "0";
-    try {
-      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
-        guarded: true,
-        callerCallSid: "CA_i_caller",
-        legACallSid: "CA_i_legA",
-      });
-      // First sight in this process arms the watch and defers one cycle.
-      expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(false);
-      const updBefore = updatedCalls.length;
-      expect(await vs.maybeBridgeGuarded(s.sessionId, { legAInline: true })).toBe(true);
-      const added = updatedCalls.slice(updBefore);
-      expect(added.some((u) => u.sid === "CA_i_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
-      // Leg A must NOT be REST-redirected — the TwiML fetch serves it inline.
-      expect(added.some((u) => u.sid === "CA_i_legA" && String(u.url).includes("guarded-bridge"))).toBe(false);
-      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
-      // Idempotent: a second pass is a no-op.
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
-    } finally {
-      delete process.env.VERIFY_MERGE_WATCH_MS;
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
     }
   });
 
   it("D2: the bridge flips the event-driven registry flag synchronously (no DB poll needed)", async () => {
-    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
     try {
-      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
         guarded: true,
         callerCallSid: "CA_reg_caller",
         legACallSid: "CA_reg_legA",
       });
       expect(vs.isBridgedSession(s.sessionId)).toBe(false);
-      // First sight arms the watch and defers one cycle.
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
-      expect(vs.isBridgedSession(s.sessionId)).toBe(false);
-      // The successful bridge sets the flag on return — the media-stream
-      // analyzer path sees BRIDGED on the next audio window, before any
-      // DB refresh poll could run.
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(true);
+      await vs.onLegBAnswered(s.sessionId, "CA_reg_legB");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
       expect(vs.isBridgedSession(s.sessionId)).toBe(true);
       // A terminal transition clears the flag (maps can't grow unboundedly).
       await vs.onMergeDetected(s.sessionId, { inCall: true });
       expect(vs.isBridgedSession(s.sessionId)).toBe(false);
     } finally {
-      delete process.env.VERIFY_MERGE_WATCH_MS;
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
     }
   });
 
-  it("guarded: Leg B hangup during LEG_B_ANSWERED bridges (no notify-completed)", async () => {
+  it("guarded: Leg B hangup without confirmed readiness is DETECTION_INCONCLUSIVE — never a forced pass", async () => {
+    // The old force:true bridge-on-hangup is gone: a Leg B completion without
+    // a verified live outcome (no stream-ready, no challenge) is inconclusive.
     const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
       guarded: true,
       callerCallSid: "CA_lbh_caller",
       legACallSid: "CA_lbh_legA",
       ringTestCallSid: "CA_lbh_rt",
+      streamReadyBy: new Date(Date.now() + 60_000),
+      detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
     });
     const updBefore = updatedCalls.length;
     await vs.onCallCompleted(s.sessionId, "legB", "CA_lbh_legB", "duration=12s");
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.state).toBe(vs.VState.BRIDGED);
+    expect(after.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
     const added = updatedCalls.slice(updBefore);
-    // BOTH caller and Leg A are redirected into the live conference…
-    expect(added.some((u) => u.sid === "CA_lbh_caller" && String(u.url).includes("guarded-bridge"))).toBe(true);
-    expect(added.some((u) => u.sid === "CA_lbh_legA" && String(u.url).includes("guarded-bridge"))).toBe(true);
-    // …the caller is NOT sent to the legacy verdict announcement and Leg A
-    // is NOT hung up. (Leg B already ended — that completion is what fired
-    // the force-bridge — and the ring-test leg is terminated.)
-    expect(added.some((u) => String(u.url).includes("notify-"))).toBe(false);
-    expect(added.some((u) => u.sid === "CA_lbh_legA" && u.status === "completed")).toBe(false);
+    // No bridge redirect, no verdict announcements; full teardown.
+    expect(added.some((u) => String(u.url).includes("guarded-bridge"))).toBe(false);
+    expect(added.some((u) => u.sid === "CA_lbh_caller" && String(u.url).includes("notify-completed"))).toBe(false);
+    expect(added.some((u) => u.sid === "CA_lbh_legA" && u.status === "completed")).toBe(true);
+    expect(added.some((u) => u.sid === "CA_lbh_caller" && u.status === "completed")).toBe(true);
     expect(added.some((u) => u.sid === "CA_lbh_rt" && u.status === "completed")).toBe(true);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("GUARDED_BRIDGED");
-    expect(types).toContain(vs.VState.BRIDGED);
+    expect(types).toContain("DETECTION_INCONCLUSIVE");
+    expect(types).not.toContain("GUARDED_BRIDGED");
+  });
+
+  it("guarded: Leg B hangup while BRIDGED with live detection completes COMPLETED", async () => {
+    // Verified live outcome: the relay confirmed stream-ready and the
+    // challenge started, so a normal Leg B end is a clean COMPLETED.
+    process.env.VERIFY_BRIDGE_RECALL = "false";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_lbm_caller",
+        legACallSid: "CA_lbm_legA",
+        legBCallSid: "CA_lbm_legB",
+        streamReadyAt: new Date(Date.now() - 30_000),
+        challengeStartedAt: new Date(Date.now() - 30_000),
+        promptLightDurationMs: 18_840,
+        promptEndsAt: new Date(Date.now() - 11_000),
+        detectionPhase: vs.DetectionPhase.LOUD_DTMF,
+      });
+      await vs.onCallCompleted(s.sessionId, "legB", "CA_lbm_legB", "duration=95s");
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.COMPLETED);
+      // Canary + remaining legs torn down; no recall, no inconclusive verdict.
+      expect(updatedCalls.some((u) => u.sid === "CA_lbm_legA" && u.status === "completed")).toBe(true);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("GUARDED_CALL_ENDED");
+    } finally {
+      delete process.env.VERIFY_BRIDGE_RECALL;
+    }
   });
 
   it("non-guarded: Leg B hangup still completes with notify-completed + hangupAll (legacy)", async () => {
@@ -1140,56 +1228,68 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(updatedCalls.length).toBe(updCount);
   });
 
-  it("BRIDGED: caller hangup → COMPLETED + Leg A released by the conference, not a REST redirect", async () => {
+  it("BRIDGED: caller hangup on a monitored call → COMPLETED + Leg B released by the conference", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_b_caller",
       legACallSid: "CA_b_legA",
+      legBCallSid: "CA_b_legB",
+      streamReadyAt: new Date(Date.now() - 30_000),
+      challengeStartedAt: new Date(Date.now() - 30_000),
     });
     const updBefore = updatedCalls.length;
     await vs.onCallCompleted(s.sessionId, "caller", "CA_b_caller", "duration=120s");
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.COMPLETED);
     expect(after.completedAt).not.toBeNull();
-    // The surviving party is inside an active <Dial><Conference> — a REST
-    // redirect cannot reach them, so NONE is attempted. endConferenceOnExit
-    // on the departed leg ends the conference; the survivor's Dial returns
-    // and its post-Dial <Redirect> plays notify-partner-ended and hangs up
-    // (asserted in the bridge-TwiML tests below). With a live conference
-    // (mock default) the survivor is NOT REST-hung-up either.
+    // The surviving Leg B is inside an active <Dial><Conference> — a REST
+    // redirect cannot reach them. endConferenceOnExit on the caller leg ends
+    // the conference; Leg B's Dial returns and its post-Dial <Redirect> plays
+    // notify-partner-ended and hangs up. The engine additionally releases the
+    // callee leg via REST (race-safe). The canary (Leg A) is hung up.
     const added = updatedCalls.slice(updBefore);
-    expect(added.some((u) => u.sid === "CA_b_legA")).toBe(false);
+    expect(added.some((u) => u.sid === "CA_b_legA" && u.status === "completed")).toBe(true);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("GUARDED_CALL_ENDED");
     expect(types).toContain(vs.VState.COMPLETED);
   });
 
-  it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller released by the conference, not a REST redirect", async () => {
-    // VERIFY_BRIDGE_RECALL=off keeps the original completion contract; the
-    // default-on auto-recall path is covered in the bridge-supervisor suite.
-    process.env.VERIFY_BRIDGE_RECALL = "false";
-    try {
-      const s = await makeSession(vs.VState.BRIDGED, {
-        guarded: true,
-        callerCallSid: "CA_b2_caller",
-        legACallSid: "CA_b2_legA",
-      });
-      const updBefore = updatedCalls.length;
-      await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
-      const after = (await vs.findSession(s.sessionId))!;
-      expect(after.state).toBe(vs.VState.COMPLETED);
-      // Same contract as the caller-hangup direction: no REST redirect/hangup
-      // against a leg that is inside the (mock-live) conference.
-      const added = updatedCalls.slice(updBefore);
-      expect(added.some((u) => u.sid === "CA_b2_caller")).toBe(false);
-    } finally {
-      delete process.env.VERIFY_BRIDGE_RECALL;
-    }
+  it("BRIDGED: caller hangup on an UNMONITORED call is DETECTION_INCONCLUSIVE (never a pass)", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_bu_caller",
+      legACallSid: "CA_bu_legA",
+      legBCallSid: "CA_bu_legB",
+      streamReadyBy: new Date(Date.now() + 60_000),
+      detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+    });
+    await vs.onCallCompleted(s.sessionId, "caller", "CA_bu_caller", "duration=8s");
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
+  });
+
+  it("BRIDGED: canary (Leg A) lost mid-call → DETECTION_INCONCLUSIVE + full teardown", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_b2_caller",
+      legACallSid: "CA_b2_legA",
+      legBCallSid: "CA_b2_legB",
+      streamReadyAt: new Date(Date.now() - 30_000),
+      challengeStartedAt: new Date(Date.now() - 30_000),
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
+    const after = (await vs.findSession(s.sessionId))!;
+    // The canary carried the challenge — without it the call can no longer be
+    // verified: inconclusive, never a pass.
+    expect(after.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
+    expect(updatedCalls.some((u) => u.sid === "CA_b2_legB" && u.status === "completed")).toBe(true);
+    expect(updatedCalls.some((u) => u.sid === "CA_b2_caller" && u.status === "completed")).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("CANARY_LOST");
   });
 
   it("BRIDGED: a survivor stuck OUTSIDE the conference (lobby) is hung up by REST", async () => {
     // The caller joins with startConferenceOnEnter: false — if the anchor
-    // (Leg A) dies before ever starting the conference, the caller is stuck
+    // (Leg B) dies before ever starting the conference, the caller is stuck
     // in a pre-start lobby with no end trigger. With NO live conference the
     // engine must hang the survivor up directly.
     process.env.VERIFY_BRIDGE_RECALL = "false";
@@ -1197,10 +1297,13 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       guarded: true,
       callerCallSid: "CA_lob_caller",
       legACallSid: "CA_lob_legA",
+      legBCallSid: "CA_lob_legB",
+      streamReadyAt: new Date(Date.now() - 30_000),
+      challengeStartedAt: new Date(Date.now() - 30_000),
     });
     twilioMock.listResult = []; // no in-progress conference
     try {
-      await vs.onCallCompleted(s.sessionId, "legA", "CA_lob_legA", "duration=5s");
+      await vs.onCallCompleted(s.sessionId, "legB", "CA_lob_legB", "duration=5s");
       expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.COMPLETED);
       expect(
         updatedCalls.some((u) => u.sid === "CA_lob_caller" && u.status === "completed"),
@@ -1343,17 +1446,53 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(body).not.toContain("<Conference");
   });
 
-  it("leg-a-hold self-heals into the bridge conference once BRIDGED (anchor role)", async () => {
+  it("leg-a-hold keeps the canary OUT of the conference even when BRIDGED", async () => {
+    // Corrected architecture: Leg A is the Call Waiting canary — it plays the
+    // two-phase challenge and NEVER joins the live conference.
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_lah_caller",
       legACallSid: "CA_lah_legA",
+      legBCallSid: "CA_lah_legB",
     });
     const res = await postForm(`/api/verify/twiml/leg-a-hold?sid=${s.sessionId}`);
     const body = await res.text();
-    expect(body).toContain("<Conference");
-    expect(body).toContain('startConferenceOnEnter="true"');
-    expect(body).not.toContain("<Pause");
+    expect(body).not.toContain("<Conference");
+    expect(body).toContain("<Pause");
+  });
+
+  it("leg-a-hold enforces the persisted readiness deadline (restart-safe fallback)", async () => {
+    // No background timers after a restart: the Leg A hold poll notices the
+    // missed stream-ready deadline and fails the detection — never a pass.
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      legACallSid: "CA_rd_legA",
+      legBCallSid: "CA_rd_legB",
+      streamReadyBy: new Date(Date.now() - 5_000), // deadline already missed
+      detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+    });
+    const res = await postForm(`/api/verify/twiml/leg-a-hold?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("<Hangup");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.DETECTION_FAILED);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("DETECTION_FAILED");
+  });
+
+  it("checkStreamReadiness is a no-op before the deadline and after stream-ready", async () => {
+    const pending = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      streamReadyBy: new Date(Date.now() + 60_000),
+      detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+    });
+    await vs.checkStreamReadiness(pending.sessionId);
+    expect((await vs.findSession(pending.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
+    const ready = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      streamReadyBy: new Date(Date.now() - 5_000),
+      streamReadyAt: new Date(),
+      detectionPhase: vs.DetectionPhase.PROMPT_LIGHT,
+    });
+    await vs.checkStreamReadiness(ready.sessionId);
+    expect((await vs.findSession(ready.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
   });
 
   it("guarded-bridge TwiML records the conference for call review", async () => {
@@ -1363,30 +1502,73 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(body).toContain("/api/verify/recording/bridge?sid=abc123");
   });
 
-  it("leg-a-tone loop serves the bridge inline once a guarded session is BRIDGED", async () => {
-    const s = await makeSession(vs.VState.BRIDGED, {
-      guarded: true,
-      callerCallSid: "CA_t_caller",
-      legACallSid: "CA_t_legA",
+  it("leg-a-challenge waits (no prompt) until the challenge has started", async () => {
+    // The prompt-light asset must NEVER play before stream-ready — otherwise
+    // the relay would count Phase 1 against an untimed prompt.
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      legACallSid: "CA_chw_legA",
+      detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
     });
-    const res = await postForm(`/api/verify/twiml/leg-a-tone?sid=${s.sessionId}`);
+    const res = await postForm(`/api/verify/twiml/leg-a-challenge?sid=${s.sessionId}`);
     const body = await res.text();
-    expect(body).toContain("<Conference");
-    expect(body).toContain(`verify-${s.sessionId}`);
+    expect(body).not.toContain("prompt-light.wav");
     expect(body).not.toContain("<Play");
+    expect(body).toContain("<Pause");
+    expect(body).toContain(`/api/verify/twiml/leg-a-challenge?sid=${s.sessionId}`);
   });
 
-  it("leg-a-tone loop keeps the guarded merge test on a short (loop=1) poll while watching", async () => {
+  it("leg-a-challenge plays the prompt-light asset exactly once, then hands off to the loud-tone phase", async () => {
+    const started = new Date();
     const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
-      guarded: true,
-      legACallSid: "CA_w_legA",
+      legACallSid: "CA_ch_legA",
+      challengeStartedAt: started,
+      promptLightDurationMs: 18_840,
+      promptEndsAt: new Date(started.getTime() + 18_840),
+      detectionPhase: vs.DetectionPhase.PROMPT_LIGHT,
     });
-    const res = await postForm(`/api/verify/twiml/leg-a-tone?sid=${s.sessionId}`);
+    const res = await postForm(`/api/verify/twiml/leg-a-challenge?sid=${s.sessionId}`);
+    const body = await res.text();
+    // Phase 1: the pre-rendered prompt + light watermark, exactly once.
+    expect(body).toContain('<Play loop="1">');
+    expect(body).toContain("/api/verify/prompt-light.wav");
+    // Phase 2 hand-off: the loud tone loop document.
+    expect(body).toContain(`/api/verify/twiml/leg-a-challenge-tone?sid=${s.sessionId}`);
+    // The loud tone itself does NOT play in Phase 1.
+    expect(body).not.toContain("/api/verify/tone.wav");
+  });
+
+  it("leg-a-challenge-tone loops the loud merge tone (Phase 2)", async () => {
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, { legACallSid: "CA_ct_legA" });
+    const res = await postForm(`/api/verify/twiml/leg-a-challenge-tone?sid=${s.sessionId}`);
     const body = await res.text();
     expect(body).toContain("<Play");
-    expect(body).toContain('loop="1"');
-    // Watch not elapsed → still in the merge test, not bridged.
-    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_ANSWERED);
+    expect(body).toContain("/api/verify/tone.wav");
+    expect(body).toContain('loop="10"');
+    expect(body).not.toContain("digits=");
+    expect(body).toContain(`/api/verify/twiml/leg-a-challenge-tone?sid=${s.sessionId}`);
+  });
+
+  it("challenge documents hang up on terminal sessions", async () => {
+    const s = await makeSession(vs.VState.MERGE_DETECTED, {
+      legACallSid: "CA_ctt_legA",
+      completedAt: new Date(),
+    });
+    for (const kind of ["leg-a-challenge", "leg-a-challenge-tone", "leg-a-hold", "leg-b-hold"]) {
+      const res = await postForm(`/api/verify/twiml/${kind}?sid=${s.sessionId}`);
+      expect(await res.text()).toContain("<Hangup");
+    }
+  });
+
+  it("prompt-light.wav endpoint serves the Phase 1 asset with the measured duration header", async () => {
+    const res = await hookApp.request("/api/verify/prompt-light.wav");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("audio/wav");
+    expect(res.headers.get("Cache-Control")).toContain("no-store");
+    expect(res.headers.get("X-Prompt-Light-Duration-Ms")).toBe("18840");
+    const buf = Buffer.from(await res.arrayBuffer());
+    expect(buf.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    // 8 kHz mono PCM16, exactly 18.840s: 150720 frames * 2 bytes + 44 header.
+    expect(buf.length).toBe(44 + 150_720 * 2);
   });
 });
 
@@ -1426,10 +1608,14 @@ import {
   handleMergeToneFire,
   handleSpeakerphoneSuspicious,
   verificationStreamDetectedHandler,
+  verificationStreamFailedHandler,
+  verificationStreamReadyHandler,
   relayStreamUrl,
+  streamToken,
 } from "./verification-stream";
 import {
   mergeToneHandler,
+  promptLightHandler,
   verificationConferenceHandler,
   verificationSmsInboundHandler,
   verificationStatusHandler,
@@ -1449,11 +1635,14 @@ hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandle
 hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 hookApp.post("/api/verify/voiceprint-transcription", verificationVoiceprintTranscriptionHandler);
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
+hookApp.get("/api/verify/prompt-light.wav", promptLightHandler);
 hookApp.get("/api/verify/merge-tone.wav", mergeToneHandler);
 hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
 hookApp.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
 hookApp.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
 hookApp.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
+hookApp.post("/api/verify/stream-ready", verificationStreamReadyHandler);
+hookApp.post("/api/verify/stream-failed", verificationStreamFailedHandler);
 hookApp.post("/api/verify/sms/inbound", verificationSmsInboundHandler);
 hookApp.post("/api/verify/conference", verificationConferenceHandler);
 hookApp.get("/api/verify/version", verificationVersionHandler);
@@ -1491,20 +1680,89 @@ describe("webhooks", () => {
     expect(body).toContain("<Say>");
   });
 
-  it("leg-b TwiML runs the silent record-chunk loop for merge detection", async () => {
-    for (const kind of ["leg-b", "leg-b-record"]) {
-      const res = await postForm(`/api/verify/twiml/${kind}?sid=abc123`);
+  it("leg-b TwiML (guarded): non-blocking inbound Start>Stream + Dial>Conference, no prompt/gather/record", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
+        guarded: true,
+        callerCallSid: "CA_lb_caller",
+      });
+      const res = await postForm(`/api/verify/twiml/leg-b?sid=${s.sessionId}`);
+      expect(res.status).toBe(200);
       const body = await res.text();
-      expect(body).toContain("<Record");
-      expect(body).toContain('maxLength="1"');
-      expect(body).toContain("/api/verify/recording/merge?sid=abc123");
-      expect(body).toContain("/api/verify/twiml/leg-b-record?sid=abc123");
-      // SILENT on Leg B — no prompts, no beep, no stream, no gather
+      // NON-BLOCKING inbound-only detection stream (Start — not Connect).
+      expect(body).toContain("<Start>");
+      expect(body).toContain("<Stream");
+      expect(body).toContain('track="inbound_track"');
+      expect(body).toContain("wss://relay.example.com/stream");
+      // Stream identity ONLY via customParameters: sid / leg=legB /
+      // mode=merge-detection / HMAC token. The URL carries no session id.
+      expect(body).toContain(`<Parameter name="sid" value="${s.sessionId}"`);
+      expect(body).toContain('<Parameter name="leg" value="legB"');
+      expect(body).toContain('<Parameter name="mode" value="merge-detection"');
+      expect(body).toContain(`<Parameter name="token" value="${streamToken(s.sessionId)}"`);
+      // Only the Stream URL itself is forbidden from carrying the session id;
+      // unrelated conference/recording callback URLs legitimately use ?sid=.
+      const streamUrl = body.match(/<Stream[^>]*url="([^"]+)"/)?.[1];
+      expect(streamUrl).toBe("wss://relay.example.com/stream");
+      expect(streamUrl).not.toContain("?sid=");
+      // Immediately continues into the live conference with the browser
+      // caller (Leg B = anchor; caller joiner exits end the room).
+      expect(body).toContain("<Dial>");
+      expect(body).toContain("<Conference");
+      expect(body).toContain(`verify-${s.sessionId}`);
+      expect(body).toContain('startConferenceOnEnter="true"');
+      expect(body).toContain('endConferenceOnExit="false"');
+      // NO Leg B prompt/Gather/keypress/tone, no blocking Connect, no Record.
       expect(body).not.toContain("<Say");
-      expect(body).not.toContain("<Stream");
+      expect(body).not.toContain("<Play");
       expect(body).not.toContain("<Gather");
-      expect(body).not.toContain('playBeep="true"');
+      expect(body).not.toContain("<Record");
+      expect(body).not.toContain("<Connect");
+      expect(body).not.toContain("/api/verify/recording/merge");
+    } finally {
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
     }
+  });
+
+  it("leg-b TwiML (non-guarded): detection stream + silent hold loop (no conference)", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, { legACallSid: "CA_lbn_legA" });
+      const res = await postForm(`/api/verify/twiml/leg-b?sid=${s.sessionId}`);
+      const body = await res.text();
+      expect(body).toContain("<Start>");
+      expect(body).toContain('<Parameter name="mode" value="merge-detection"');
+      expect(body).not.toContain("<Conference");
+      expect(body).toContain("<Pause");
+      expect(body).toContain(`/api/verify/twiml/leg-b-hold?sid=${s.sessionId}`);
+      expect(body).not.toContain("<Say");
+      expect(body).not.toContain("<Gather");
+      expect(body).not.toContain("<Record");
+      expect(body).not.toContain("<Connect");
+    } finally {
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("leg-b TwiML without a configured relay fails CLOSED (DETECTION_FAILED, hangup)", async () => {
+    delete process.env.VERIFY_STREAM_URL;
+    delete process.env.VERIFY_STREAM_SECRET;
+    const s = await makeSession(vs.VState.LEG_B_DIALING, { legACallSid: "CA_lbf_legA" });
+    const res = await postForm(`/api/verify/twiml/leg-b?sid=${s.sessionId}`);
+    const body = await res.text();
+    expect(body).toContain("<Hangup");
+    expect(body).not.toContain("<Stream");
+    expect(body).not.toContain("<Record");
+    await tick(200); // onStreamFailed is fire-and-forget from the TwiML fetch
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.DETECTION_FAILED);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("DETECTION_FAILED");
   });
 
   it("stray non-tone digit re-arms the listener without a verdict", async () => {
@@ -1542,7 +1800,7 @@ describe("webhooks", () => {
     }
   });
 
-  it("merge-tone.wav endpoint serves the armed DTMF-9 tone as audio/wav", async () => {
+  it("merge-tone.wav endpoint serves the armed DTMF-8 tone (852+1336 Hz) as audio/wav", async () => {
     const res = await hookApp.request("/api/verify/merge-tone.wav");
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("audio/wav");
@@ -1552,13 +1810,7 @@ describe("webhooks", () => {
     expect(buf.length).toBe(44 + Math.round(0.5 * 8000) * 2);
   });
 
-  it("leg-a-tone TwiML loops the in-band audio tone (1400Hz port)", async () => {
-    const res = await postForm("/api/verify/twiml/leg-a-tone?sid=abc123");
-    const body = await res.text();
-    expect(body).toContain("<Play");
-    expect(body).toContain("/api/verify/tone.wav");
-    expect(body).not.toContain("digits=");
-  });
+
 
   it("tone endpoint serves the wav as audio/wav (Twilio requires it)", async () => {
     const res = await hookApp.request("/api/verify/tone.wav");
@@ -1622,7 +1874,7 @@ describe("webhooks", () => {
   it("relay stream-detected callback: 403 without secret, MERGE_DETECTED with it", async () => {
     process.env.VERIFY_STREAM_SECRET = "test-secret";
     try {
-      expect(relayStreamUrl("abc")).toBeNull(); // VERIFY_STREAM_URL unset in tests
+      expect(relayStreamUrl()).toBeNull(); // VERIFY_STREAM_URL unset in tests
       const s = await makeSession(vs.VState.LEG_B_ANSWERED, { legBCallSid: "CA_legb_relay" });
 
       // No/wrong secret → forbidden, no state change
@@ -1645,6 +1897,215 @@ describe("webhooks", () => {
       expect(
         updatedCalls.some((u) => u.sid === "CA_legb_relay" && String(u.url).includes("notify-merge")),
       ).toBe(true);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("stream token is the relay contract HMAC: hex(HMAC-SHA256(secret, 'merge-relay-stream:' + sid))", async () => {
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const { createHmac } = await import("crypto");
+      const expected = createHmac("sha256", "test-secret")
+        .update("merge-relay-stream:abc123")
+        .digest("hex");
+      expect(streamToken("abc123")).toBe(expected);
+      expect(streamToken("abc123")).toMatch(/^[0-9a-f]{64}$/);
+      // Per-session: different sid → different token.
+      expect(streamToken("other")).not.toBe(expected);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("relay stream-ready: 403 without secret; starts the challenge ONLY then (persisted + Leg A redirect + relay challenge-start)", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const relayPosts: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      relayPosts.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+      return new Response("{}", { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        legACallSid: "CA_sr_legA",
+        legBCallSid: "CA_sr_legB",
+        streamReadyBy: new Date(Date.now() + 60_000),
+        detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+      });
+      const updBefore = updatedCalls.length;
+
+      // No/wrong secret → forbidden, nothing starts.
+      const bad = await hookApp.request("/api/verify/stream-ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "wrong" },
+        body: JSON.stringify({ sid: s.sessionId, streamSid: "MZ_bad" }),
+      });
+      expect(bad.status).toBe(403);
+      expect((await vs.findSession(s.sessionId))!.challengeStartedAt).toBeNull();
+
+      const good = await hookApp.request("/api/verify/stream-ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({ sid: s.sessionId, streamSid: "MZ_ready_1", readyAt: new Date().toISOString() }),
+      });
+      expect(good.status).toBe(200);
+      expect(((await good.json()) as { ok: boolean }).ok).toBe(true);
+
+      const after = (await vs.findSession(s.sessionId))!;
+      // Restart-safe persistence: exact challenge timeline + phase.
+      expect(after.streamSid).toBe("MZ_ready_1");
+      expect(after.streamReadyAt).not.toBeNull();
+      expect(after.challengeStartedAt).not.toBeNull();
+      expect(after.promptLightDurationMs).toBe(18_840);
+      expect(after.promptEndsAt!.getTime()).toBe(after.challengeStartedAt!.getTime() + 18_840);
+      expect(after.detectionPhase).toBe(vs.DetectionPhase.PROMPT_LIGHT);
+
+      // Leg A canary redirected to the challenge TwiML (Phase 1 starts here).
+      const added = updatedCalls.slice(updBefore);
+      expect(added.some((u) => u.sid === "CA_sr_legA" && String(u.url).includes("leg-a-challenge"))).toBe(true);
+
+      // cloudtalk → relay /challenge-start with the exact window.
+      const cs = relayPosts.find((r) => r.url === "https://relay.example.com/challenge-start");
+      expect(cs).toBeTruthy();
+      expect(cs!.body.sid).toBe(s.sessionId);
+      expect(cs!.body.promptLightDurationMs).toBe(18_840);
+      expect(typeof cs!.body.promptEndsAt).toBe("string");
+      expect(typeof cs!.body.transitionToleranceMs).toBe("number");
+
+      // Idempotent: a duplicate stream-ready does not restart the challenge.
+      const upd2 = updatedCalls.length;
+      const again = await hookApp.request("/api/verify/stream-ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({ sid: s.sessionId, streamSid: "MZ_ready_1" }),
+      });
+      expect(again.status).toBe(200);
+      expect(updatedCalls.length).toBe(upd2);
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("relay stream-ready is 500 (retryable) when the challenge redirect cannot be confirmed", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      // No Leg A call leg → the challenge redirect cannot be confirmed… but a
+      // headless session has no canary either. Use a session whose leg A
+      // exists but force the redirect to fail via the mock.
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        legACallSid: "CA_srf_legA",
+        legBCallSid: "CA_srf_legB",
+        streamReadyBy: new Date(Date.now() + 60_000),
+        detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+      });
+      // …however with no relay fetch stub the challenge-start POST would hit
+      // the network, so stub fetch to fail — delivery failure after retries
+      // must flip the session to DETECTION_FAILED (never a pass).
+      vi.stubGlobal("fetch", async () => new Response("boom", { status: 500 }));
+      const res = await hookApp.request("/api/verify/stream-ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({ sid: s.sessionId, streamSid: "MZ_fail_1" }),
+      });
+      expect(res.status).toBe(500);
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.DETECTION_FAILED);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("CHALLENGE_START_FAILED");
+      expect(types).toContain("DETECTION_FAILED");
+      // Never a pass: no bridge, no COMPLETED.
+      expect(after.state).not.toBe(vs.VState.COMPLETED);
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("relay stream-failed: DETECTION_FAILED with full teardown; wrong secret 403", async () => {
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_sf_caller",
+        legACallSid: "CA_sf_legA",
+        legBCallSid: "CA_sf_legB",
+        ringTestCallSid: "CA_sf_rt",
+        streamReadyBy: new Date(Date.now() + 60_000),
+        detectionPhase: vs.DetectionPhase.AWAITING_STREAM_READY,
+      });
+      const bad = await hookApp.request("/api/verify/stream-failed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "nope" },
+        body: JSON.stringify({ sid: s.sessionId, verdict: "DETECTION_FAILED", reason: "x" }),
+      });
+      expect(bad.status).toBe(403);
+
+      const good = await hookApp.request("/api/verify/stream-failed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({
+          sid: s.sessionId,
+          verdict: "DETECTION_FAILED",
+          reason: "websocket dropped mid-call",
+          failedAt: new Date().toISOString(),
+        }),
+      });
+      expect(good.status).toBe(200);
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.DETECTION_FAILED);
+      expect(after.failureReason).toContain("websocket dropped mid-call");
+      // End Leg A, stop the stream/conference — everything exactly once.
+      expect(updatedCalls.some((u) => u.sid === "CA_sf_legA" && u.status === "completed")).toBe(true);
+      expect(updatedCalls.some((u) => u.sid === "CA_sf_legB" && u.status === "completed")).toBe(true);
+      expect(updatedCalls.some((u) => u.sid === "CA_sf_caller" && u.status === "completed")).toBe(true);
+      expect(conferenceUpdates.some((u) => u.status === "completed")).toBe(true);
+      // Idempotent: a duplicate failure callback is a 200 no-op.
+      const again = await hookApp.request("/api/verify/stream-failed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({ sid: s.sessionId, verdict: "DETECTION_FAILED", reason: "retry" }),
+      });
+      expect(again.status).toBe(200);
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.DETECTION_FAILED);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("relay stream-detected accepts the two-phase body (phase + evidence) via JSON", async () => {
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_sd_caller",
+        legACallSid: "CA_sd_legA",
+        legBCallSid: "CA_sd_legB",
+        streamReadyAt: new Date(),
+        challengeStartedAt: new Date(),
+      });
+      const res = await hookApp.request("/api/verify/stream-detected", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({
+          sid: s.sessionId,
+          verdict: "MERGE_DETECTED",
+          phase: "LOUD_DTMF",
+          detectedAt: new Date().toISOString(),
+          evidence: { goertzelStreakMs: 320 },
+        }),
+      });
+      expect(res.status).toBe(200);
+      await tick(200);
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.MERGE_DETECTED);
+      expect(after.toneDetected).toBe(true);
+      const evts = (await events(s.sessionId)).map((e) => `${e.eventType}:${e.details}`);
+      expect(evts.some((e) => e.startsWith("STREAM_DETECTED_CALLBACK:phase=LOUD_DTMF"))).toBe(true);
     } finally {
       delete process.env.VERIFY_STREAM_SECRET;
     }
@@ -1675,7 +2136,7 @@ describe("webhooks", () => {
     const s = await makeSession(vs.VState.LEG_B_ANSWERED);
     const res = await postForm(`/api/verify/gather/merge?sid=${s.sessionId}`, {
       CallSid: "CA_legb_test",
-      Digits: "9",
+      Digits: "8", // the merge-tone pair 852+1336 Hz is DTMF-8
     });
     expect(res.status).toBe(200);
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
@@ -1964,7 +2425,7 @@ describe("full flows (mocked Twilio)", () => {
     // Callee merges → leaked digits in Leg B's Gather → MERGE_DETECTED.
     const res = await postForm(`/api/verify/gather/merge?sid=${s.sessionId}`, {
       CallSid: "CA_legb_headless",
-      Digits: "9",
+      Digits: "8", // 852+1336 Hz = DTMF-8
     });
     // Current merge verdict (verifyPrompts().mergeDetected) + hangup.
     expect(await res.text()).toContain(
@@ -2016,14 +2477,15 @@ describe("full flows (mocked Twilio)", () => {
         (u) => u.sid === "CA_legb_p" && String(u.url).includes("conference-leg-b"),
       ),
     ).toBe(false);
-    // …and the trade-off is logged as an event note on LEG_B_ANSWERED.
+    // …and the stream-readiness deadline is armed (missing stream-ready is
+    // DETECTION_FAILED, never a silent pass).
     const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("LEG_B_ANSWERED_NOTE");
+    expect(types).toContain("STREAM_READINESS_ARMED");
 
     // Terminal state → the parked caller is redirected to the verdict TwiML.
     await postForm(`/api/verify/gather/merge?sid=${s.sessionId}`, {
       CallSid: "CA_legb_p",
-      Digits: "9",
+      Digits: "8", // 852+1336 Hz = DTMF-8
     });
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
     expect(
@@ -3324,45 +3786,50 @@ describe("bridge supervisor", () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_cs_caller",
-      legACallSid: "CA_cs_legA",
+      legBCallSid: "CA_cs_legB",
     });
     const base = `/api/verify/conference?sid=${s.sessionId}`;
     await postForm(base, {
       StatusCallbackEvent: "conference-start",
       ConferenceSid: "CF_test_1",
     });
-    await postForm(base, { StatusCallbackEvent: "participant-join", CallSid: "CA_cs_legA", ConferenceSid: "CF_test_1" });
+    await postForm(base, { StatusCallbackEvent: "participant-join", CallSid: "CA_cs_legB", ConferenceSid: "CF_test_1" });
     await postForm(base, { StatusCallbackEvent: "participant-join", CallSid: "CA_cs_caller", ConferenceSid: "CF_test_1" });
-    await postForm(base, { StatusCallbackEvent: "participant-leave", CallSid: "CA_cs_legA", ConferenceSid: "CF_test_1" });
+    await postForm(base, { StatusCallbackEvent: "participant-leave", CallSid: "CA_cs_legB", ConferenceSid: "CF_test_1" });
     const evts = (await events(s.sessionId)).map((e) => `${e.eventType}:${e.details}`);
     expect(evts.some((e) => e.startsWith("CONF_STARTED:"))).toBe(true);
-    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_JOINED:leg=legA"))).toBe(true);
+    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_JOINED:leg=legB"))).toBe(true);
     expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_JOINED:leg=caller"))).toBe(true);
-    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_LEFT:leg=legA"))).toBe(true);
+    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_LEFT:leg=legB"))).toBe(true);
   });
 
-  it("join watchdog re-redirects legs that never JOINED the conference", async () => {
+  it("join watchdog re-redirects bridge legs (caller + legB) that never JOINED the conference", async () => {
     const saved = process.env.VERIFY_BRIDGE_WATCHDOG_MS;
-    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
     process.env.VERIFY_BRIDGE_WATCHDOG_MS = "50";
     try {
-      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
         guarded: true,
         callerCallSid: "CA_wd_caller",
         legACallSid: "CA_wd_legA",
       });
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false); // arm
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(true); // bridge
+      // Bridge happens at Leg B answer; the watchdog proves BOTH live parties
+      // (caller + legB — never the canary legA) actually joined.
+      await vs.onLegBAnswered(s.sessionId, "CA_wd_legB");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
       // No participant-join events arrive → the watchdog must notice BOTH legs.
       await tick(400);
       const evts = (await events(s.sessionId)).map((e) => `${e.eventType}:${e.details}`);
       expect(evts.some((e) => e.startsWith("BRIDGE_JOIN_MISSING:leg=caller"))).toBe(true);
-      expect(evts.some((e) => e.startsWith("BRIDGE_JOIN_MISSING:leg=legA"))).toBe(true);
+      expect(evts.some((e) => e.startsWith("BRIDGE_JOIN_MISSING:leg=legB"))).toBe(true);
+      expect(evts.some((e) => e.startsWith("BRIDGE_JOIN_MISSING:leg=legA"))).toBe(false);
       // Each missing leg is re-redirected into the bridge.
       expect(updatedCalls.filter((u) => String(u.url).includes("guarded-bridge") && u.sid === "CA_wd_caller").length).toBeGreaterThanOrEqual(2);
-      expect(updatedCalls.filter((u) => String(u.url).includes("guarded-bridge") && u.sid === "CA_wd_legA").length).toBeGreaterThanOrEqual(2);
+      expect(updatedCalls.filter((u) => String(u.url).includes("guarded-bridge") && u.sid === "CA_wd_legB").length).toBeGreaterThanOrEqual(1);
     } finally {
-      delete process.env.VERIFY_MERGE_WATCH_MS;
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
       if (saved === undefined) delete process.env.VERIFY_BRIDGE_WATCHDOG_MS;
       else process.env.VERIFY_BRIDGE_WATCHDOG_MS = saved;
     }
@@ -3370,45 +3837,54 @@ describe("bridge supervisor", () => {
 
   it("join watchdog is silent when both legs provably joined", async () => {
     const saved = process.env.VERIFY_BRIDGE_WATCHDOG_MS;
-    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
     process.env.VERIFY_BRIDGE_WATCHDOG_MS = "50";
     try {
-      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
         guarded: true,
         callerCallSid: "CA_ok_caller",
         legACallSid: "CA_ok_legA",
       });
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
-      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(true);
-      // Simulate Twilio's participant-join callbacks.
-      await postForm(`/api/verify/conference?sid=${s.sessionId}`, { StatusCallbackEvent: "participant-join", CallSid: "CA_ok_legA" });
+      await vs.onLegBAnswered(s.sessionId, "CA_ok_legB");
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+      // Simulate Twilio's participant-join callbacks for BOTH live parties.
+      await postForm(`/api/verify/conference?sid=${s.sessionId}`, { StatusCallbackEvent: "participant-join", CallSid: "CA_ok_legB" });
       await postForm(`/api/verify/conference?sid=${s.sessionId}`, { StatusCallbackEvent: "participant-join", CallSid: "CA_ok_caller" });
       await tick(400);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).not.toContain("BRIDGE_JOIN_MISSING");
     } finally {
-      delete process.env.VERIFY_MERGE_WATCH_MS;
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
       if (saved === undefined) delete process.env.VERIFY_BRIDGE_WATCHDOG_MS;
       else process.env.VERIFY_BRIDGE_WATCHDOG_MS = saved;
     }
   });
 
-  it("BRIDGE_RECALL: callee leg drops mid-call → re-dialled straight into the conference", async () => {
+  it("BRIDGE_RECALL: callee live leg (Leg B) drops mid-call → re-dialled straight into the conference", async () => {
     const createsBefore = createdCalls.length;
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_rc_caller",
       legACallSid: "CA_rc_legA",
+      legBCallSid: "CA_rc_legB",
+      streamReadyAt: new Date(Date.now() - 30_000),
+      challengeStartedAt: new Date(Date.now() - 30_000),
     });
-    await vs.onCallCompleted(s.sessionId, "legA", "CA_rc_legA", "duration=95s");
+    await vs.onCallCompleted(s.sessionId, "legB", "CA_rc_legB", "duration=95s");
     const after = (await vs.findSession(s.sessionId))!;
-    // Session STAYS BRIDGED and a fresh callee leg was originated.
+    // Session STAYS BRIDGED and a fresh callee live leg was originated
+    // (legB role) with the readiness deadline re-armed.
     expect(after.state).toBe(vs.VState.BRIDGED);
-    expect(after.legACallSid).not.toBe("CA_rc_legA");
+    expect(after.legBCallSid).not.toBe("CA_rc_legB");
+    expect(after.detectionPhase).toBe(vs.DetectionPhase.AWAITING_STREAM_READY);
+    expect(after.streamReadyBy).not.toBeNull();
     const created = createdCalls.slice(createsBefore);
     expect(created).toHaveLength(1);
     expect(created[0].to).toBe("+61400000000");
     expect(String(created[0].url)).toContain("bridge-recall");
+    expect(String(created[0].statusCallback)).toContain("/api/verify/status/legB");
     // Caller was told we're reconnecting (conference announce to caller only).
     expect(
       participantUpdates.some(
@@ -3421,23 +3897,25 @@ describe("bridge supervisor", () => {
     expect(types).not.toContain("GUARDED_CALL_ENDED");
   });
 
-  it("bridge recall happens ONCE — a second callee drop ends the call normally", async () => {
+  it("bridge recall happens ONCE — a second callee drop is DETECTION_INCONCLUSIVE (recalled leg unmonitored)", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_rc2_caller",
       legACallSid: "CA_rc2_legA",
+      legBCallSid: "CA_rc2_legB",
+      streamReadyAt: new Date(Date.now() - 30_000),
+      challengeStartedAt: new Date(Date.now() - 30_000),
     });
-    await vs.onCallCompleted(s.sessionId, "legA", "CA_rc2_legA", "duration=60s");
+    await vs.onCallCompleted(s.sessionId, "legB", "CA_rc2_legB", "duration=60s");
     const mid = (await vs.findSession(s.sessionId))!;
     expect(mid.state).toBe(vs.VState.BRIDGED);
     const createsBefore = createdCalls.length;
-    // The recalled leg drops too → normal completion, no second recall.
-    await vs.onCallCompleted(s.sessionId, "legA", mid.legACallSid!, "duration=20s");
+    // The recalled leg drops too → no second recall. The recall never
+    // re-confirmed readiness, so the outcome is inconclusive, never a pass.
+    await vs.onCallCompleted(s.sessionId, "legB", mid.legBCallSid!, "duration=20s");
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.state).toBe(vs.VState.COMPLETED);
+    expect(after.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
     expect(createdCalls.slice(createsBefore)).toHaveLength(0);
-    const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("GUARDED_CALL_ENDED");
   });
 
   it("bridge recall unanswered → conference ended, session COMPLETED, caller released", async () => {
@@ -3445,11 +3923,14 @@ describe("bridge supervisor", () => {
       guarded: true,
       callerCallSid: "CA_rc3_caller",
       legACallSid: "CA_rc3_legA",
+      legBCallSid: "CA_rc3_legB",
+      streamReadyAt: new Date(Date.now() - 30_000),
+      challengeStartedAt: new Date(Date.now() - 30_000),
     });
-    await vs.onCallCompleted(s.sessionId, "legA", "CA_rc3_legA", "duration=60s");
+    await vs.onCallCompleted(s.sessionId, "legB", "CA_rc3_legB", "duration=60s");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
-    // The recall call rings out / is declined → legA failure while BRIDGED.
-    await vs.onLegFailed(s.sessionId, "legA", "no-answer");
+    // The recall call rings out / is declined → legB failure while BRIDGED.
+    await vs.onLegFailed(s.sessionId, "legB", "no-answer");
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.COMPLETED);
     expect(conferenceUpdates.some((u) => u.status === "completed")).toBe(true);
@@ -3457,15 +3938,27 @@ describe("bridge supervisor", () => {
     expect(types).toContain("BRIDGE_RECALL_UNANSWERED");
   });
 
-  it("bridge-recall TwiML reconnects straight into the conference", async () => {
-    const res = await postForm("/api/verify/twiml/bridge-recall?sid=abc123");
-    const body = await res.text();
-    expect(body).toContain("Reconnecting your call");
-    expect(body).toContain("<Conference");
-    expect(body).toContain("verify-abc123");
-    // Recall leg can start the room (caller may have left) but never ends it.
-    expect(body).toContain('startConferenceOnEnter="true"');
-    expect(body).toContain('endConferenceOnExit="false"');
+  it("bridge-recall TwiML reconnects straight into the conference with a fresh detection stream", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const res = await postForm("/api/verify/twiml/bridge-recall?sid=abc123");
+      const body = await res.text();
+      expect(body).toContain("Reconnecting your call");
+      expect(body).toContain("<Conference");
+      expect(body).toContain("verify-abc123");
+      // Recall leg re-opens the inbound-only relay stream (monitoring resumes).
+      expect(body).toContain("<Start>");
+      expect(body).toContain('track="inbound_track"');
+      expect(body).toContain('<Parameter name="leg" value="legB"');
+      expect(body).toContain('<Parameter name="mode" value="merge-detection"');
+      // Recall leg can start the room (caller may have left) but never ends it.
+      expect(body).toContain('startConferenceOnEnter="true"');
+      expect(body).toContain('endConferenceOnExit="false"');
+    } finally {
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
   });
 
   it("notify-reconnecting TwiML is a caller-only announce doc", async () => {

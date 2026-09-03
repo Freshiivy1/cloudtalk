@@ -2658,12 +2658,19 @@ export async function onLegFailed(
     return;
   }
 
-  if (leg === "legA") {
-    // RECALL-FAILURE path: this legA failure is the BRIDGE RECALL call
-    // (session still BRIDGED, recall already used). The callee didn't take the
-    // re-dial — end the conference so the caller is released to the
-    // partner-ended notice, and close the session COMPLETED (the original
-    // conversation did happen and was verified).
+  if (
+    leg === "legA" ||
+    (leg === "legB" &&
+      session.guarded &&
+      session.state === VState.BRIDGED &&
+      bridgeRecallUsed.has(sessionId))
+  ) {
+    // RECALL-FAILURE path: this failure is the BRIDGE RECALL call (the
+    // callee's re-dialled live leg — legB role in the corrected architecture;
+    // legA role kept for legacy sessions). The callee didn't take the re-dial
+    // — end the conference so the caller is released to the partner-ended
+    // notice, and close the session COMPLETED (the original conversation did
+    // happen and was monitored before the drop).
     if (session.guarded && session.state === VState.BRIDGED && bridgeRecallUsed.has(sessionId)) {
       console.warn(`[verify] BRIDGE_RECALL_NO_ANSWER reason=${reason} — ending bridge`);
       if (await transition(session, VState.COMPLETED, `Bridge recall failed (${reason}) — callee unreachable`)) {
@@ -2682,6 +2689,7 @@ export async function onLegFailed(
       }
       return;
     }
+    if (leg !== "legA") return; // legB failures outside recall: handled via onCallCompleted
     console.warn(`[verify] LEG_A_FAILED callee unavailable. reason=${reason}`);
     if (
       await transition(session, VState.FAILED, `Leg A failed (${reason}) — callee unavailable`)

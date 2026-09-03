@@ -174,7 +174,13 @@ export function relayStreamUrl(): string | null {
 function relayHttpBase(): string | null {
   const u = process.env.VERIFY_STREAM_URL?.trim();
   if (!u || !/^wss:\/\//.test(u)) return null;
-  return u.replace(/^wss:\/\//, "https://").replace(/[/?].*$/, "");
+  try {
+    // Preserve the complete host (the previous regex stripped from the
+    // scheme's // and produced https:/path). Path/query belong only to the WS.
+    return new URL(u.replace(/^wss:/, "https:")).origin;
+  } catch {
+    return null;
+  }
 }
 
 /**

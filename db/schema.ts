@@ -238,11 +238,13 @@ export const verificationSessions = mysqlTable(
      *  - detectionPhase: AWAITING_STREAM_READY | PROMPT_LIGHT | LOUD_DTMF.
      */
     streamSid: varchar("streamSid", { length: 64 }),
-    streamReadyAt: timestamp("streamReadyAt"),
-    streamReadyBy: timestamp("streamReadyBy"),
-    challengeStartedAt: timestamp("challengeStartedAt"),
+    // Millisecond precision is required: the Phase 1 boundary is derived from
+    // an exact measured WAV duration and must survive a process restart.
+    streamReadyAt: timestamp("streamReadyAt", { fsp: 3 }),
+    streamReadyBy: timestamp("streamReadyBy", { fsp: 3 }),
+    challengeStartedAt: timestamp("challengeStartedAt", { fsp: 3 }),
     promptLightDurationMs: int("promptLightDurationMs"),
-    promptEndsAt: timestamp("promptEndsAt"),
+    promptEndsAt: timestamp("promptEndsAt", { fsp: 3 }),
     detectionPhase: varchar("detectionPhase", { length: 32 }),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     completedAt: timestamp("completedAt"),

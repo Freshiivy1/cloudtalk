@@ -3,9 +3,10 @@
 -- All columns additive + nullable (existing rows unaffected).
 ALTER TABLE `verification_sessions`
 	ADD COLUMN `streamSid` varchar(64),
-	ADD COLUMN `streamReadyAt` timestamp,
-	ADD COLUMN `streamReadyBy` timestamp,
-	ADD COLUMN `challengeStartedAt` timestamp,
+	-- Millisecond precision is required for the exact measured prompt boundary.
+	ADD COLUMN `streamReadyAt` timestamp(3),
+	ADD COLUMN `streamReadyBy` timestamp(3),
+	ADD COLUMN `challengeStartedAt` timestamp(3),
 	ADD COLUMN `promptLightDurationMs` int,
-	ADD COLUMN `promptEndsAt` timestamp,
+	ADD COLUMN `promptEndsAt` timestamp(3),
 	ADD COLUMN `detectionPhase` varchar(32);
