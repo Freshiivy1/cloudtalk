@@ -1161,6 +1161,14 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       expect(after.state).toBe(vs.VState.COMPLETED);
       // Canary + remaining legs torn down; no recall, no inconclusive verdict.
       expect(updatedCalls.some((u) => u.sid === "CA_lbm_legA" && u.status === "completed")).toBe(true);
+      // The caller must NOT be stranded in the conference: endConferenceOnExit
+      // lives only on the caller leg, so the engine completes the conference
+      // by SID — the caller's Dial returns into notify-partner-ended.
+      expect(
+        conferenceUpdates.some(
+          (u) => u.conference === `verify-${s.sessionId}` && u.status === "completed",
+        ),
+      ).toBe(true);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).toContain("GUARDED_CALL_ENDED");
     } finally {
@@ -1965,12 +1973,17 @@ describe("webhooks", () => {
       const added = updatedCalls.slice(updBefore);
       expect(added.some((u) => u.sid === "CA_sr_legA" && String(u.url).includes("leg-a-challenge"))).toBe(true);
 
-      // cloudtalk → relay /challenge-start with the exact window.
+      // cloudtalk → relay /challenge-start with the exact window. Timestamp
+      // fields are EPOCH MILLISECONDS (numbers) — the relay's persisted-state
+      // schema — not ISO strings.
       const cs = relayPosts.find((r) => r.url === "https://relay.example.com/challenge-start");
       expect(cs).toBeTruthy();
       expect(cs!.body.sid).toBe(s.sessionId);
       expect(cs!.body.promptLightDurationMs).toBe(18_840);
-      expect(typeof cs!.body.promptEndsAt).toBe("string");
+      expect(typeof cs!.body.challengeStartedAt).toBe("number");
+      expect(typeof cs!.body.promptEndsAt).toBe("number");
+      expect(cs!.body.challengeStartedAt).toBe(after.challengeStartedAt!.getTime());
+      expect(cs!.body.promptEndsAt).toBe(after.promptEndsAt!.getTime());
       expect(typeof cs!.body.transitionToleranceMs).toBe("number");
 
       // Idempotent: a duplicate stream-ready does not restart the challenge.
@@ -1982,6 +1995,61 @@ describe("webhooks", () => {
       });
       expect(again.status).toBe(200);
       expect(updatedCalls.length).toBe(upd2);
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("relay stream-ready BEFORE Leg B answer is buffered (never rejected) and drained at answer", async () => {
+    // Leg B's TwiML opens the relay stream the instant the call connects, so
+    // the relay's stream-ready can beat the answered status callback that
+    // drives the FSM to LEG_B_ANSWERED. The readiness signal must be accepted
+    // and recorded — a 500 would burn the relay's bounded retries.
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const relayPosts: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      relayPosts.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+      return new Response("{}", { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.LEG_B_DIALING, {
+        legACallSid: "CA_esr_legA",
+        legBCallSid: "CA_esr_legB",
+      });
+      const res = await hookApp.request("/api/verify/stream-ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-verify-secret": "test-secret" },
+        body: JSON.stringify({ sid: s.sessionId, streamSid: "MZ_early_1", readyAt: new Date().toISOString() }),
+      });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+      // Readiness is recorded but the challenge has NOT started yet — the FSM
+      // has not reached LEG_B_ANSWERED.
+      let cur = (await vs.findSession(s.sessionId))!;
+      expect(cur.state).toBe(vs.VState.LEG_B_DIALING);
+      expect(cur.challengeStartedAt).toBeNull();
+      expect(cur.streamReadyAt).toBeNull();
+      expect((await events(s.sessionId)).map((e) => e.eventType)).toContain("STREAM_READY_EARLY");
+
+      // The Leg B answer drains the buffered readiness: the challenge starts
+      // immediately — persisted timeline, Leg A redirect, relay challenge-start.
+      await vs.onLegBAnswered(s.sessionId, "CA_esr_legB");
+      cur = (await vs.findSession(s.sessionId))!;
+      expect(cur.state).toBe(vs.VState.LEG_B_ANSWERED);
+      expect(cur.streamSid).toBe("MZ_early_1");
+      expect(cur.streamReadyAt).not.toBeNull();
+      expect(cur.challengeStartedAt).not.toBeNull();
+      expect(cur.detectionPhase).toBe(vs.DetectionPhase.PROMPT_LIGHT);
+      expect(
+        updatedCalls.some((u) => u.sid === "CA_esr_legA" && String(u.url).includes("leg-a-challenge")),
+      ).toBe(true);
+      expect(relayPosts.some((r) => r.url === "https://relay.example.com/challenge-start")).toBe(true);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("STREAM_READY_EARLY_DRAINED");
+      expect(types).toContain("CHALLENGE_STARTED");
     } finally {
       vi.unstubAllGlobals();
       delete process.env.VERIFY_STREAM_URL;
@@ -3897,6 +3965,83 @@ describe("bridge supervisor", () => {
     expect(types).not.toContain("GUARDED_CALL_ENDED");
   });
 
+  it("bridge recall RE-GATES stream readiness: stale sid rejected, only the NEW stream restarts the challenge", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const relayPosts: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      relayPosts.push({ url: String(url), body: JSON.parse(String(init?.body ?? "{}")) });
+      return new Response("{}", { status: 200 });
+    });
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_rg_caller",
+        legACallSid: "CA_rg_legA",
+        legBCallSid: "CA_rg_legB",
+        streamSid: "MZ_old_stream",
+        streamReadyAt: new Date(Date.now() - 60_000),
+        challengeStartedAt: new Date(Date.now() - 60_000),
+        promptLightDurationMs: 18_840,
+        promptEndsAt: new Date(Date.now() - 41_000),
+        detectionPhase: vs.DetectionPhase.LOUD_DTMF,
+      });
+      // Callee drops → auto-recall: readiness is reset (streamReadyAt=null,
+      // deadline re-armed) while the old streamSid is KEPT as the stale guard.
+      await vs.onCallCompleted(s.sessionId, "legB", "CA_rg_legB", "duration=95s");
+      const mid = (await vs.findSession(s.sessionId))!;
+      expect(mid.state).toBe(vs.VState.BRIDGED);
+      expect(mid.streamReadyAt).toBeNull();
+      expect(mid.streamSid).toBe("MZ_old_stream");
+      expect(mid.detectionPhase).toBe(vs.DetectionPhase.AWAITING_STREAM_READY);
+      expect(mid.streamReadyBy).not.toBeNull();
+      // The relay was re-armed for the new leg (no terminal verdict from the
+      // old attempt blocks it).
+      expect(relayPosts.some((r) => r.url === "https://relay.example.com/arm")).toBe(true);
+
+      // A LATE stream-ready for the OLD (dead) stream must NOT re-open the
+      // challenge against it.
+      const stale = await vs.onStreamReady(s.sessionId, "MZ_old_stream", new Date().toISOString());
+      expect(stale.ok).toBe(false);
+      let cur = (await vs.findSession(s.sessionId))!;
+      expect(cur.streamReadyAt).toBeNull();
+      expect(cur.challengeStartedAt!.getTime()).toBeLessThan(Date.now() - 30_000); // untouched
+      expect((await events(s.sessionId)).map((e) => e.eventType)).toContain("STREAM_READY_SUPERSEDED");
+
+      // The NEW stream's ready re-gates readiness and restarts the challenge:
+      // fresh timestamps, Leg A back into Phase 1, relay /challenge-start with
+      // epoch-ms numbers.
+      const updBefore = updatedCalls.length;
+      const fresh = await vs.onStreamReady(s.sessionId, "MZ_new_stream", new Date().toISOString());
+      expect(fresh.ok).toBe(true);
+      cur = (await vs.findSession(s.sessionId))!;
+      expect(cur.streamSid).toBe("MZ_new_stream");
+      expect(cur.streamReadyAt).not.toBeNull();
+      expect(cur.challengeStartedAt!.getTime()).toBeGreaterThan(Date.now() - 10_000);
+      expect(cur.promptEndsAt!.getTime()).toBe(cur.challengeStartedAt!.getTime() + 18_840);
+      expect(cur.detectionPhase).toBe(vs.DetectionPhase.PROMPT_LIGHT);
+      expect(
+        updatedCalls
+          .slice(updBefore)
+          .some((u) => u.sid === "CA_rg_legA" && String(u.url).includes("leg-a-challenge")),
+      ).toBe(true);
+      const cs = relayPosts.filter((r) => r.url === "https://relay.example.com/challenge-start");
+      expect(cs.length).toBeGreaterThanOrEqual(1);
+      expect(typeof cs.at(-1)!.body.challengeStartedAt).toBe("number");
+      expect(cs.at(-1)!.body.challengeStartedAt).toBe(cur.challengeStartedAt!.getTime());
+
+      // Duplicate ready for the now-live stream stays an idempotent no-op.
+      const upd2 = updatedCalls.length;
+      const dup = await vs.onStreamReady(s.sessionId, "MZ_new_stream");
+      expect(dup.ok).toBe(true);
+      expect(updatedCalls.length).toBe(upd2);
+    } finally {
+      vi.unstubAllGlobals();
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
   it("bridge recall happens ONCE — a second callee drop is DETECTION_INCONCLUSIVE (recalled leg unmonitored)", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
@@ -3916,6 +4061,13 @@ describe("bridge supervisor", () => {
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.state).toBe(vs.VState.DETECTION_INCONCLUSIVE);
     expect(createdCalls.slice(createsBefore)).toHaveLength(0);
+    // The caller is not stranded either: the conference is completed by SID so
+    // the surviving caller leg drops into its post-Dial notify-partner-ended.
+    expect(
+      conferenceUpdates.some(
+        (u) => u.conference === `verify-${s.sessionId}` && u.status === "completed",
+      ),
+    ).toBe(true);
   });
 
   it("bridge recall unanswered → conference ended, session COMPLETED, caller released", async () => {

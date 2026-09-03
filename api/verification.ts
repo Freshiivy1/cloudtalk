@@ -172,6 +172,18 @@ const GUARDED_CALLER_TIMEOUT_MS = 2 * 60 * 1000;
  */
 const pendingLegBAnswer = new Map<string, string>();
 
+/**
+ * Early stream-ready buffer. Leg B's TwiML opens the non-blocking relay
+ * stream the instant the call connects, so the relay's stream-ready callback
+ * can beat the Twilio answered status callback that drives the FSM to
+ * LEG_B_ANSWERED. Rejecting that callback (500) would burn the relay's
+ * bounded retries and risks losing readiness entirely — instead the readiness
+ * is buffered here and drained by onLegBAnswered(), which starts the Leg A
+ * challenge the moment the FSM catches up. Short-lived, in-process (mirrors
+ * pendingLegBAnswer); cleared by cleanupSessionMaps() on terminal states.
+ */
+const pendingStreamReady = new Map<string, { streamSid: string; readyAt?: string }>();
+
 /* -------------------------------------------------------------------------- */
 /* Two-phase Call Waiting challenge (corrected architecture)                    */
 /* -------------------------------------------------------------------------- */
@@ -773,6 +785,7 @@ export async function onVoiceMismatch(sessionId: string, detail: string): Promis
  */
 function cleanupSessionMaps(sessionId: string): void {
   pendingLegBAnswer.delete(sessionId);
+  pendingStreamReady.delete(sessionId);
   clearReadinessTimer(sessionId);
   bridgedSessions.delete(sessionId);
   noiseInjectionCount.delete(sessionId);
@@ -1283,9 +1296,11 @@ async function armRelay(
  * POST the relay /challenge-start contract after stream-ready:
  *   { sid, challengeStartedAt, promptLightDurationMs, promptEndsAt,
  *     transitionToleranceMs }
- * The relay persists this and reconstructs the phase after restart. Bounded
- * retries with backoff; a final failure is a callback failure after retry →
- * the caller turns it into DETECTION_FAILED (never a pass).
+ * Timestamp fields are EPOCH MILLISECONDS (numbers), matching the relay's
+ * persisted-state schema — NOT ISO strings. The relay persists this and
+ * reconstructs the phase after restart. Bounded retries with backoff; a final
+ * failure is a callback failure after retry → the caller turns it into
+ * DETECTION_FAILED (never a pass).
  */
 async function sendChallengeStart(
   session: VerificationSession,
@@ -1298,11 +1313,11 @@ async function sendChallengeStart(
   const body = {
     sid: session.sessionId,
     challengeStartedAt: session.challengeStartedAt
-      ? new Date(session.challengeStartedAt).toISOString()
+      ? new Date(session.challengeStartedAt).getTime()
       : null,
     promptLightDurationMs: session.promptLightDurationMs,
     promptEndsAt: session.promptEndsAt
-      ? new Date(session.promptEndsAt).toISOString()
+      ? new Date(session.promptEndsAt).getTime()
       : null,
     transitionToleranceMs: transitionToleranceMs(),
   };
@@ -2086,6 +2101,21 @@ export async function onLegBAnswered(
     if (session.guarded) {
       await bridgeGuardedLive(session);
     }
+
+    // Drain a stream-ready that raced ahead of the answered status callback
+    // (the relay's stream opens the instant Leg B connects): the Leg A
+    // challenge starts NOW against the buffered readiness — no readiness
+    // signal is lost to ordering.
+    const early = pendingStreamReady.get(sessionId);
+    if (early) {
+      pendingStreamReady.delete(sessionId);
+      await logEvent(
+        sessionId,
+        "STREAM_READY_EARLY_DRAINED",
+        `streamSid=${early.streamSid} — Leg B answer caught up, starting the challenge`,
+      );
+      await onStreamReady(sessionId, early.streamSid, early.readyAt);
+    }
   }
 }
 
@@ -2284,9 +2314,12 @@ async function recallCalleeIntoBridge(
     // re-opens the inbound detection stream and re-joins the conference as
     // anchor. The readiness deadline is re-armed — a recall that never
     // re-establishes monitoring is DETECTION_FAILED, not a silent pass.
+    // streamReadyAt is reset so readiness is RE-GATED on the new stream; the
+    // OLD streamSid is deliberately KEPT on the session so onStreamReady can
+    // reject a late stream-ready from the dead stream (stale-sid guard) and
+    // only a ready with a NEW stream sid restarts the challenge.
     session.legBCallSid = call.sid;
     session.streamReadyAt = null;
-    session.streamSid = null;
     session.streamReadyBy = new Date(Date.now() + streamReadyTimeoutMs());
     session.detectionPhase = DetectionPhase.AWAITING_STREAM_READY;
     await save(session);
@@ -2400,8 +2433,16 @@ export async function onMergeDetected(
  *     detectionPhase=PROMPT_LIGHT (restart-safe);
  *  3. post /challenge-start to the relay (bounded retries); a callback
  *     failure after retry is DETECTION_FAILED, never a pass.
- * Idempotent: a duplicate stream-ready for an already-started challenge is a
- * 200 no-op.
+ * Idempotency / ordering rules:
+ *  - a duplicate stream-ready for the stream ALREADY marked ready is a 200
+ *    no-op (relay restart / callback retry);
+ *  - EARLY stream-ready (FSM has not reached LEG_B_ANSWERED yet — the relay
+ *    can beat Twilio's answered status callback) is buffered, never rejected,
+ *    and drained by onLegBAnswered();
+ *  - after a bridge-recall re-arm (streamReadyAt reset, old streamSid kept), a
+ *    stream-ready naming the PREVIOUS stream's sid is stale and rejected, and
+ *    only a ready for the NEW stream sid re-gates readiness and restarts the
+ *    challenge — Leg A can never start against a stale/dead stream.
  */
 export async function onStreamReady(
   sessionId: string,
@@ -2411,18 +2452,70 @@ export async function onStreamReady(
   const session = await findSession(sessionId);
   if (!session) return { ok: false, reason: "unknown session" };
   if (isTerminal(session)) return { ok: true, reason: "session already terminal (idempotent)" };
-  if (session.challengeStartedAt) {
-    // Idempotent retry (relay restart / callback retry): already started.
-    return { ok: true, reason: "challenge already started (idempotent)" };
-  }
-  if (session.state !== VState.LEG_B_ANSWERED && session.state !== VState.BRIDGED) {
+
+  if (session.streamReadyAt) {
+    // Idempotent retry (relay restart / callback retry) for the stream we
+    // already acknowledged — never restart the challenge for it.
+    if (!streamSid || !session.streamSid || session.streamSid === streamSid) {
+      return { ok: true, reason: "stream already ready (idempotent)" };
+    }
+    // A ready naming a DIFFERENT stream while ours is live is the previous
+    // attempt's late callback — ignore it (200 so the relay does not burn its
+    // bounded retries on a deliberately dropped signal).
     console.warn(
-      `[verify] STREAM_READY_IGNORED session=${sessionId} state=${session.state} — Leg B not answered`,
+      `[verify] STREAM_READY_STALE session=${sessionId} streamSid=${streamSid} current=${session.streamSid} — already ready, ignoring`,
     );
-    return { ok: false, reason: `unexpected state ${session.state}` };
+    return { ok: true, reason: "stale stream-ready ignored (current stream already ready)" };
   }
 
-  const startedAt = readyAt && !Number.isNaN(Date.parse(readyAt)) ? new Date(readyAt) : new Date();
+  // streamReadyAt is null: either the first arm, or a bridge-recall re-arm
+  // awaiting the NEW leg's stream (the recall keeps the old streamSid on the
+  // session precisely so this guard can fire). A ready naming the PREVIOUS
+  // attempt's stream sid is stale — reject it so Leg A can never (re)start
+  // its challenge against a dead stream.
+  if (
+    session.challengeStartedAt &&
+    session.streamSid &&
+    streamSid &&
+    session.streamSid === streamSid
+  ) {
+    console.warn(
+      `[verify] STREAM_READY_SUPERSEDED session=${sessionId} streamSid=${streamSid} — readiness re-armed for a new leg; stale ready rejected`,
+    );
+    await logEvent(
+      sessionId,
+      "STREAM_READY_SUPERSEDED",
+      `streamSid=${streamSid} arrived after readiness was re-armed — ignored; awaiting the new stream`,
+    );
+    return { ok: false, reason: "stale stream-ready for a superseded stream" };
+  }
+
+  if (session.state !== VState.LEG_B_ANSWERED && session.state !== VState.BRIDGED) {
+    // EARLY READY: the stream opened before the answered status callback drove
+    // the FSM to LEG_B_ANSWERED. Buffer the readiness — never reject — and
+    // drain it from onLegBAnswered so no readiness signal is lost.
+    pendingStreamReady.set(sessionId, { streamSid, readyAt });
+    console.log(
+      `[verify] STREAM_READY_EARLY session=${sessionId} state=${session.state} streamSid=${streamSid} — buffered until Leg B answer`,
+    );
+    await logEvent(
+      sessionId,
+      "STREAM_READY_EARLY",
+      `state=${session.state} streamSid=${streamSid} — readiness buffered; challenge starts at Leg B answer`,
+    );
+    return { ok: true, reason: "readiness buffered — awaiting Leg B answer" };
+  }
+
+  // readyAt may be ISO-8601 OR epoch-ms (number / numeric string) — the relay
+  // persists epoch-ms internally.
+  const readyIsoMs = readyAt ? Date.parse(readyAt) : Number.NaN;
+  const readyEpochMs =
+    readyAt && /^\d{10,}$/.test(readyAt.trim()) ? Number(readyAt.trim()) : Number.NaN;
+  const startedAt = Number.isFinite(readyIsoMs)
+    ? new Date(readyIsoMs)
+    : Number.isFinite(readyEpochMs)
+      ? new Date(readyEpochMs)
+      : new Date();
   const promptEndsAt = new Date(startedAt.getTime() + PROMPT_LIGHT_DURATION_MS);
 
   // 1) Start the canary challenge on Leg A. The redirect MUST succeed before
@@ -2819,6 +2912,28 @@ export async function onCallCompleted(
         // Caller gone: endConferenceOnExit ends the room, but release the
         // callee leg explicitly in case the exit raced.
         await hangupCall(session.legBCallSid);
+      } else {
+        // CALLEE (Leg B) gone: endConferenceOnExit lives ONLY on the caller
+        // leg, so the room SURVIVES the callee's exit and the caller would be
+        // stranded alone in an active <Dial><Conference> until they hang up
+        // manually. Complete the conference by SID: the caller's Dial verb
+        // returns, its post-Dial <Redirect> plays notify-partner-ended and the
+        // leg hangs up (same convention as the in-call merge verdict).
+        try {
+          await getTwilioClient()
+            .conferences(confSid)
+            .update({ status: "completed" });
+          console.log(
+            `[verify] CONFERENCE_COMPLETED session=${sessionId} conf=${confSid} (callee ended the live call)`,
+          );
+        } catch (err) {
+          console.warn(
+            `[verify] conference complete failed session=${sessionId} conf=${confSid}:`,
+            (err as Error).message,
+          );
+          // Fallback: never leave the caller stranded — REST-hangup the leg.
+          await hangupCall(remaining);
+        }
       }
       // The canary (Leg A) and the ring test always end with the live call.
       await hangupAll(session, { legA: true, ringTest: true });

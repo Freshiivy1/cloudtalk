@@ -194,7 +194,7 @@ async function twilioSignatureOk(c: Context): Promise<boolean> {
   const sig = c.req.header("X-Twilio-Signature");
   const base = vs.getPublicBaseUrl();
   if (!authToken || !sig || !base) return false;
-  let formParams: Record<string, string> = {};
+  const formParams: Record<string, string> = {};
   try {
     const form = await c.req.parseBody();
     for (const [k, v] of Object.entries(form)) {
