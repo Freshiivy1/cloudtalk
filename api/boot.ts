@@ -12,9 +12,11 @@ import {
   mergeToneHandler,
   verificationGatherHandler,
   verificationGatherLegAAcceptHandler,
+  verificationConferenceHandler,
   verificationGatherLegAReadyHandler,
   verificationSmsInboundHandler,
   verificationStatusHandler,
+  verificationVersionHandler,
   verificationToneHandler,
   verificationTwimlHandler,
   verificationVoiceprintHandler,
@@ -58,6 +60,10 @@ app.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
 // Two-way AI SMS: Crazytel Virtual Mobile Number inbound webhook (JSON
 // {from, to, text}) — replies with model-specific call-waiting walkthroughs.
 app.post("/api/verify/sms/inbound", verificationSmsInboundHandler);
+// Bridge conference lifecycle/participant events (bridge supervisor).
+app.post("/api/verify/conference", verificationConferenceHandler);
+// Deployment marker — which commit is live (RENDER_GIT_COMMIT).
+app.get("/api/verify/version", verificationVersionHandler);
 // Serve the in-band DTMF verification tone with a proper audio/wav Content-Type
 // (the generic static server returns octet-stream; Twilio refuses it — error 12300).
 app.get("/api/verify/tone.wav", verificationToneHandler);

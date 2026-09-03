@@ -1165,19 +1165,26 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
   });
 
   it("BRIDGED: callee (Leg A) hangup → COMPLETED + caller released by the conference, not a REST redirect", async () => {
-    const s = await makeSession(vs.VState.BRIDGED, {
-      guarded: true,
-      callerCallSid: "CA_b2_caller",
-      legACallSid: "CA_b2_legA",
-    });
-    const updBefore = updatedCalls.length;
-    await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
-    const after = (await vs.findSession(s.sessionId))!;
-    expect(after.state).toBe(vs.VState.COMPLETED);
-    // Same contract as the caller-hangup direction: no REST redirect/hangup
-    // against a leg that is inside the (mock-live) conference.
-    const added = updatedCalls.slice(updBefore);
-    expect(added.some((u) => u.sid === "CA_b2_caller")).toBe(false);
+    // VERIFY_BRIDGE_RECALL=off keeps the original completion contract; the
+    // default-on auto-recall path is covered in the bridge-supervisor suite.
+    process.env.VERIFY_BRIDGE_RECALL = "false";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_b2_caller",
+        legACallSid: "CA_b2_legA",
+      });
+      const updBefore = updatedCalls.length;
+      await vs.onCallCompleted(s.sessionId, "legA", "CA_b2_legA", "duration=45s");
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.state).toBe(vs.VState.COMPLETED);
+      // Same contract as the caller-hangup direction: no REST redirect/hangup
+      // against a leg that is inside the (mock-live) conference.
+      const added = updatedCalls.slice(updBefore);
+      expect(added.some((u) => u.sid === "CA_b2_caller")).toBe(false);
+    } finally {
+      delete process.env.VERIFY_BRIDGE_RECALL;
+    }
   });
 
   it("BRIDGED: a survivor stuck OUTSIDE the conference (lobby) is hung up by REST", async () => {
@@ -1185,6 +1192,7 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     // (Leg A) dies before ever starting the conference, the caller is stuck
     // in a pre-start lobby with no end trigger. With NO live conference the
     // engine must hang the survivor up directly.
+    process.env.VERIFY_BRIDGE_RECALL = "false";
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_lob_caller",
@@ -1199,6 +1207,7 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
       ).toBe(true);
     } finally {
       twilioMock.listResult = null;
+      delete process.env.VERIFY_BRIDGE_RECALL;
     }
   });
 
@@ -1272,7 +1281,12 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(body).toContain('beep="false"');
     // No leg param → backwards-compatible anchor role.
     expect(body).toContain('startConferenceOnEnter="true"');
-    expect(body).toContain('endConferenceOnExit="true"');
+    // Callee (anchor) exit must NOT end the room — the supervisor re-dials a
+    // dropped callee back into this same conference (BRIDGE_RECALL).
+    expect(body).toContain('endConferenceOnExit="false"');
+    // Bridge supervisor: participant join/leave events flow to the timeline.
+    expect(body).toContain(`/api/verify/conference?sid=abc123`);
+    expect(body).toContain('statusCallbackEvent="start end join leave"');
     // No verdict announcement, no hangup — this is a LIVE bridge.
     expect(body).not.toContain("<Say");
     expect(body).not.toContain("<Hangup");
@@ -1416,9 +1430,11 @@ import {
 } from "./verification-stream";
 import {
   mergeToneHandler,
+  verificationConferenceHandler,
   verificationSmsInboundHandler,
   verificationStatusHandler,
   verificationTwimlHandler,
+  verificationVersionHandler,
   verificationVoiceprintHandler,
   verificationVoiceprintTranscriptionHandler,
 } from "./verification-webhooks";
@@ -1439,6 +1455,8 @@ hookApp.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler)
 hookApp.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
 hookApp.post("/api/verify/stream-detected", verificationStreamDetectedHandler);
 hookApp.post("/api/verify/sms/inbound", verificationSmsInboundHandler);
+hookApp.post("/api/verify/conference", verificationConferenceHandler);
+hookApp.get("/api/verify/version", verificationVersionHandler);
 // TwiML App voice webhook (SDK outbound calls — guarded branch keys off the
 // `guarded` custom param).
 hookApp.post("/api/voice/twiml", voiceWebhookHandler);
@@ -2340,7 +2358,7 @@ describe("voice-ID enforcement (guarded)", () => {
     const wait = await postForm(`/api/verify/twiml/voice-id-wait?sid=${s.sessionId}`);
     const waitBody = await wait.text();
     expect(waitBody).toContain(
-      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. Press 1 to continue.",
+      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. If your phone shows this call on hold, tap it to resume. Press 1 to continue.",
     );
     expect(waitBody).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
     // …and that press-1 originates Leg B (the only bridge path).
@@ -3294,5 +3312,174 @@ describe("Twilio-format inbound SMS", () => {
     } finally {
       restore();
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Bridge supervisor — conference events, join watchdog, callee drop recall   */
+/* -------------------------------------------------------------------------- */
+
+describe("bridge supervisor", () => {
+  it("conference status callback logs join/leave with leg identification", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_cs_caller",
+      legACallSid: "CA_cs_legA",
+    });
+    const base = `/api/verify/conference?sid=${s.sessionId}`;
+    await postForm(base, {
+      StatusCallbackEvent: "conference-start",
+      ConferenceSid: "CF_test_1",
+    });
+    await postForm(base, { StatusCallbackEvent: "participant-join", CallSid: "CA_cs_legA", ConferenceSid: "CF_test_1" });
+    await postForm(base, { StatusCallbackEvent: "participant-join", CallSid: "CA_cs_caller", ConferenceSid: "CF_test_1" });
+    await postForm(base, { StatusCallbackEvent: "participant-leave", CallSid: "CA_cs_legA", ConferenceSid: "CF_test_1" });
+    const evts = (await events(s.sessionId)).map((e) => `${e.eventType}:${e.details}`);
+    expect(evts.some((e) => e.startsWith("CONF_STARTED:"))).toBe(true);
+    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_JOINED:leg=legA"))).toBe(true);
+    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_JOINED:leg=caller"))).toBe(true);
+    expect(evts.some((e) => e.startsWith("CONF_PARTICIPANT_LEFT:leg=legA"))).toBe(true);
+  });
+
+  it("join watchdog re-redirects legs that never JOINED the conference", async () => {
+    const saved = process.env.VERIFY_BRIDGE_WATCHDOG_MS;
+    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    process.env.VERIFY_BRIDGE_WATCHDOG_MS = "50";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        guarded: true,
+        callerCallSid: "CA_wd_caller",
+        legACallSid: "CA_wd_legA",
+      });
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false); // arm
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(true); // bridge
+      // No participant-join events arrive → the watchdog must notice BOTH legs.
+      await tick(400);
+      const evts = (await events(s.sessionId)).map((e) => `${e.eventType}:${e.details}`);
+      expect(evts.some((e) => e.startsWith("BRIDGE_JOIN_MISSING:leg=caller"))).toBe(true);
+      expect(evts.some((e) => e.startsWith("BRIDGE_JOIN_MISSING:leg=legA"))).toBe(true);
+      // Each missing leg is re-redirected into the bridge.
+      expect(updatedCalls.filter((u) => String(u.url).includes("guarded-bridge") && u.sid === "CA_wd_caller").length).toBeGreaterThanOrEqual(2);
+      expect(updatedCalls.filter((u) => String(u.url).includes("guarded-bridge") && u.sid === "CA_wd_legA").length).toBeGreaterThanOrEqual(2);
+    } finally {
+      delete process.env.VERIFY_MERGE_WATCH_MS;
+      if (saved === undefined) delete process.env.VERIFY_BRIDGE_WATCHDOG_MS;
+      else process.env.VERIFY_BRIDGE_WATCHDOG_MS = saved;
+    }
+  });
+
+  it("join watchdog is silent when both legs provably joined", async () => {
+    const saved = process.env.VERIFY_BRIDGE_WATCHDOG_MS;
+    process.env.VERIFY_MERGE_WATCH_MS = "0";
+    process.env.VERIFY_BRIDGE_WATCHDOG_MS = "50";
+    try {
+      const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
+        guarded: true,
+        callerCallSid: "CA_ok_caller",
+        legACallSid: "CA_ok_legA",
+      });
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(false);
+      expect(await vs.maybeBridgeGuarded(s.sessionId)).toBe(true);
+      // Simulate Twilio's participant-join callbacks.
+      await postForm(`/api/verify/conference?sid=${s.sessionId}`, { StatusCallbackEvent: "participant-join", CallSid: "CA_ok_legA" });
+      await postForm(`/api/verify/conference?sid=${s.sessionId}`, { StatusCallbackEvent: "participant-join", CallSid: "CA_ok_caller" });
+      await tick(400);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).not.toContain("BRIDGE_JOIN_MISSING");
+    } finally {
+      delete process.env.VERIFY_MERGE_WATCH_MS;
+      if (saved === undefined) delete process.env.VERIFY_BRIDGE_WATCHDOG_MS;
+      else process.env.VERIFY_BRIDGE_WATCHDOG_MS = saved;
+    }
+  });
+
+  it("BRIDGE_RECALL: callee leg drops mid-call → re-dialled straight into the conference", async () => {
+    const createsBefore = createdCalls.length;
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_rc_caller",
+      legACallSid: "CA_rc_legA",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_rc_legA", "duration=95s");
+    const after = (await vs.findSession(s.sessionId))!;
+    // Session STAYS BRIDGED and a fresh callee leg was originated.
+    expect(after.state).toBe(vs.VState.BRIDGED);
+    expect(after.legACallSid).not.toBe("CA_rc_legA");
+    const created = createdCalls.slice(createsBefore);
+    expect(created).toHaveLength(1);
+    expect(created[0].to).toBe("+61400000000");
+    expect(String(created[0].url)).toContain("bridge-recall");
+    // Caller was told we're reconnecting (conference announce to caller only).
+    expect(
+      participantUpdates.some(
+        (p) => p.participant === "CA_rc_caller" && String(p.announceUrl).includes("notify-reconnecting"),
+      ),
+    ).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("BRIDGE_RECALL");
+    expect(types).toContain("BRIDGE_RECALL_DIALED");
+    expect(types).not.toContain("GUARDED_CALL_ENDED");
+  });
+
+  it("bridge recall happens ONCE — a second callee drop ends the call normally", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_rc2_caller",
+      legACallSid: "CA_rc2_legA",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_rc2_legA", "duration=60s");
+    const mid = (await vs.findSession(s.sessionId))!;
+    expect(mid.state).toBe(vs.VState.BRIDGED);
+    const createsBefore = createdCalls.length;
+    // The recalled leg drops too → normal completion, no second recall.
+    await vs.onCallCompleted(s.sessionId, "legA", mid.legACallSid!, "duration=20s");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.COMPLETED);
+    expect(createdCalls.slice(createsBefore)).toHaveLength(0);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("GUARDED_CALL_ENDED");
+  });
+
+  it("bridge recall unanswered → conference ended, session COMPLETED, caller released", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_rc3_caller",
+      legACallSid: "CA_rc3_legA",
+    });
+    await vs.onCallCompleted(s.sessionId, "legA", "CA_rc3_legA", "duration=60s");
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
+    // The recall call rings out / is declined → legA failure while BRIDGED.
+    await vs.onLegFailed(s.sessionId, "legA", "no-answer");
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.state).toBe(vs.VState.COMPLETED);
+    expect(conferenceUpdates.some((u) => u.status === "completed")).toBe(true);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("BRIDGE_RECALL_UNANSWERED");
+  });
+
+  it("bridge-recall TwiML reconnects straight into the conference", async () => {
+    const res = await postForm("/api/verify/twiml/bridge-recall?sid=abc123");
+    const body = await res.text();
+    expect(body).toContain("Reconnecting your call");
+    expect(body).toContain("<Conference");
+    expect(body).toContain("verify-abc123");
+    // Recall leg can start the room (caller may have left) but never ends it.
+    expect(body).toContain('startConferenceOnEnter="true"');
+    expect(body).toContain('endConferenceOnExit="false"');
+  });
+
+  it("notify-reconnecting TwiML is a caller-only announce doc", async () => {
+    const res = await postForm("/api/verify/twiml/notify-reconnecting?sid=abc123");
+    const body = await res.text();
+    expect(body).toContain("Reconnecting");
+    expect(body).toContain("<Hangup");
+  });
+
+  it("version endpoint reports the deployed commit marker", async () => {
+    const res = await hookApp.request("/api/verify/version", { method: "GET" });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { commit: string; time: string };
+    expect(json).toHaveProperty("commit");
+    expect(json).toHaveProperty("time");
   });
 });

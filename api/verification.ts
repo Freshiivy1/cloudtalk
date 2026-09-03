@@ -762,6 +762,11 @@ export function recordingBridgeUrl(sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/recording/bridge?sid=${sessionId}`;
 }
 
+/** Twilio → app: bridge conference lifecycle/participant status callback. */
+export function conferenceStatusUrl(sessionId: string): string {
+  return `${requirePublicBaseUrl()}/api/verify/conference?sid=${sessionId}`;
+}
+
 /** Leg A callee-IVR gather endpoints (CALL-FLOW.md Phase 2). */
 export function gatherLegAAcceptUrl(sessionId: string, attempt: number): string {
   return `${requirePublicBaseUrl()}/api/verify/gather/leg-a-accept?sid=${sessionId}&a=${attempt}`;
@@ -820,7 +825,7 @@ export function verifyPrompts() {
     // returns them here.
     secondCall:
       e.VERIFY_PROMPT_SECOND_CALL ??
-      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. Press 1 to continue.",
+      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. If your phone shows this call on hold, tap it to resume. Press 1 to continue.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
@@ -828,7 +833,7 @@ export function verifyPrompts() {
       "Please wait while we connect your call.",
     ready:
       e.VERIFY_PROMPT_READY ??
-      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. Press 1 to continue.",
+      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. If your phone shows this call on hold, tap it to resume. Press 1 to continue.",
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
       "Please hold. Your call is being connected. You will hear updates as the line is verified.",
@@ -1938,9 +1943,170 @@ export async function maybeBridgeGuarded(
     // continuous merge tone when the callee engages a second call, and the
     // stream-side MergeToneDetector fires the instant the tone crosses a
     // merge. Nothing to start at bridge time.
+    // SUPERVISOR: prove both parties actually JOINED the room (conference
+    // status callbacks) and re-redirect any leg that didn't — a silently
+    // failed redirect otherwise presents as "I can't hear the other person".
+    bridgeJoinRegistry.delete(sessionId);
+    scheduleBridgeWatchdog(sessionId);
     return true;
   }
   return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Bridge supervisor — join watchdog + callee drop auto-recall                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Live record of which CallSids have JOINED the bridge conference, fed by the
+ * /api/verify/conference status callback (participant-join events). Used by
+ * the join watchdog to prove both parties actually made it into the room —
+ * a REST redirect that silently failed leaves that leg parked in silence,
+ * which presents exactly as "I can't hear the other person".
+ */
+const bridgeJoinRegistry = new Map<string, Set<string>>();
+
+/** Sessions that already used their one automatic callee recall. */
+const bridgeRecallUsed = new Set<string>();
+
+/** Called by the conference status webhook on participant-join. */
+export function noteConferenceJoin(sessionId: string, callSid: string): void {
+  let set = bridgeJoinRegistry.get(sessionId);
+  if (!set) {
+    set = new Set();
+    bridgeJoinRegistry.set(sessionId, set);
+  }
+  set.add(callSid);
+}
+
+/** Called by the conference status webhook on participant-leave. */
+export function noteConferenceLeave(sessionId: string, callSid: string): void {
+  bridgeJoinRegistry.get(sessionId)?.delete(callSid);
+}
+
+/** Watchdog delay after bridging before checking both legs joined (env-overridable for tests). */
+export function bridgeWatchdogMs(): number {
+  const v = Number.parseInt(process.env.VERIFY_BRIDGE_WATCHDOG_MS ?? "20000", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 20_000;
+}
+
+/** Auto-recall of a dropped callee mid-bridge (env VERIFY_BRIDGE_RECALL, default on). */
+export function bridgeRecallEnabled(): boolean {
+  return (process.env.VERIFY_BRIDGE_RECALL ?? "true") === "true";
+}
+
+/**
+ * 20s (default) after the bridge, both parties must have JOINED the
+ * conference. A leg that never joined was never heard by the other party —
+ * the systematic "I can't hear the inmate" failure. Recovery: re-issue the
+ * REST redirect into the bridge (harmless if the leg is already inside), and
+ * log loudly so the dashboard timeline shows it.
+ */
+async function bridgeJoinWatchdog(sessionId: string): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || session.state !== VState.BRIDGED) {
+      bridgeJoinRegistry.delete(sessionId);
+      return;
+    }
+    const joined = bridgeJoinRegistry.get(sessionId) ?? new Set<string>();
+    const expected: Array<["caller" | "legA", string | null]> = [
+      ["caller", session.callerCallSid],
+      ["legA", session.legACallSid],
+    ];
+    for (const [leg, callSid] of expected) {
+      if (callSid && !joined.has(callSid)) {
+        console.warn(`[verify] BRIDGE_JOIN_MISSING session=${sessionId} leg=${leg} — re-issuing bridge redirect`);
+        await logEvent(
+          sessionId,
+          "BRIDGE_JOIN_MISSING",
+          `leg=${leg} sid=${callSid} never joined the conference — re-issuing guarded-bridge redirect`,
+        );
+        await redirectCall(callSid, "guarded-bridge", sessionId, leg);
+      }
+    }
+  } catch (err) {
+    console.error(`[verify] bridgeJoinWatchdog failed session=${sessionId}:`, err);
+  }
+}
+
+function scheduleBridgeWatchdog(sessionId: string): void {
+  const t = setTimeout(() => {
+    void bridgeJoinWatchdog(sessionId);
+  }, bridgeWatchdogMs());
+  t.unref?.();
+}
+
+/**
+ * Callee drop auto-recovery (the "the first call ended without me ending"
+ * fix): the callee's bridged leg ended mid-conversation while the caller is
+ * still live. Verification already PASSED, so we don't re-verify — we dial
+ * the callee back once, straight into the live conference (bridge-recall
+ * TwiML), tell the caller we're reconnecting (conference announce), and keep
+ * the session BRIDGED. A second drop ends the call normally (no recall loop).
+ */
+async function recallCalleeIntoBridge(
+  session: VerificationSession,
+  droppedCallSid: string,
+  statusDetail: string,
+): Promise<boolean> {
+  if (!bridgeRecallEnabled()) return false;
+  if (!session.guarded || !session.callerCallSid) return false;
+  if (bridgeRecallUsed.has(session.sessionId)) return false;
+  bridgeRecallUsed.add(session.sessionId);
+
+  await logEvent(
+    session.sessionId,
+    "BRIDGE_RECALL",
+    `callee leg ended mid-call (sid=${droppedCallSid} ${statusDetail}) — re-dialling callee directly into the live conference`.slice(0, 512),
+  );
+
+  // Tell the caller (still in the conference) that we're reconnecting —
+  // announce plays to the CALLER participant only.
+  try {
+    const confSid = await liveConferenceSid(session.sessionId);
+    if (confSid) {
+      await getTwilioClient()
+        .conferences(confSid)
+        .participants(session.callerCallSid)
+        .update({
+          announceUrl: twimlUrl("notify-reconnecting", session.sessionId),
+          announceMethod: "POST",
+        });
+    }
+  } catch (err) {
+    console.warn(`[verify] BRIDGE_RECALL announce failed session=${session.sessionId}:`, err);
+  }
+
+  try {
+    const call = await getTwilioClient().calls.create({
+      to: session.calleeNumber,
+      from: twilioCallerId(),
+      url: twimlUrl("bridge-recall", session.sessionId),
+      method: "POST",
+      statusCallback: statusUrl("legA", session.sessionId),
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["completed"],
+      timeout: 30,
+    });
+    session.legACallSid = call.sid;
+    await save(session);
+    await logEvent(
+      session.sessionId,
+      "BRIDGE_RECALL_DIALED",
+      `newLegA=${call.sid} to=${session.calleeNumber} — session stays BRIDGED`,
+    );
+    scheduleBridgeWatchdog(session.sessionId);
+    return true;
+  } catch (err) {
+    console.error(`[verify] BRIDGE_RECALL originate failed session=${session.sessionId}:`, err);
+    await logEvent(
+      session.sessionId,
+      "BRIDGE_RECALL_FAILED",
+      err instanceof Error ? err.message : String(err),
+    );
+    return false; // fall through to the normal call-ended path
+  }
 }
 
 /**
@@ -2158,6 +2324,29 @@ export async function onLegFailed(
   }
 
   if (leg === "legA") {
+    // RECALL-FAILURE path: this legA failure is the BRIDGE RECALL call
+    // (session still BRIDGED, recall already used). The callee didn't take the
+    // re-dial — end the conference so the caller is released to the
+    // partner-ended notice, and close the session COMPLETED (the original
+    // conversation did happen and was verified).
+    if (session.guarded && session.state === VState.BRIDGED && bridgeRecallUsed.has(sessionId)) {
+      console.warn(`[verify] BRIDGE_RECALL_NO_ANSWER reason=${reason} — ending bridge`);
+      if (await transition(session, VState.COMPLETED, `Bridge recall failed (${reason}) — callee unreachable`)) {
+        session.completedAt = new Date();
+        await save(session);
+        await logEvent(sessionId, "BRIDGE_RECALL_UNANSWERED", `reason=${reason}`);
+        const confSid = await liveConferenceSid(sessionId);
+        if (confSid) {
+          try {
+            await getTwilioClient().conferences(confSid).update({ status: "completed" });
+          } catch (err) {
+            console.warn(`[verify] conference end failed session=${sessionId}:`, err);
+          }
+        }
+        await hangupAll(session, { caller: true, legB: true, ringTest: true });
+      }
+      return;
+    }
     console.warn(`[verify] LEG_A_FAILED callee unavailable. reason=${reason}`);
     if (
       await transition(session, VState.FAILED, `Leg A failed (${reason}) — callee unavailable`)
@@ -2234,6 +2423,17 @@ export async function onCallCompleted(
   // while BRIDGED are expected (the ring test was hung up and Leg B was torn
   // down at bridge time) and fall through untouched.
   if (session.state === VState.BRIDGED && (leg === "caller" || leg === "legA")) {
+    // CALLEE DROP AUTO-RECALL: the callee's bridged leg ended while the caller
+    // is still live (handset glitch, accidental hold-end, carrier blip).
+    // Verification already passed — dial them back straight into the live
+    // conference instead of ending the call. Once per session.
+    if (
+      leg === "legA" &&
+      session.legACallSid === callSid &&
+      (await recallCalleeIntoBridge(session, callSid, statusDetail))
+    ) {
+      return; // session stays BRIDGED; the recall call continues the bridge
+    }
     if (
       await transition(
         session,

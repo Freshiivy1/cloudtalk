@@ -179,17 +179,29 @@ const CALLER_WAIT_PAUSE_SEC = 10;
 function serveBridgeConference(
   vr: twilio.twiml.VoiceResponse,
   sid: string,
-  leg: "caller" | "legA",
+  leg: "caller" | "legA" | "recall",
 ) {
   vr.dial().conference(
     {
       beep: "false",
-      startConferenceOnEnter: leg === "legA",
-      endConferenceOnExit: true,
+      // Anchor rules: Leg A (or the recall leg) STARTS the room; the caller
+      // only ever joins it — a leg that cannot start the conference can never
+      // spawn a duplicate same-name conference stranding both in silence.
+      startConferenceOnEnter: leg !== "caller",
+      // endConferenceOnExit ONLY on the caller leg: the caller hanging up
+      // ends the call for everyone. The CALLEE leg exiting must NOT end the
+      // room — the bridge supervisor re-dials a dropped callee straight back
+      // into this same conference while the caller waits (BRIDGE_RECALL).
+      endConferenceOnExit: leg === "caller",
       record: "record-from-start",
       recordingStatusCallback: vs.recordingBridgeUrl(sid),
       recordingStatusCallbackMethod: "POST",
       recordingStatusCallbackEvent: ["completed"],
+      // Participant join/leave + conference lifecycle events feed the bridge
+      // supervisor (join watchdog + drop recovery) and the session timeline.
+      statusCallback: vs.conferenceStatusUrl(sid),
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["start", "end", "join", "leave"],
     },
     vs.conferenceName(sid),
   );
@@ -495,6 +507,23 @@ export async function verificationTwimlHandler(c: Context) {
         // <Dial><Conference>, which is why this notice lives in the TwiML
         // flow itself rather than being pushed by the state machine.)
         vr.say(P.partnerEnded);
+        vr.hangup();
+        break;
+      }
+
+      case "bridge-recall": {
+        // GUARDED MODE ONLY: the callee's bridged leg dropped mid-call and the
+        // supervisor is re-dialling them straight into the live conference
+        // (verification already passed — no second-call dance on recovery).
+        vr.say("Reconnecting your call now.");
+        serveBridgeConference(vr, sid, "recall");
+        break;
+      }
+
+      case "notify-reconnecting": {
+        // Conference ANNOUNCE document played to the CALLER participant only
+        // while the callee is being re-dialled (see BRIDGE_RECALL).
+        vr.say("Please hold — the other party disconnected. Reconnecting them now.");
         vr.hangup();
         break;
       }
@@ -1171,4 +1200,71 @@ export async function verificationSmsInboundHandler(c: Context) {
     }
     return c.json({ ok: false, error: "internal" }, 200);
   }
+}
+
+/**
+ * POST /api/verify/conference?sid=… — bridge conference status callback.
+ * Twilio posts conference-start / conference-end / participant-join /
+ * participant-leave with the participant's CallSid. This is the bridge
+ * supervisor's ground truth: which party actually JOINED the room (the join
+ * watchdog re-redirects a leg that never did) and who LEFT (the drop-recall
+ * path). Every event lands on the session timeline, so a live call can be
+ * diagnosed from the dashboard instead of guesswork.
+ */
+export async function verificationConferenceHandler(c: Context) {
+  try {
+    const sid = c.req.query("sid") ?? "";
+    const body = await c.req.parseBody();
+    const event = String(body.StatusCallbackEvent ?? "");
+    const callSid = String(body.CallSid ?? "");
+    const confSid = String(body.ConferenceSid ?? "");
+    if (!sid) return c.text("ok", 200);
+
+    if (event === "participant-join" && callSid) {
+      vs.noteConferenceJoin(sid, callSid);
+      const session = await vs.findSession(sid);
+      const leg =
+        session?.callerCallSid === callSid
+          ? "caller"
+          : session?.legACallSid === callSid
+            ? "legA"
+            : session?.legBCallSid === callSid
+              ? "legB"
+              : "unknown";
+      await vs.logEvent(sid, "CONF_PARTICIPANT_JOINED", `leg=${leg} sid=${callSid} conf=${confSid}`);
+    } else if (event === "participant-leave" && callSid) {
+      vs.noteConferenceLeave(sid, callSid);
+      const session = await vs.findSession(sid);
+      const leg =
+        session?.callerCallSid === callSid
+          ? "caller"
+          : session?.legACallSid === callSid
+            ? "legA"
+            : session?.legBCallSid === callSid
+              ? "legB"
+              : "unknown";
+      await vs.logEvent(sid, "CONF_PARTICIPANT_LEFT", `leg=${leg} sid=${callSid} conf=${confSid}`);
+    } else if (event === "conference-start") {
+      await vs.logEvent(sid, "CONF_STARTED", `conf=${confSid}`);
+    } else if (event === "conference-end") {
+      await vs.logEvent(sid, "CONF_ENDED", `conf=${confSid}`);
+    }
+    return c.text("ok", 200);
+  } catch (err) {
+    console.error("[verify] conference status error:", err);
+    return c.text("ok", 200); // never error Twilio on a status callback
+  }
+}
+
+/**
+ * GET /api/verify/version — deployment marker so we can always tell WHICH
+ * code the live service is running (Render injects RENDER_GIT_COMMIT).
+ */
+export async function verificationVersionHandler(c: Context) {
+  return c.json({
+    commit: process.env.RENDER_GIT_COMMIT ?? "unknown",
+    branch: process.env.RENDER_GIT_BRANCH ?? "unknown",
+    service: process.env.RENDER_SERVICE_NAME ?? "local",
+    time: new Date().toISOString(),
+  });
 }
