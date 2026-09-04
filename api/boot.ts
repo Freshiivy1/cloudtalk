@@ -21,7 +21,6 @@ import {
   verificationToneHandler,
   verificationTwimlHandler,
   verificationVoiceprintHandler,
-  verificationVoiceprintTranscriptionHandler,
 } from "./verification-webhooks";
 import {
   verificationBridgeRecordingHandler,
@@ -53,10 +52,9 @@ app.post("/api/verify/recording/merge", verificationRecordingHandler);
 // GUARDED MODE ONLY: bridge conference recording callback + call-review playback.
 app.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
 app.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
-// GUARDED MODE ONLY: voice-ID <Record> action (baseline + second-call handoff)
-// and its Twilio transcription callback (phrase verification).
+// GUARDED MODE ONLY: save-only voice-ID <Record> action (capture stamp +
+// immediate second-call handoff — no verification, no transcription).
 app.post("/api/verify/voiceprint", verificationVoiceprintHandler);
-app.post("/api/verify/voiceprint-transcription", verificationVoiceprintTranscriptionHandler);
 // TEST-ONLY scripted callee for end-to-end guarded-call self-tests.
 app.post("/api/test/callee-bot", testCalleeBotHandler);
 app.get("/api/test/callee-bot", testCalleeBotHandler);

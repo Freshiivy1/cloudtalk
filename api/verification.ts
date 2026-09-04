@@ -15,13 +15,14 @@
  *   POST {PUBLIC_BASE_URL}/api/verify/gather/merge?sid=...
  *   POST {PUBLIC_BASE_URL}/api/verify/gather/leg-a-accept?sid=...
  *   POST {PUBLIC_BASE_URL}/api/verify/gather/leg-a-ready?sid=...
- *   POST {PUBLIC_BASE_URL}/api/verify/voiceprint?sid=...        (guarded only)
+ *   POST {PUBLIC_BASE_URL}/api/verify/voiceprint?sid=...        (guarded only —
+ *     save-only voice-ID <Record> action: stamps the capture and hands the
+ *     callee straight to the second press-1 gather)
  */
 import { TRPCError } from "@trpc/server";
 import { and, desc, eq, gt, lt, ne, notInArray, or } from "drizzle-orm";
 import * as schema from "@db/schema";
 import type { VerificationSession } from "@db/schema";
-import type { ClipProfile } from "./relayguard/features";
 import { PROMPT_LIGHT_DURATION_MS } from "./generated/prompt-light-asset";
 import { getDb } from "./queries/connection";
 import {
@@ -324,459 +325,56 @@ export function forensicsWarmupMs(): number {
   return Math.floor(v);
 }
 
-/**
- * GUARDED MODE ONLY: session-scoped callee voice baseline. Captured from the
- * post-press-1 voiceprint <Record> ("my voice identifies me") by the
- * /api/verify/voiceprint webhook and compared against live Leg A audio
- * in-call (verification-stream.ts). In-memory only — the recording itself
- * persists on Twilio and is referenced by the VOICEPRINT_CAPTURED event.
- */
-const voiceBaselineBySession = new Map<string, ClipProfile>();
-
-/** Per-session wall-clock of the last VOICE_MISMATCH event write (throttle). */
-const lastVoiceMismatchAt = new Map<string, number>();
-
-/** Min ms between VOICE_MISMATCH event writes (default 30s). */
-export function voiceMismatchThrottleMs(): number {
-  const v = Number(process.env.VERIFY_VOICE_MISMATCH_THROTTLE_MS);
-  return Number.isFinite(v) && v >= 0 ? v : 30_000;
-}
-
-export function setVoiceBaseline(sessionId: string, profile: ClipProfile): void {
-  voiceBaselineBySession.set(sessionId, profile);
-}
-
-export function getVoiceBaseline(sessionId: string): ClipProfile | null {
-  return voiceBaselineBySession.get(sessionId) ?? null;
-}
-
 /* -------------------------------------------------------------------------- */
-/* GUARDED MODE ONLY: voice-ID enforcement (phrase + voiceprint gate)           */
+/* GUARDED MODE ONLY: save-only voice ID ("my voice identifies me")            */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The guarded bridge is gated on a PASSING voice-ID: before Leg B is ever
- * originated, the callee's "my voice identifies me" recording must pass BOTH
- *  (a) a usable voiceprint — analyzeClip() succeeds with >=
- *      VOICE_ID_MIN_SPEECH_SEC of VAD speech, and
- *  (b) phrase verification — the Twilio <Record transcribe> transcript
- *      fuzzy-matches the expected phrase (>=3 of the 4 content tokens).
- * While the transcript is awaited the callee is held in the voice-id-wait
- * loop; after voiceIdTranscriptTimeoutMs() with no transcript the fallback
- * ACCEPTS when the voiceprint is strong (VOICE_ID_TRANSCRIPT_MISSING logged).
- * ANY failure re-prompts and re-records; after VOICE_ID_MAX_ATTEMPTS the
- * session FAILS (polite prompt + hangup). NO BRIDGE without a pass.
+ * Save-only voice ID: after the first press-1 the callee is asked to say
+ * "my voice identifies me"; the phrase is recorded and the voiceprint
+ * profile is built (VOICEPRINT_CAPTURED evidence), but NO voice matching and
+ * NO phrase verification is EVER performed — the capture is call-review
+ * evidence, not a gate. The voiceprint <Record> action stamps the capture on
+ * the session (voiceIdCapturedAt + voiceIdRecordingSid — see
+ * markVoiceIdCaptured) and thereby against the Leg B call it originates, and
+ * hands the callee STRAIGHT to the second press-1 gather: no wait loop, no
+ * verdict, no re-record. A capture is valid for the SAME UTC calendar day as
+ * the call only (voiceIdFreshForToday) — a fresh capture is required each
+ * day; a prior-day capture is never reused.
  */
-
-/** Max voice-ID record attempts before the call is failed. */
-export const VOICE_ID_MAX_ATTEMPTS = 3;
 
 /**
- * Max voice-id-wait loop polls (2s pause each, ~20s) tolerated with NO
- * attempt begun — i.e. the voice-ID <Record> action never fired (Twilio
- * action-fetch failure, or the redirect-after-Record fallback landed in the
- * wait loop). Past this cap the wait loop counts a FAILED attempt (D1) and
- * routes into the normal re-record path instead of holding the callee in
- * silence forever.
+ * True while a voice-ID capture stamped at `capturedAt` is still fresh for
+ * `now` — both fall on the SAME UTC calendar day. A missing capture is never
+ * fresh; a prior-day capture is never reused.
  */
-export const VOICE_ID_WAIT_MAX_POLLS = 10;
-
-/** Min VAD speech (seconds) for a voiceprint to count as usable/strong. */
-export const VOICE_ID_MIN_SPEECH_SEC = 1.5;
-
-/** Max wait for the Twilio transcript before the strong-voiceprint fallback. */
-export function voiceIdTranscriptTimeoutMs(): number {
-  const v = Number(process.env.VERIFY_VOICE_ID_TRANSCRIPT_TIMEOUT_MS);
-  return Number.isFinite(v) && v > 0 ? v : 15_000;
+export function voiceIdFreshForToday(capturedAt: Date | null, now: Date = new Date()): boolean {
+  if (!capturedAt) return false;
+  return capturedAt.toISOString().slice(0, 10) === now.toISOString().slice(0, 10);
 }
 
 /**
- * Fuzzy phrase match for the voice-ID transcript. Expected: "my voice
- * identifies me" (or "my name identifies me"), case-insensitive. Small STT
- * substitutions are tolerated: >=3 of the 4 content token groups must be
- * present — [my], [voice|name], [identif…] (covers identify/identified),
- * [me].
+ * The voice-ID <Record> action fired — stamp the save-only capture on the
+ * session (voiceIdCapturedAt + voiceIdRecordingSid). No attempts, no
+ * verdict, no gate: the callee proceeds to the second press-1 immediately
+ * and Leg B is originated from that press regardless of profiling outcome.
  */
-export function voiceIdPhraseMatches(transcript: string): boolean {
-  const words = transcript
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-  if (words.length === 0) return false;
-  const groups = [
-    (ws: string[]) => ws.includes("my"),
-    (ws: string[]) => ws.includes("voice") || ws.includes("name"),
-    (ws: string[]) => ws.some((w) => w.startsWith("identif")),
-    (ws: string[]) => ws.includes("me"),
-  ];
-  return groups.filter((g) => g(words)).length >= 3;
-}
-
-interface VoiceIdAttempt {
-  pendingSince: number;
-  /** Twilio RecordingSid of this attempt's <Record> (late-transcript guard). */
-  recordingSid: string;
-  recordingNoted: boolean;
-  /** Recording exists with usable audio (url + >=1s). */
-  recordingUsable: boolean;
-  /** analyzeClip succeeded AND >= VOICE_ID_MIN_SPEECH_SEC of VAD speech. */
-  voiceprintStrong: boolean;
-  transcriptReceived: boolean;
-  transcriptMatched: boolean;
-  decided: "pending" | "passed" | "failed";
-  decisionReason: string;
-  missingLogged: boolean;
-}
-
-interface VoiceIdState {
-  attempts: number;
-  current: VoiceIdAttempt | null;
-  /** Transcript that raced in before the record action (rare Twilio ordering). */
-  earlyTranscript: { status: string; text: string; recordingSid: string } | null;
-}
-
-const voiceIdBySession = new Map<string, VoiceIdState>();
-
-function voiceIdState(sessionId: string): VoiceIdState {
-  let st = voiceIdBySession.get(sessionId);
-  if (!st) {
-    st = { attempts: 0, current: null, earlyTranscript: null };
-    voiceIdBySession.set(sessionId, st);
-  }
-  return st;
-}
-
-function newVoiceIdAttempt(recordingSid: string): VoiceIdAttempt {
-  return {
-    pendingSince: Date.now(),
-    recordingSid,
-    recordingNoted: false,
-    recordingUsable: false,
-    voiceprintStrong: false,
-    transcriptReceived: false,
-    transcriptMatched: false,
-    decided: "pending",
-    decisionReason: "",
-    missingLogged: false,
-  };
-}
-
-function applyTranscript(a: VoiceIdAttempt, status: string, text: string): void {
-  a.transcriptReceived = true;
-  // A completed transcription fuzzy-matches the phrase; a failed/empty one
-  // can never match (counts as a mismatch → re-record, NOT the timeout
-  // fallback — that is reserved for a transcript that never arrives).
-  a.transcriptMatched = status === "completed" && voiceIdPhraseMatches(text.trim());
-}
-
-/**
- * The voice-ID <Record> action fired — a new attempt begins. Called once per
- * recording (initial + each re-record). Returns the 1-based attempt number.
- */
-export function voiceIdBeginAttempt(sessionId: string, recordingSid = ""): number {
-  const st = voiceIdState(sessionId);
-  st.attempts++;
-  const a = newVoiceIdAttempt(recordingSid);
-  if (
-    st.earlyTranscript &&
-    (!recordingSid || !st.earlyTranscript.recordingSid || st.earlyTranscript.recordingSid === recordingSid)
-  ) {
-    applyTranscript(a, st.earlyTranscript.status, st.earlyTranscript.text);
-    st.earlyTranscript = null;
-  }
-  st.current = a;
-  return st.attempts;
-}
-
-/**
- * D3: true while `recordingSid` belongs to the CURRENT voice-ID attempt —
- * used to keep a slow processVoiceprint fetch (still retrying when a
- * re-record already began attempt N+1) from stamping its baseline/note onto
- * the new attempt. Un-correlatable (empty) SIDs are accepted, matching the
- * late-transcript guard convention; no current attempt → stale.
- */
-export function voiceIdIsCurrentRecording(sessionId: string, recordingSid: string): boolean {
-  const cur = voiceIdBySession.get(sessionId)?.current;
-  if (!cur) return false;
-  if (!recordingSid || !cur.recordingSid) return true;
-  return cur.recordingSid === recordingSid;
-}
-
-/** Recording profiling outcome for the current attempt (from the action). */
-export function voiceIdNoteRecording(
+export async function markVoiceIdCaptured(
   sessionId: string,
-  note: { usable: boolean; strong: boolean; detail: string; recordingSid?: string },
-): void {
-  const st = voiceIdState(sessionId);
-  if (!st.current || st.current.decided !== "pending") return;
-  // D3: a note from a PREVIOUS attempt's recording (its processVoiceprint
-  // fetch was still retrying when the re-record began) must never land on
-  // the new attempt — same guard as the stale-transcript path.
-  if (
-    note.recordingSid &&
-    st.current.recordingSid &&
-    note.recordingSid !== st.current.recordingSid
-  ) {
-    console.log(
-      `[verify] VOICE_ID_RECORDING_STALE session=${sessionId} — profiling note for an older recording, ignoring`,
-    );
-    return;
-  }
-  st.current.recordingNoted = true;
-  st.current.recordingUsable = note.usable;
-  st.current.voiceprintStrong = note.strong;
-  console.log(
-    `[verify] VOICE_ID_RECORDING_NOTED session=${sessionId} usable=${note.usable} strong=${note.strong} | ${note.detail}`,
-  );
-}
-
-/** Twilio transcribeCallback for the voice-ID recording. */
-export async function voiceIdNoteTranscript(
-  sessionId: string,
-  note: { status: string; text: string; recordingSid?: string },
+  recordingSid: string,
 ): Promise<void> {
-  const st = voiceIdState(sessionId);
-  if (!st.current) {
-    // Transcript raced ahead of the record action — buffer it for the attempt.
-    st.earlyTranscript = { status: note.status, text: note.text, recordingSid: note.recordingSid ?? "" };
-    return;
-  }
-  if (st.current.decided !== "pending" || st.current.transcriptReceived) {
-    console.log(
-      `[verify] VOICE_ID_TRANSCRIPT_LATE session=${sessionId} — attempt already decided/heard, ignoring`,
-    );
-    return;
-  }
-  // A transcript from a PREVIOUS recording (late Twilio delivery after a
-  // re-record) must never decide the current attempt.
-  if (
-    st.current.recordingSid &&
-    note.recordingSid &&
-    note.recordingSid !== st.current.recordingSid
-  ) {
-    console.log(
-      `[verify] VOICE_ID_TRANSCRIPT_STALE session=${sessionId} — transcript for an older recording, ignoring`,
-    );
-    return;
-  }
-  applyTranscript(st.current, note.status, note.text);
-  await logEvent(
-    sessionId,
-    "VOICE_ID_TRANSCRIPT",
-    `status=${note.status} matched=${st.current.transcriptMatched} text="${note.text.slice(0, 200)}"`,
-  );
-}
-
-export interface VoiceIdVerdict {
-  status: "pending" | "passed" | "failed";
-  attempts: number;
-  reason: string;
-}
-
-/**
- * Current voice-ID verdict for the wait loop. Computes (and latches) the
- * per-attempt decision:
- *  - recording missing/unusable → FAILED (re-record).
- *  - transcript received: a phrase MISMATCH (including empty/failed
- *    transcriptions) → FAILED (re-record); a MATCH passes only when the
- *    voiceprint is also strong (BOTH halves required).
- *  - no transcript after voiceIdTranscriptTimeoutMs → strong-voiceprint
- *    fallback: PASS when strong (VOICE_ID_TRANSCRIPT_MISSING logged), FAIL
- *    otherwise.
- */
-export async function voiceIdVerdict(sessionId: string): Promise<VoiceIdVerdict> {
-  const st = voiceIdState(sessionId);
-  const a = st.current;
-  if (!a) return { status: "pending", attempts: st.attempts, reason: "no recording yet" };
-  if (a.decided !== "pending") {
-    return { status: a.decided, attempts: st.attempts, reason: a.decisionReason };
-  }
-
-  const decide = async (
-    status: "passed" | "failed",
-    reason: string,
-    eventType: string,
-  ): Promise<VoiceIdVerdict> => {
-    a.decided = status;
-    a.decisionReason = reason;
-    console.log(`[verify] ${eventType} session=${sessionId} attempt=${st.attempts} | ${reason}`);
-    await logEvent(sessionId, eventType, `attempt=${st.attempts} | ${reason}`.slice(0, 512));
-    return { status, attempts: st.attempts, reason };
-  };
-
-  // Missing/unusable recording → fail the attempt immediately (re-record).
-  if (a.recordingNoted && !a.recordingUsable) {
-    return decide("failed", "voice-ID recording missing or unusable", "VOICE_ID_FAILED");
-  }
-
-  if (a.transcriptReceived) {
-    // A phrase mismatch (wrong/empty/failed transcription) fails the attempt
-    // as soon as it arrives — the callee re-records.
-    if (!a.transcriptMatched) {
-      return decide(
-        "failed",
-        `phrase mismatch — transcript did not match "my voice identifies me"`,
-        "VOICE_ID_FAILED",
-      );
-    }
-    if (a.recordingNoted) {
-      // BOTH halves must pass: phrase verified AND usable voiceprint.
-      if (a.voiceprintStrong) {
-        return decide(
-          "passed",
-          "phrase matched and voiceprint usable — voice-ID verified",
-          "VOICE_ID_PASSED",
-        );
-      }
-      return decide(
-        "failed",
-        "phrase matched but voiceprint unusable/insufficient speech",
-        "VOICE_ID_FAILED",
-      );
-    }
-    // Profiling still running — fall through to the timeout check below.
-  }
-
-  // Profiling never completed inside the wait window — fail the attempt
-  // rather than holding the callee forever.
-  const elapsed = Date.now() - a.pendingSince;
-  if (!a.recordingNoted && elapsed >= voiceIdTranscriptTimeoutMs()) {
-    return decide(
-      "failed",
-      `recording profiling timed out after ${Math.round(elapsed / 1000)}s`,
-      "VOICE_ID_FAILED",
-    );
-  }
-
-  // Transcript-timeout fallback: the callee waited the full window with no
-  // transcript — ACCEPT when the voiceprint is provably strong (logged),
-  // otherwise fail the attempt and re-record.
-  if (!a.transcriptReceived && a.recordingNoted && elapsed >= voiceIdTranscriptTimeoutMs()) {
-    if (a.voiceprintStrong) {
-      if (!a.missingLogged) {
-        a.missingLogged = true;
-        await logEvent(
-          sessionId,
-          "VOICE_ID_TRANSCRIPT_MISSING",
-          `no transcript after ${Math.round(elapsed / 1000)}s — accepting on strong voiceprint`,
-        );
-      }
-      return decide(
-        "passed",
-        "transcript unavailable but voiceprint strong — fallback accept",
-        "VOICE_ID_PASSED",
-      );
-    }
-    return decide(
-      "failed",
-      `no transcript after ${Math.round(elapsed / 1000)}s and voiceprint unusable`,
-      "VOICE_ID_FAILED",
-    );
-  }
-
-  return { status: "pending", attempts: st.attempts, reason: "awaiting transcript/voiceprint" };
-}
-
-/**
- * D1: the voice-id-wait loop hit its poll cap (VOICE_ID_WAIT_MAX_POLLS × 2s)
- * with NO attempt begun — the <Record> action never fired (Twilio
- * action-fetch failure, or the redirect-after-Record fallback landed in the
- * wait loop). Counts as a FAILED voice-ID attempt so the wait loop routes
- * into the normal re-record path (and the polite goodbye after
- * VOICE_ID_MAX_ATTEMPTS) instead of holding the callee in silence forever.
- * Passthrough to the normal verdict when an attempt IS in flight (the poll
- * cap only applies to the no-attempt case).
- */
-export async function voiceIdNoteMissedAttempt(sessionId: string): Promise<VoiceIdVerdict> {
-  const st = voiceIdState(sessionId);
-  // An attempt IS in flight — the poll cap only applies to the no-attempt
-  // case (the pending attempt's transcript/profiling timeouts decide it).
-  if (st.current && st.current.decided === "pending") return voiceIdVerdict(sessionId);
-  st.attempts++;
-  const a = newVoiceIdAttempt("");
-  a.decided = "failed";
-  a.decisionReason = "voice-ID recording never started (<Record> action not received)";
-  st.current = a;
-  console.log(
-    `[verify] VOICE_ID_NO_ATTEMPT session=${sessionId} attempt=${st.attempts} — counted as failed (wait poll cap)`,
-  );
-  await logEvent(
-    sessionId,
-    "VOICE_ID_NO_ATTEMPT",
-    `attempt=${st.attempts} | <Record> action never fired within ${VOICE_ID_WAIT_MAX_POLLS} wait polls — counted as failed`,
-  );
-  return { status: "failed", attempts: st.attempts, reason: a.decisionReason };
-}
-
-/** True once the session's voice-ID has PASSED (bridge gate). */
-export async function isVoiceIdPassed(sessionId: string): Promise<boolean> {
-  return (await voiceIdVerdict(sessionId)).status === "passed";
-}
-
-/**
- * True while NO voice-ID attempt has begun (the <Record> action hasn't
- * fired). D1: the wait loop's poll cap only applies in this state.
- */
-export function voiceIdAwaitingAttempt(sessionId: string): boolean {
-  return voiceIdBySession.get(sessionId)?.current == null;
-}
-
-/**
- * The wait loop served the re-record TwiML for a FAILED attempt — clear the
- * latched attempt so subsequent wait-loop polls see "no attempt begun"
- * until the new <Record> action fires. D1: if it never fires, the poll cap
- * counts the miss as the NEXT failed attempt (3 strikes → polite goodbye)
- * instead of instantly re-serving the same re-record TwiML forever.
- */
-export function voiceIdAcknowledgeFailure(sessionId: string): void {
-  const st = voiceIdBySession.get(sessionId);
-  if (st?.current && st.current.decided === "failed") st.current = null;
-}
-
-/**
- * Voice-ID exhausted VOICE_ID_MAX_ATTEMPTS failures → the call ends: FAILED
- * (reason logged), the caller hears notify-failed, verification legs are
- * torn down. The CALLEE leg is deliberately NOT REST-hung-up — the
- * voice-id-wait TwiML plays the polite failure prompt and hangs up itself.
- */
-export async function onVoiceIdFailed(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
   if (!session || isTerminal(session)) return;
-  if (
-    await transition(
-      session,
-      VState.FAILED,
-      `voice-ID verification failed after ${VOICE_ID_MAX_ATTEMPTS} attempts`,
-    )
-  ) {
-    session.failureReason = "Voice-ID verification failed";
-    session.completedAt = new Date();
-    await save(session);
-    await logEvent(
-      sessionId,
-      "VOICE_ID_EXHAUSTED",
-      `voice-ID failed ${VOICE_ID_MAX_ATTEMPTS} times — call ended`,
-    );
-    await redirectCall(session.callerCallSid, "notify-failed", sessionId);
-    await hangupAll(session, { legB: true, ringTest: true });
-  }
+  session.voiceIdCapturedAt = new Date();
+  session.voiceIdRecordingSid = recordingSid || null;
+  await save(session);
+  await logEvent(
+    sessionId,
+    "VOICE_ID_CAPTURED",
+    `recordingSid=${recordingSid || "(none)"} — save-only voice ID (no matching); valid same UTC day only`,
+  );
 }
 
-/**
- * In-call voice comparison fired on a 'different' consensus. Detection only —
- * NEVER hangs up and NEVER fires challenge noise: a voice mismatch is a
- * forensic signal (event log + dashboard), while challenge noise is reserved
- * for the SpeakerphoneDetector.onSuspicious path exclusively. Throttled to
- * one event write per voiceMismatchThrottleMs().
- */
-export async function onVoiceMismatch(sessionId: string, detail: string): Promise<void> {
-  const last = lastVoiceMismatchAt.get(sessionId) ?? -Infinity;
-  if (Date.now() - last < voiceMismatchThrottleMs()) return;
-  lastVoiceMismatchAt.set(sessionId, Date.now());
-  console.warn(`[verify] VOICE_MISMATCH session=${sessionId} | ${detail}`);
-  await logEvent(sessionId, "VOICE_MISMATCH", detail);
-}
 
 /**
  * Drop all per-session in-process map entries. Call whenever a session reaches
@@ -790,9 +388,6 @@ function cleanupSessionMaps(sessionId: string): void {
   bridgedSessions.delete(sessionId);
   noiseInjectionCount.delete(sessionId);
   lastNoiseEventAt.delete(sessionId);
-  voiceBaselineBySession.delete(sessionId);
-  lastVoiceMismatchAt.delete(sessionId);
-  voiceIdBySession.delete(sessionId);
   secondCallEngagedSessions.delete(sessionId);
   disarmMergeTone(sessionId);
 }
@@ -878,14 +473,9 @@ export function gatherLegAReadyUrl(sessionId: string, attempt: number): string {
   return `${requirePublicBaseUrl()}/api/verify/gather/leg-a-ready?sid=${sessionId}&a=${attempt}`;
 }
 
-/** GUARDED MODE ONLY: voiceprint <Record> action — keeps the leg on hold. */
+/** GUARDED MODE ONLY: voiceprint <Record> action — save-only voice-ID capture. */
 export function voiceprintUrl(sessionId: string): string {
   return `${requirePublicBaseUrl()}/api/verify/voiceprint?sid=${sessionId}`;
-}
-
-/** GUARDED MODE ONLY: Twilio transcription callback for the voice-ID <Record>. */
-export function voiceprintTranscriptionUrl(sessionId: string): string {
-  return `${requirePublicBaseUrl()}/api/verify/voiceprint-transcription?sid=${sessionId}`;
 }
 
 /** Self-redirecting hold TwiML that keeps Leg A alive after CALLEE_READY. */
@@ -906,19 +496,12 @@ export function verifyPrompts() {
     accept:
       e.VERIFY_PROMPT_ACCEPT ??
       "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
-    // GUARDED MODE ONLY: spoken after press-1, before the voiceprint <Record>.
+    // GUARDED MODE ONLY: spoken after press-1, before the voiceprint <Record>
+    // (save-only — the phrase is captured as call-review evidence, never
+    // verified, so there are no retry/failure prompts).
     voiceId:
       e.VERIFY_PROMPT_VOICE_ID ??
       "Please identify your voice. After the beep, say: my voice identifies me.",
-    // GUARDED MODE ONLY: voice-ID attempt failed (phrase mismatch / unusable
-    // recording) — re-prompt before re-recording.
-    voiceIdRetry:
-      e.VERIFY_PROMPT_VOICE_ID_RETRY ??
-      "That didn't match. Please try again. After the beep, say: my voice identifies me.",
-    // GUARDED MODE ONLY: all voice-ID attempts exhausted — polite goodbye.
-    voiceIdFailed:
-      e.VERIFY_PROMPT_VOICE_ID_FAILED ??
-      "We could not verify your voice. This call will now end. Goodbye.",
     // GUARDED MODE ONLY: spoken after the voice-ID recording; the SECOND
     // press-1 is the explicit trigger that originates Leg B. The callee is
     // pre-taught the call-waiting choreography: answering the second call
@@ -1132,6 +715,10 @@ async function save(session: VerificationSession): Promise<void> {
       voiceRecordingUrl: session.voiceRecordingUrl,
       voiceRecordingDurationSec: session.voiceRecordingDurationSec,
       voiceRecordedAt: session.voiceRecordedAt,
+      // Save-only voice-ID capture stamp (markVoiceIdCaptured) — same-UTC-day
+      // validity is derived at read time via voiceIdFreshForToday.
+      voiceIdCapturedAt: session.voiceIdCapturedAt,
+      voiceIdRecordingSid: session.voiceIdRecordingSid,
       bridgeRecordingSid: session.bridgeRecordingSid,
       bridgeRecordingUrl: session.bridgeRecordingUrl,
       bridgeRecordingDurationSec: session.bridgeRecordingDurationSec,
@@ -1908,46 +1495,28 @@ export async function onCallAccepted(
 }
 
 /**
- * Second press-1 ("ready"). Guarded sessions originate Leg B HERE — after
- * voice-ID, never automatically from the recording callback. Non-guarded Leg B
- * may already be airborne from the legacy pre-origination path; in that case
- * this confirms and drains the buffered answer without a duplicate call.
+ * Second press-1 ("ready"). Guarded sessions originate Leg B HERE — after the
+ * save-only voice-ID recording, never automatically from the recording
+ * callback. Non-guarded Leg B may already be airborne from the legacy
+ * pre-origination path; in that case this confirms and drains the buffered
+ * answer without a duplicate call.
  *
- * VOICE-ID GATE (guarded only): Leg B is NEVER originated — and therefore the
- * bridge can never happen — until the voice-ID has PASSED (phrase transcript
- * match + usable voiceprint, or the logged strong-voiceprint fallback). A
- * guarded press that arrives without a pass is bounced back to the
- * voice-id-wait loop (returns false).
- *
- * Returns false when the press was rejected by the voice-ID gate (the webhook
- * re-serves the wait loop); true otherwise.
+ * SAVE-ONLY VOICE ID: there is NO voice-ID verdict gate. The voice-ID phrase
+ * is captured as call-review evidence only (stamped via markVoiceIdCaptured);
+ * the second press-1 always proceeds to Leg B origination.
  */
-export async function onCalleeReady(sessionId: string): Promise<boolean> {
+export async function onCalleeReady(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
-  if (!session) return true;
-  if (session.guarded && session.state === VState.CALL_ACCEPTED) {
-    if (!(await isVoiceIdPassed(sessionId))) {
-      console.warn(
-        `[verify] VOICE_ID_GATE_BLOCKED session=${sessionId} — second press-1 without a passing voice-ID; Leg B NOT originated`,
-      );
-      await logEvent(
-        sessionId,
-        "VOICE_ID_GATE_BLOCKED",
-        "callee pressed ready before voice-ID passed — bounced to the voice-ID wait loop",
-      );
-      return false;
-    }
-  }
+  if (!session) return;
   if (session.state === VState.CALL_ACCEPTED) {
     await originateLegB(sessionId);
-    return true;
+    return;
   }
   await logEvent(
     sessionId,
     "CALLEE_READY_CONFIRMED",
     `state=${session.state} — Leg B already ringing (pre-originated at accept)`,
   );
-  return true;
 }
 
 /**
@@ -3739,9 +3308,9 @@ export async function storeCallSid(
 }
 
 /**
- * GUARDED MODE ONLY: persist the explicit voice-ID recording ("my voice
+ * GUARDED MODE ONLY: persist the save-only voice-ID recording ("my voice
  * identifies me") so the call-review UI can play it back. Stored even when
- * relayguard profiling failed — playback does not depend on the baseline.
+ * relayguard profiling failed — playback does not depend on the profile.
  */
 export async function storeVoiceRecording(
   sessionId: string,

@@ -220,6 +220,16 @@ export const verificationSessions = mysqlTable(
     voiceRecordingDurationSec: int("voiceRecordingDurationSec"),
     voiceRecordedAt: timestamp("voiceRecordedAt"),
     /**
+     * GUARDED MODE ONLY: save-only voice ID ("my voice identifies me") — the
+     * phrase is recorded and the voiceprint profile is built, but NO voice
+     * matching is performed. The capture is stamped here against the session
+     * (and thereby the Leg B call it originates) and is valid for the SAME
+     * UTC calendar day as the call only (see voiceIdFreshForToday) — a fresh
+     * capture is required each day; a prior-day capture is never reused.
+     */
+    voiceIdCapturedAt: timestamp("voiceIdCapturedAt", { fsp: 3 }),
+    voiceIdRecordingSid: varchar("voiceIdRecordingSid", { length: 64 }),
+    /**
      * GUARDED MODE ONLY: the live bridge conference recording (record-from-
      * start) — the full two-way conversation for call review.
      */
