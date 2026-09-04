@@ -445,37 +445,48 @@ export function inProcessStreamUrl(): string | null {
  * one-shot — re-injection stops on the first clean window.
  *
  * MUTUAL EXCLUSION with the in-call merge system: if the merge tone is
- * already ARMED (i.e. the HoldDetector engaged a second call first) or the
+ * EFFECTIVELY armed (armed AND its announces are actually landing — see
+ * isMergeToneEffective; an armed-but-404ing tone owns nothing) or the
  * session is MERGE_DETECTED/terminal, the merge system owns the moment —
- * the challenge noise is SUPPRESSED (NOISE_SUPPRESSED_MERGE_ACTIVE event)
- * and skipped entirely. This guarantees the noise can NEVER interrupt the
- * DTMF merge tone or mask its detection: the two announces target different
- * participants (caller vs Leg A), and the noise never fires while the merge
- * system is active.
+ * the challenge is SUPPRESSED (NOISE_SUPPRESSED_MERGE_ACTIVE event) and
+ * skipped entirely. This guarantees the challenge can NEVER interrupt the
+ * merge tone: the two announces target different participants (caller vs
+ * Leg B), and the challenge never fires while the merge system is active.
+ *
+ * STRIKE LADDER: `episodeStart` (true on the FIRST emission of a new
+ * episode) plus the per-session strike count route the challenge —
+ * episodes 1–2 challenge noise, episode 3 final warning + caller mute,
+ * episode 4 supreme flag (call ended + admin alerted). See
+ * injectSpeakerphoneChallenge in verification.ts.
  */
 export function handleSpeakerphoneSuspicious(
   sid: string,
   score: number,
   detail: string,
+  episodeStart: boolean,
 ): void {
   console.warn(
-    `[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} ${detail}`,
+    `[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} episodeStart=${episodeStart} ${detail}`,
   );
   void (async () => {
-    const mergeToneArmed = vs.isMergeToneArmed(sid);
+    const mergeToneEffective = vs.isMergeToneEffective(sid);
     const session = await vs.findSession(sid);
     const mergeActive =
-      mergeToneArmed || !session || vs.isTerminal(session);
+      mergeToneEffective || !session || vs.isTerminal(session);
     if (mergeActive) {
       const reason =
-        `merge system active (mergeToneArmed=${mergeToneArmed} state=${session?.state ?? "unknown"}) — ` +
-        `challenge noise SUPPRESSED so it cannot interrupt the DTMF merge tone | score=${score.toFixed(2)} ${detail}`;
+        `merge system active (mergeToneEffective=${mergeToneEffective} state=${session?.state ?? "unknown"}) — ` +
+        `speakerphone challenge SUPPRESSED so it cannot interrupt the merge tone | score=${score.toFixed(2)} ${detail}`;
       console.log(`[verify-stream] NOISE_SUPPRESSED_MERGE_ACTIVE sid=${sid} ${reason}`);
       await vs.logEvent(sid, "NOISE_SUPPRESSED_MERGE_ACTIVE", reason.slice(0, 512));
       return;
     }
-    await vs.injectChallengeNoise(sid, `score=${score.toFixed(2)} ${detail}`);
-  })().catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
+    await vs.injectSpeakerphoneChallenge(
+      sid,
+      `score=${score.toFixed(2)} ${detail}`,
+      episodeStart,
+    );
+  })().catch((err) => console.error("[verify-stream] injectSpeakerphoneChallenge error:", err));
 }
 
 /**
@@ -615,8 +626,13 @@ async function buildAnalyzers(
         armOnlyWhenBridged: true,
         bridged,
         onSuspicious: (score, detail) => {
+          // Episode onset = the FIRST emission while no episode is tracked.
+          // Must be computed BEFORE adding to the set; the strike ladder
+          // escalates only on episode onsets (refires just sustain the
+          // current episode's challenge).
+          const episodeStart = !speakerphoneSuspicion.has(sid);
           speakerphoneSuspicion.add(sid);
-          handleSpeakerphoneSuspicious(sid, score, detail);
+          handleSpeakerphoneSuspicious(sid, score, detail, episodeStart);
         },
         onClean: (detail) => {
           speakerphoneSuspicion.delete(sid);
@@ -832,8 +848,8 @@ export function attachVerificationStreamServer(server: HttpServer): void {
  * MergeToneDetector fire path (Leg A uplink stream / Leg B relay stream).
  *
  * BRIDGED in-call detection (v3): the continuous merge tone is announced to
- * the Leg A participant ONLY while ARMED (HoldDetector second-call
- * engagement — the speakerphone suspicion path NEVER arms it). A tone fire
+ * the Leg B (callee live-leg) participant ONLY while ARMED (HoldDetector
+ * second-call engagement — the speakerphone suspicion path NEVER arms it). A tone fire
  * while armed is real tone
  * leakage across a merge — and must clear the ELEVATED energy floor (see the
  * detector's dynamic energyFloor) — so the verdict fires immediately, within

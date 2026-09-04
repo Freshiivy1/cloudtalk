@@ -33,8 +33,13 @@ const twilioMock = vi.hoisted(() => ({
     participant: string;
     announceUrl?: string;
     announceMethod?: string;
+    muted?: boolean;
   }>,
   conferenceUpdates: [] as Array<{ conference: string; status?: string }>,
+  // Optional fault injection: when set, participants().update throws this
+  // error (e.g. { status: 404, code: 20404 } to simulate a participant that
+  // is NOT in the live conference — the merge-tone 404-disarm path).
+  participantUpdateError: null as { status?: number; code?: number } | null,
   /** SMS sent via the Messages API (SMS_PROVIDER=twilio transport). */
   sentMessages: [] as Array<{ to: string; from: string; body: string }>,
   // Optional override for conferences.list: null (default) = a live
@@ -65,7 +70,11 @@ vi.mock("twilio", async (importOriginal) => {
     conferences: Object.assign(
       (name: string) => ({
         participants: (participantSid: string) => ({
-          update: async (opts: { announceUrl?: string; announceMethod?: string }) => {
+          update: async (opts: { announceUrl?: string; announceMethod?: string; muted?: boolean }) => {
+            if (twilioMock.participantUpdateError) {
+              const e = twilioMock.participantUpdateError;
+              throw Object.assign(new Error("mock participant update failure"), e);
+            }
             twilioMock.participantUpdates.push({
               conference: name,
               participant: participantSid,
@@ -607,23 +616,27 @@ describe("injectChallengeNoise (outer speakerphone → caller leg)", () => {
 });
 
 describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
-  it("second-call engage while BRIDGED announces the merge tone to the Leg A participant only and re-announces on the rearm cadence", async () => {
+  it("second-call engage while BRIDGED announces the merge tone to the Leg B participant only and re-announces on the rearm cadence", async () => {
     process.env.VERIFY_MERGE_TONE_REARM_MS = "60";
     try {
       const s = await makeSession(vs.VState.BRIDGED, {
         guarded: true,
         callerCallSid: "CA_sc_caller",
         legACallSid: "CA_sc_legA",
+        legBCallSid: "CA_sc_legB",
       });
       const partBefore = participantUpdates.length;
       await vs.onSecondCallEngaged(s.sessionId);
       expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
-      // Immediate announce: Leg A (callee) participant ONLY, on this
-      // session's live conference.
+      expect(vs.isMergeToneEffective(s.sessionId)).toBe(true);
+      // Immediate announce: Leg B (callee live-leg) participant ONLY, on this
+      // session's live conference. (Leg A is the held canary — it NEVER joins
+      // the conference, so targeting it 404'd on every announce in prod.)
       const added = participantUpdates.slice(partBefore);
       expect(added).toHaveLength(1);
-      expect(added[0].participant).toBe("CA_sc_legA");
+      expect(added[0].participant).toBe("CA_sc_legB");
       expect(added[0].participant).not.toBe("CA_sc_caller");
+      expect(added[0].participant).not.toBe("CA_sc_legA");
       expect(added[0].conference).toBe(`verify-${s.sessionId}`);
       expect(added[0].announceUrl).toContain("/api/verify/merge-tone.wav");
       expect(added[0].announceMethod).toBe("GET");
@@ -631,7 +644,7 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
       await tick(200); // several 60ms rearms
       const rearmed = participantUpdates.slice(partBefore);
       expect(rearmed.length).toBeGreaterThanOrEqual(3);
-      expect(rearmed.every((p) => p.participant === "CA_sc_legA")).toBe(true);
+      expect(rearmed.every((p) => p.participant === "CA_sc_legB")).toBe(true);
       expect(rearmed.every((p) => p.announceUrl?.includes("/api/verify/merge-tone.wav"))).toBe(true);
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).toContain("SECOND_CALL_ENGAGED");
@@ -746,7 +759,7 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
     expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
     const updBefore = updatedCalls.length;
     const partBefore = participantUpdates.length;
-    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "no-backstop test");
+    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "no-backstop test", true);
     await tick(150); // let the REST path settle
     // The suspicion path must NOT arm the merge tone: an armed recognizer +
     // loud acoustic tone loopback would be a false-MERGE hangup path from
@@ -780,11 +793,11 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
     // Simulates the detector's refire cadence (every refireMs ~4s while
     // suspicion persists). With the tone NOT armed, none of these are
     // suppressed — the masking is sustained for the whole episode.
-    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "refire #1");
+    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "refire #1", true);
     await tick(100);
-    handleSpeakerphoneSuspicious(s.sessionId, 0.91, "refire #2");
+    handleSpeakerphoneSuspicious(s.sessionId, 0.91, "refire #2", false);
     await tick(100);
-    handleSpeakerphoneSuspicious(s.sessionId, 0.92, "refire #3");
+    handleSpeakerphoneSuspicious(s.sessionId, 0.92, "refire #3", false);
     await tick(100);
     expect(vs.isMergeToneArmed(s.sessionId)).toBe(false);
     const added = participantUpdates.slice(partBefore);
@@ -873,7 +886,7 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
 });
 
 describe("challenge noise / merge system mutual exclusion", () => {
-  it("suspicion while the merge tone is ARMED → NO noise announce + NOISE_SUPPRESSED_MERGE_ACTIVE event; the Leg A merge tone is unaffected", async () => {
+  it("suspicion while the merge tone is ARMED → NO noise announce + NOISE_SUPPRESSED_MERGE_ACTIVE event; the Leg B merge tone is unaffected", async () => {
     process.env.VERIFY_MERGE_TONE_REARM_MS = "50"; // fast rearms (fixed at arm time)
     let armedSid: string | null = null;
     try {
@@ -881,13 +894,14 @@ describe("challenge noise / merge system mutual exclusion", () => {
         guarded: true,
         callerCallSid: "CA_mx_caller",
         legACallSid: "CA_mx_legA",
+        legBCallSid: "CA_mx_legB",
       });
       // Merge system already active (second-call engagement path).
       await vs.armMergeTone(s.sessionId);
       armedSid = s.sessionId;
       expect(vs.isMergeToneArmed(s.sessionId)).toBe(true);
       const partBefore = participantUpdates.length;
-      handleSpeakerphoneSuspicious(s.sessionId, 0.9, "suppression test");
+      handleSpeakerphoneSuspicious(s.sessionId, 0.9, "suppression test", true);
       await tick(200); // let any (suppressed) REST path + several rearms settle
       const added = participantUpdates.slice(partBefore);
       // NO challenge-noise announce to ANYONE while the merge system is active.
@@ -898,15 +912,15 @@ describe("challenge noise / merge system mutual exclusion", () => {
       const types = (await events(s.sessionId)).map((e) => e.eventType);
       expect(types).toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
       expect(types).not.toContain("SPEAKERPHONE_SUSPECTED");
-      // The merge tone keeps re-announcing to the Leg A participant, unaffected.
+      // The merge tone keeps re-announcing to the Leg B participant, unaffected.
       expect(
         added.some(
           (p) =>
-            p.participant === "CA_mx_legA" &&
+            p.participant === "CA_mx_legB" &&
             p.announceUrl?.includes("/api/verify/merge-tone.wav"),
         ),
       ).toBe(true);
-      expect(added.every((p) => p.participant === "CA_mx_legA")).toBe(true);
+      expect(added.every((p) => p.participant === "CA_mx_legB")).toBe(true);
     } finally {
       delete process.env.VERIFY_MERGE_TONE_REARM_MS;
       if (armedSid) vs.disarmMergeTone(armedSid);
@@ -922,7 +936,7 @@ describe("challenge noise / merge system mutual exclusion", () => {
     await vs.onMergeDetected(s.sessionId, { inCall: true }); // terminal
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
     const partBefore = participantUpdates.length;
-    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "late suspicion after verdict");
+    handleSpeakerphoneSuspicious(s.sessionId, 0.9, "late suspicion after verdict", true);
     await tick(150);
     expect(
       participantUpdates
@@ -946,14 +960,219 @@ describe("challenge noise / merge system mutual exclusion", () => {
     expect(await handleMergeToneFire(s.sessionId)).toBe("merge");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.MERGE_DETECTED);
     // Every leg routed to the conference-ending announcement; the only
-    // participant announce in the whole flow is the merge tone to Leg A.
+    // participant announce in the whole flow is the merge tone to Leg B.
     const added = participantUpdates.slice(partBefore);
     expect(added.length).toBeGreaterThan(0);
     expect(added.every((p) => p.announceUrl?.includes("/api/verify/merge-tone.wav"))).toBe(true);
-    expect(added.every((p) => p.participant === "CA_mf_legA")).toBe(true);
+    expect(added.every((p) => p.participant === "CA_mf_legB")).toBe(true);
     expect(added.some((p) => p.announceUrl?.includes("/api/verify/challenge-noise.wav"))).toBe(
       false,
     );
+  });
+});
+
+describe("speakerphone strike ladder (episodes → warning+mute → supreme flag)", () => {
+  it("full ladder: episodes 1–2 noise only, episode 3 final warning + permanent caller mute, episode 4 supreme flag (ended + flagged + admin SMS)", async () => {
+    process.env.VERIFY_SPEAKERPHONE_WARNING_MS = "500"; // mute lands at 1000ms
+    process.env.VERIFY_SPEAKERPHONE_WARNING_GRACE_MS = "60000"; // no grace race here
+    process.env.ADMIN_ALERT_NUMBER = "+61400000999";
+    process.env.SMS_ENABLED = "true";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_ld_caller",
+        legACallSid: "CA_ld_legA",
+        legBCallSid: "CA_ld_legB",
+      });
+      const sid = s.sessionId;
+      const partBefore = participantUpdates.length;
+
+      // Episode 1 → challenge noise (strike recorded on clear).
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep1", true);
+      await tick(150);
+      await vs.onSpeakerphoneCleared(sid, "ep1 cleared");
+      // Episode 2 → challenge noise again.
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep2", true);
+      await tick(150);
+      await vs.onSpeakerphoneCleared(sid, "ep2 cleared");
+
+      let added = participantUpdates.slice(partBefore);
+      expect(
+        added.filter((p) => p.announceUrl?.includes("/api/verify/challenge-noise.wav")).length,
+      ).toBe(2);
+      expect(added.every((p) => p.participant === "CA_ld_caller")).toBe(true);
+      let evts = (await events(sid)).map((e) => `${e.eventType}|${e.details ?? ""}`);
+      expect(evts.some((e) => e.startsWith("SPEAKERPHONE_CLEARED|") && e.includes("strike=1"))).toBe(true);
+      expect(evts.some((e) => e.startsWith("SPEAKERPHONE_CLEARED|") && e.includes("strike=2"))).toBe(true);
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
+
+      // Episode 3 → FINAL WARNING: warning prompt to the caller, NO noise,
+      // then the caller mic is muted (permanently) after the prompt lands.
+      const warnAt = participantUpdates.length;
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep3", true);
+      await tick(150);
+      added = participantUpdates.slice(warnAt);
+      expect(added).toHaveLength(1);
+      expect(added[0].participant).toBe("CA_ld_caller");
+      expect(added[0].announceUrl).toContain("/api/verify/speakerphone-warning.wav");
+      expect(added.some((p) => p.announceUrl?.includes("challenge-noise"))).toBe(false);
+      // A mid-episode refire must NOT re-announce the warning or the noise.
+      handleSpeakerphoneSuspicious(sid, 0.91, "ep3 refire", false);
+      await tick(150);
+      expect(participantUpdates.slice(warnAt).filter((p) => p.announceUrl)).toHaveLength(1);
+      // Mute lands at warningMs(500)+500=1000ms (≈700ms from here).
+      await tick(900);
+      const muteUpd = participantUpdates
+        .slice(warnAt)
+        .find((p) => p.participant === "CA_ld_caller" && p.muted === true);
+      expect(muteUpd).toBeTruthy();
+      let types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_WARNING");
+      expect(types).toContain("SPEAKERPHONE_CALLER_MUTED");
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
+
+      // Episode 3 clears → strike 3 recorded; the NEXT episode is supreme.
+      await vs.onSpeakerphoneCleared(sid, "ep3 cleared");
+      evts = (await events(sid)).map((e) => `${e.eventType}|${e.details ?? ""}`);
+      expect(evts.some((e) => e.startsWith("SPEAKERPHONE_CLEARED|") && e.includes("strike=3"))).toBe(true);
+
+      // Episode 4 onset → SUPREME FLAG: termination prompt to BOTH parties,
+      // state SPEAKERPHONE_TERMINATED, admin SMS, then full teardown.
+      const supremeAt = participantUpdates.length;
+      handleSpeakerphoneSuspicious(sid, 0.95, "ep4", true);
+      await tick(250);
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.SPEAKERPHONE_TERMINATED);
+      const supremeAdded = participantUpdates.slice(supremeAt);
+      expect(
+        supremeAdded.some(
+          (p) =>
+            p.participant === "CA_ld_caller" &&
+            p.announceUrl?.includes("/api/verify/speakerphone-terminated.wav"),
+        ),
+      ).toBe(true);
+      expect(
+        supremeAdded.some(
+          (p) =>
+            p.participant === "CA_ld_legB" &&
+            p.announceUrl?.includes("/api/verify/speakerphone-terminated.wav"),
+        ),
+      ).toBe(true);
+      types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_SUPREME");
+      expect(types).toContain("ADMIN_ALERT_SENT");
+      expect(
+        twilioMock.sentMessages.some(
+          (m) => m.to === "+61400000999" && m.body.includes("SUPREME FLAG"),
+        ),
+      ).toBe(true);
+      // Delayed teardown (terminated prompt ~7.1s + buffer → 8.5s timer).
+      await tick(9_000);
+      const hungUp = updatedCalls.filter((u) => u.status === "completed").map((u) => u.sid);
+      expect(hungUp).toContain("CA_ld_caller");
+      expect(hungUp).toContain("CA_ld_legA");
+      expect(hungUp).toContain("CA_ld_legB");
+      expect(
+        conferenceUpdates.some(
+          (u) => u.conference === `verify-${sid}` && u.status === "completed",
+        ),
+      ).toBe(true);
+    } finally {
+      delete process.env.VERIFY_SPEAKERPHONE_WARNING_MS;
+      delete process.env.VERIFY_SPEAKERPHONE_WARNING_GRACE_MS;
+      delete process.env.ADMIN_ALERT_NUMBER;
+      delete process.env.SMS_ENABLED;
+    }
+  }, 20_000);
+
+  it("strike-3 warning episode that NEVER clears escalates to supreme after the grace window", async () => {
+    process.env.VERIFY_SPEAKERPHONE_WARNING_MS = "500";
+    process.env.VERIFY_SPEAKERPHONE_WARNING_GRACE_MS = "1200";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_gr_caller",
+        legACallSid: "CA_gr_legA",
+        legBCallSid: "CA_gr_legB",
+      });
+      const sid = s.sessionId;
+      // Two completed episodes → strikes 1–2.
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep1", true);
+      await tick(120);
+      await vs.onSpeakerphoneCleared(sid, "ep1 cleared");
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep2", true);
+      await tick(120);
+      await vs.onSpeakerphoneCleared(sid, "ep2 cleared");
+      // Episode 3: warning fires, but the relay NEVER clears.
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep3", true);
+      await tick(120);
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
+      // Grace (1200ms) expires mid-episode → supreme.
+      await tick(1500);
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.SPEAKERPHONE_TERMINATED);
+      const types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_WARNING");
+      expect(types).toContain("SPEAKERPHONE_SUPREME");
+    } finally {
+      delete process.env.VERIFY_SPEAKERPHONE_WARNING_MS;
+      delete process.env.VERIFY_SPEAKERPHONE_WARNING_GRACE_MS;
+    }
+  }, 15_000);
+
+  it("supreme is idempotent — a refire after the flag changes nothing", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_id_caller",
+      legACallSid: "CA_id_legA",
+      legBCallSid: "CA_id_legB",
+    });
+    const sid = s.sessionId;
+    await vs.onSpeakerphoneSupreme(sid, "direct supreme test");
+    expect((await vs.findSession(sid))!.state).toBe(vs.VState.SPEAKERPHONE_TERMINATED);
+    const evtCount = (await events(sid)).filter((e) => e.eventType === "SPEAKERPHONE_SUPREME").length;
+    const partCount = participantUpdates.length;
+    await vs.onSpeakerphoneSupreme(sid, "duplicate supreme test");
+    expect((await events(sid)).filter((e) => e.eventType === "SPEAKERPHONE_SUPREME")).toHaveLength(evtCount);
+    expect(participantUpdates.length).toBe(partCount);
+  }, 15_000);
+
+  it("merge-tone announce retargeted to Leg B; 3 consecutive participant-404s disarm the tone and release the forensic challenge", async () => {
+    process.env.VERIFY_MERGE_TONE_REARM_MS = "50";
+    let engagedSid: string | null = null;
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_404_caller",
+        legACallSid: "CA_404_legA",
+        legBCallSid: "CA_404_legB",
+      });
+      const sid = s.sessionId;
+      // Participant unreachable (the 2026-09-04 incident signature).
+      twilioMock.participantUpdateError = { status: 404, code: 20404 };
+      await vs.onSecondCallEngaged(sid);
+      engagedSid = sid;
+      // Immediate announce 404'd once: armed but NOT effective — the broken
+      // tone must no longer suppress the forensic challenge.
+      expect(vs.isMergeToneArmed(sid)).toBe(true);
+      expect(vs.isMergeToneEffective(sid)).toBe(false);
+      handleSpeakerphoneSuspicious(sid, 0.9, "while tone 404ing", true);
+      await tick(120);
+      let types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_SUSPECTED");
+      expect(types).not.toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
+      // After 3 consecutive 404s the tone disarms itself and clears the
+      // engagement (releasing the mutual exclusion permanently).
+      await tick(300);
+      expect(vs.isMergeToneArmed(sid)).toBe(false);
+      expect(vs.isSecondCallEngaged(sid)).toBe(false);
+      engagedSid = null;
+      types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("MERGE_TONE_DISARMED");
+      expect(vs.isMergeToneEffective(sid)).toBe(false);
+    } finally {
+      twilioMock.participantUpdateError = null;
+      delete process.env.VERIFY_MERGE_TONE_REARM_MS;
+      if (engagedSid) vs.disarmMergeTone(engagedSid);
+    }
   });
 });
 

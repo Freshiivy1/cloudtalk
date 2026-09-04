@@ -119,6 +119,9 @@ export const calls = mysqlTable("calls", {
   endedAt: timestamp("endedAt"),
   durationSec: int("durationSec").default(0).notNull(),
   muted: boolean("muted").default(false).notNull(),
+  /** Supreme-flag review marker (speakerphone strike ladder exhausted). */
+  flagged: boolean("flagged").default(false).notNull(),
+  flagReason: varchar("flagReason", { length: 255 }),
   hasRecording: boolean("hasRecording").default(false).notNull(),
   note: text("note"),
   simAnswerAt: timestamp("simAnswerAt"),

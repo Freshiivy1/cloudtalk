@@ -11,6 +11,8 @@ import {
   challengeNoiseHandler,
   mergeToneHandler,
   promptLightHandler,
+  speakerphoneTerminatedHandler,
+  speakerphoneWarningHandler,
   verificationGatherHandler,
   verificationGatherLegAAcceptHandler,
   verificationConferenceHandler,
@@ -79,8 +81,12 @@ app.get("/api/verify/tone.wav", verificationToneHandler);
 app.get("/api/verify/prompt-light.wav", promptLightHandler);
 // Relayguard challenge-noise probe (conference announce on suspected speakerphone).
 app.get("/api/verify/challenge-noise.wav", challengeNoiseHandler);
-// BRIDGED in-call merge tone (Leg A participant announce while ARMED — the
-// tone crossing a merge fires the in-call verdict on the Leg A media stream).
+// Speakerphone strike ladder: strike-3 final warning (caller-only announce)
+// and the supreme-flag termination notice (announced to both live parties).
+app.get("/api/verify/speakerphone-warning.wav", speakerphoneWarningHandler);
+app.get("/api/verify/speakerphone-terminated.wav", speakerphoneTerminatedHandler);
+// BRIDGED in-call merge tone (Leg B participant announce while ARMED — the
+// tone crossing a merge fires the in-call verdict on the canary media stream).
 app.get("/api/verify/merge-tone.wav", mergeToneHandler);
 app.use("/api/trpc/*", async (c) => {
   return fetchRequestHandler({

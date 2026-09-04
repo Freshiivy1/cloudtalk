@@ -79,8 +79,8 @@ export async function verificationToneHandler(c: Context) {
  * the conference announceUrl for the OUTER speakerphone case: Twilio plays it
  * to the CALLER (inmate) participant only, so the party relaying the call
  * over speakerphone is prompted to take it off speaker to hear clearly (the
- * call continues — no hangup). The callee (Leg A) participant NEVER gets
- * this noise — that announce channel is reserved for the DTMF merge tone.
+ * call continues — no hangup). The callee (Leg B) participant NEVER gets
+ * this noise — that announce channel is reserved for the merge tone.
  */
 export async function challengeNoiseHandler(c: Context) {
   const candidates = [
@@ -115,6 +115,49 @@ export async function challengeNoiseHandler(c: Context) {
     console.error("[verify] challenge-noise render failed:", err);
     return c.text("noise unavailable", 500);
   }
+}
+
+/**
+ * Shared static-WAV server for the speakerphone strike-ladder prompts. Both
+ * assets live in public/ as 16 kHz mono PCM16 and are announced to
+ * conference participants (announceUrl, GET):
+ *  - speakerphone-warning.wav   — STRIKE 3 final warning, caller-only
+ *    ("your microphone has now been muted … if it is detected again, this
+ *    call will be ended and flagged for review");
+ *  - speakerphone-terminated.wav — SUPREME FLAG termination notice, played to
+ *    BOTH parties before the conference is torn down.
+ */
+async function serveSpeakerphonePrompt(c: Context, fileName: string) {
+  const candidates = [
+    path.resolve(import.meta.dirname, "public", fileName),
+    path.resolve(import.meta.dirname, "..", "dist", "public", fileName),
+    path.resolve(import.meta.dirname, "..", "public", fileName),
+    path.resolve(process.cwd(), "dist", "public", fileName),
+    path.resolve(process.cwd(), "public", fileName),
+  ];
+  for (const p of candidates) {
+    try {
+      const buf = await fs.promises.readFile(p);
+      return c.body(new Uint8Array(buf), 200, {
+        "Content-Type": "audio/wav",
+        "Content-Length": String(buf.byteLength),
+        "Cache-Control": "no-store",
+      });
+    } catch {
+      // try next candidate
+    }
+  }
+  return c.text("prompt not found", 404);
+}
+
+/** GET /api/verify/speakerphone-warning.wav — strike-3 final warning. */
+export async function speakerphoneWarningHandler(c: Context) {
+  return serveSpeakerphonePrompt(c, "speakerphone-warning.wav");
+}
+
+/** GET /api/verify/speakerphone-terminated.wav — supreme-flag termination. */
+export async function speakerphoneTerminatedHandler(c: Context) {
+  return serveSpeakerphonePrompt(c, "speakerphone-terminated.wav");
 }
 
 /**

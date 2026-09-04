@@ -43,6 +43,13 @@
       "when": 1788446400000,
       "tag": "0005_voice_id_save_only",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1788520628762,
+      "tag": "0006_speakerphone_supreme_flag",
+      "breakpoints": true
     }
   ]
 }

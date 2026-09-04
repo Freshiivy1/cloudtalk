@@ -69,6 +69,12 @@ export const VState = {
    * NEVER a pass.
    */
   DETECTION_INCONCLUSIVE: "DETECTION_INCONCLUSIVE",
+  /**
+   * SUPREME FLAG: speakerphone/relay audio was detected again after the
+   * final warning (strike 3: warning prompt + caller muted) — the call is
+   * ended, the call record is flagged, and admin is alerted. NEVER a pass.
+   */
+  SPEAKERPHONE_TERMINATED: "SPEAKERPHONE_TERMINATED",
   FAILED: "FAILED",
 } as const;
 export type VerificationState = (typeof VState)[keyof typeof VState];
@@ -80,6 +86,7 @@ export const TERMINAL_STATES: readonly VerificationState[] = [
   VState.CALL_WAITING_OFF,
   VState.DETECTION_FAILED,
   VState.DETECTION_INCONCLUSIVE,
+  VState.SPEAKERPHONE_TERMINATED,
   VState.FAILED,
 ];
 
@@ -137,6 +144,7 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
     VState.VOIP_DETECTED,
     VState.DETECTION_FAILED,
     VState.DETECTION_INCONCLUSIVE,
+    VState.SPEAKERPHONE_TERMINATED,
     VState.FAILED,
   ],
   COMPLETED: [],
@@ -145,6 +153,7 @@ const ALLOWED: Record<VerificationState, readonly VerificationState[]> = {
   CALL_WAITING_OFF: [],
   DETECTION_FAILED: [],
   DETECTION_INCONCLUSIVE: [],
+  SPEAKERPHONE_TERMINATED: [],
   FAILED: [],
 };
 
@@ -284,6 +293,30 @@ export function isBridgedSession(sessionId: string): boolean {
 /** Per-session challenge-noise injection counter (event payload enrichment). */
 const noiseInjectionCount = new Map<string, number>();
 
+/* ------- Speakerphone-relay STRIKE LADDER (per-session, in-process) -------
+ * A STRIKE is a completed relay episode: suspicion fired … then cleared
+ * (recorded in onSpeakerphoneCleared). Ladder:
+ *   episodes 1–2 (strikes 0–1) → challenge noise only (injectChallengeNoise);
+ *   episode 3   (strikes 2)    → FINAL WARNING: warning prompt announced to
+ *                                the caller, then the caller participant is
+ *                                MUTED (stays muted for the rest of the call);
+ *   episode 4+  (strikes ≥3)   → SUPREME FLAG: call flagged, admin alerted,
+ *                                call ended (SPEAKERPHONE_TERMINATED).
+ * A warning episode that never clears also escalates to the supreme flag
+ * after speakerphoneWarningGraceMs() — "if it happens again" includes "never
+ * stopped". All entries are cleared by cleanupSessionMaps() on terminal
+ * states. */
+const speakerphoneStrikes = new Map<string, number>();
+/** Sessions whose final warning has been issued (persists across episodes). */
+const speakerphoneWarnedSessions = new Set<string>();
+/** Wall-clock the current warning episode started; present ONLY while that
+ * episode is still active (deleted on clear) — the grace-timer tripwire. */
+const speakerphoneWarningActiveAt = new Map<string, number>();
+/** Sessions already supreme-flagged (idempotency). */
+const speakerphoneSupremeSessions = new Set<string>();
+const speakerphoneMuteTimers = new Map<string, NodeJS.Timeout>();
+const speakerphoneGraceTimers = new Map<string, NodeJS.Timeout>();
+
 /**
  * Per-session wall-clock of the last SPEAKERPHONE_SUSPECTED event WRITE.
  * The noise itself re-injects every refire interval (~4s) but the DB event
@@ -372,6 +405,50 @@ export function forensicsWarmupMs(): number {
   return Math.floor(v);
 }
 
+/**
+ * Strike-3 warning prompt duration (ms) — how long the caller-mute timer
+ * waits so `public/speakerphone-warning.wav` fully lands before the mic
+ * drops. Default 15000 ≈ the measured asset length plus buffer. The mute is
+ * scheduled at speakerphoneWarningMs() + 500ms. Env-overridable via
+ * VERIFY_SPEAKERPHONE_WARNING_MS (retune only if the asset is replaced).
+ */
+export function speakerphoneWarningMs(): number {
+  const raw = process.env.VERIFY_SPEAKERPHONE_WARNING_MS;
+  if (!raw) return 15_000;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0) return 15_000;
+  return Math.max(500, Math.min(60_000, Math.floor(v)));
+}
+
+/**
+ * Warning-episode grace period (ms). When the strike-3 episode has been
+ * running this long WITHOUT a fingerprint-clean clear (the caller keeps
+ * relaying straight through the warning + mute), the session escalates to
+ * the supreme flag without waiting for another clean→relay cycle. The mute
+ * takes the caller's mic out of the acoustic path, but the detector listens
+ * to the CALLEE's uplink — a loudspeaker pressed against it still leaks
+ * enough relay signature to fingerprint. Default 20s: long enough that a
+ * compliant caller can actually put the phone down, short enough that a
+ * determined three-way cannot ride a muted mic indefinitely.
+ * Env-overridable via VERIFY_SPEAKERPHONE_WARNING_GRACE_MS.
+ */
+export function speakerphoneWarningGraceMs(): number {
+  const raw = process.env.VERIFY_SPEAKERPHONE_WARNING_GRACE_MS;
+  if (!raw) return 20_000;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0) return 20_000;
+  return Math.max(1_000, Math.min(120_000, Math.floor(v)));
+}
+
+/**
+ * Admin phone number (E.164) for the supreme-flag SMS alert. Empty (default)
+ * skips the SMS — the call still terminates, is flagged on the calls row,
+ * and the event is logged. Env: ADMIN_ALERT_NUMBER.
+ */
+export function adminAlertNumber(): string {
+  return (process.env.ADMIN_ALERT_NUMBER ?? "").trim();
+}
+
 /* -------------------------------------------------------------------------- */
 /* GUARDED MODE ONLY: save-only voice ID ("my voice identifies me")            */
 /* -------------------------------------------------------------------------- */
@@ -437,6 +514,17 @@ function cleanupSessionMaps(sessionId: string): void {
   lastNoiseEventAt.delete(sessionId);
   secondCallEngagedSessions.delete(sessionId);
   disarmMergeTone(sessionId);
+  mergeTone404s.delete(sessionId);
+  speakerphoneStrikes.delete(sessionId);
+  speakerphoneWarnedSessions.delete(sessionId);
+  speakerphoneWarningActiveAt.delete(sessionId);
+  speakerphoneSupremeSessions.delete(sessionId);
+  const mt = speakerphoneMuteTimers.get(sessionId);
+  if (mt) clearTimeout(mt);
+  speakerphoneMuteTimers.delete(sessionId);
+  const gt = speakerphoneGraceTimers.get(sessionId);
+  if (gt) clearTimeout(gt);
+  speakerphoneGraceTimers.delete(sessionId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1023,8 +1111,9 @@ export async function checkStreamReadiness(sessionId: string): Promise<void> {
  * not by interval. When the HoldDetector on Leg A's uplink sees the callee
  * engage a SECOND call (call-waiting / add-call: sustained hold silence or a
  * steady hold tone after real speech), onSecondCallEngaged() ARMS the merge
- * tone — a 0.5s DTMF-'9' BEEP announced to the LEG A conference participant
- * ONLY every mergeToneRearmMs() (default 2s). Beeps, not a continuous tone:
+ * tone — a 0.5s DTMF-'9' BEEP announced to the CALLEE's live-leg (Leg B)
+ * conference participant ONLY every mergeToneRearmMs() (default 2s). Beeps,
+ * not a continuous tone:
  * a participant announce REPLACES that participant's conference audio while
  * it plays, so a continuous tone silenced the callee for the whole armed
  * episode (live-test bug). The instant the callee presses "merge", a beep
@@ -1080,6 +1169,19 @@ export function mergeToneEnergyFloor(): number {
 const mergeToneTimers = new Map<string, NodeJS.Timeout>();
 const mergeToneArmedSessions = new Set<string>();
 /**
+ * Consecutive participant-404 count for merge-tone announces (per session).
+ * A participant-404 means the target leg is NOT in the live conference — the
+ * beep can never reach the callee, so the armed tone provides zero merge
+ * protection while its armed flag still suppresses the speakerphone
+ * challenge (mutual exclusion). After MERGE_TONE_404_LIMIT consecutive 404s
+ * the tone is disarmed and the engagement cleared, releasing the forensic
+ * path (the 2026-09-04 live incident: 38s of confirmed relay audio got no
+ * challenge because a false engagement armed a tone whose announce 404'd
+ * forever — it targeted legACallSid, which NEVER joins the conference).
+ */
+const mergeTone404s = new Map<string, number>();
+const MERGE_TONE_404_LIMIT = 3;
+/**
  * Sessions with an ACTIVE HoldDetector second-call engagement. Set by
  * onSecondCallEngaged(), cleared by onSecondCallDisengaged() and by
  * cleanupSessionMaps() — while set, the disengage path (not the
@@ -1090,6 +1192,20 @@ const secondCallEngagedSessions = new Set<string>();
 /** True while the continuous merge tone is armed for this session. */
 export function isMergeToneArmed(sessionId: string): boolean {
   return mergeToneArmedSessions.has(sessionId);
+}
+
+/**
+ * True while the merge tone is armed AND actually reaching the callee (no
+ * participant-404 on its announces). The speakerphone challenge's mutual
+ * exclusion keys off THIS — an armed-but-404ing tone owns nothing: it cannot
+ * catch a merge (the beep never plays), so it must not suppress the forensic
+ * challenge either.
+ */
+export function isMergeToneEffective(sessionId: string): boolean {
+  return (
+    mergeToneArmedSessions.has(sessionId) &&
+    (mergeTone404s.get(sessionId) ?? 0) === 0
+  );
 }
 
 /** True while a HoldDetector second-call engagement is active. */
@@ -1105,7 +1221,15 @@ export function disarmMergeTone(sessionId: string): void {
   mergeToneArmedSessions.delete(sessionId);
 }
 
-/** Announce the merge tone to the LEG A participant only. Never throws. */
+/**
+ * Announce the merge tone to the CALLEE's LIVE-LEG (Leg B) conference
+ * participant only — never the caller. Leg B is the callee's call in the
+ * live conference (the anchor); the beep must play to the CALLEE so that the
+ * instant they press "merge", the beep crosses into Leg A's uplink where the
+ * armed MergeToneDetector hears it. (Leg A is the held Call Waiting canary
+ * and NEVER joins the conference — targeting legACallSid here 404'd on every
+ * announce in production.) Never throws.
+ */
 async function announceMergeTone(sessionId: string): Promise<void> {
   try {
     const session = await findSession(sessionId);
@@ -1114,8 +1238,8 @@ async function announceMergeTone(sessionId: string): Promise<void> {
       disarmMergeTone(sessionId);
       return;
     }
-    if (!session.legACallSid) {
-      console.warn(`[verify] MERGE_TONE_SKIPPED session=${sessionId} — no Leg A leg`);
+    if (!session.legBCallSid) {
+      console.warn(`[verify] MERGE_TONE_SKIPPED session=${sessionId} — no Leg B (live callee) leg`);
       return;
     }
     const base = getPublicBaseUrl();
@@ -1133,23 +1257,47 @@ async function announceMergeTone(sessionId: string): Promise<void> {
     }
     await getTwilioClient()
       .conferences(confSid)
-      .participants(session.legACallSid)
+      .participants(session.legBCallSid)
       .update({
         announceUrl: `${base}/api/verify/merge-tone.wav`,
         announceMethod: "GET",
       });
+    mergeTone404s.delete(sessionId);
     console.log(
-      `[verify] MERGE_TONE_ANNOUNCED session=${sessionId} legA=${session.legACallSid} duration=${mergeToneSec()}s`,
+      `[verify] MERGE_TONE_ANNOUNCED session=${sessionId} legB=${session.legBCallSid} duration=${mergeToneSec()}s`,
     );
   } catch (err) {
     // Best-effort: a failed announce must never crash the media path.
     console.error(`[verify] MERGE_TONE_ANNOUNCE_FAILED session=${sessionId}:`, err);
+    // Participant/conference GONE (404 / Twilio 20404): the beep can never
+    // reach the callee — after MERGE_TONE_404_LIMIT consecutive failures,
+    // disarm the tone and clear the engagement so the armed flag stops
+    // suppressing the speakerphone challenge (mutual exclusion is only
+    // legitimate while the tone can actually play).
+    const e = err as { status?: number; code?: number };
+    if (e?.status === 404 || e?.code === 20404) {
+      const n = (mergeTone404s.get(sessionId) ?? 0) + 1;
+      mergeTone404s.set(sessionId, n);
+      if (n >= MERGE_TONE_404_LIMIT) {
+        console.warn(
+          `[verify] MERGE_TONE_DISARMED session=${sessionId} — ${n} consecutive participant-404 announces; releasing forensic mutual exclusion`,
+        );
+        disarmMergeTone(sessionId);
+        secondCallEngagedSessions.delete(sessionId);
+        mergeTone404s.delete(sessionId);
+        await logEvent(
+          sessionId,
+          "MERGE_TONE_DISARMED",
+          `${n} consecutive participant-404 merge-tone announces — tone unreachable, disarmed; speakerphone challenge no longer suppressed`.slice(0, 512),
+        ).catch(() => {});
+      }
+    }
   }
 }
 
 /**
  * Arm the merge tone for a BRIDGED session: announce immediately to the Leg
- * A participant, then re-announce every mergeToneRearmMs() with a
+ * B (callee live-leg) participant, then re-announce every mergeToneRearmMs() with a
  * mergeToneSec()-second beep render (0.5s beep every 2s by default — the
  * detection budget still closes in 1-3s while the callee keeps 75% of their
  * conference audio). Idempotent while armed. The timer is unref'd and
@@ -3171,6 +3319,21 @@ export async function onSpeakerphoneCleared(
     // A later episode is a NEW suspicion, not a continuation of the previous
     // one — reset the event throttle so it is visible immediately.
     lastNoiseEventAt.delete(sessionId);
+    // STRIKE: a fired suspicion that has now cleared is one COMPLETED relay
+    // episode ("detected speakerphone … then it went back to normal"). The
+    // count drives the ladder in injectSpeakerphoneChallenge: episodes 1–2 =
+    // challenge noise, episode 3 = final warning + caller mute, episode 4 =
+    // supreme flag (call ended + admin alerted).
+    const strikes = (speakerphoneStrikes.get(sessionId) ?? 0) + 1;
+    speakerphoneStrikes.set(sessionId, strikes);
+    // The episode ended inside the grace window — cancel the warning-episode
+    // escalation tripwire (the mute itself, once scheduled, still lands: the
+    // warning prompt TELLS the caller their mic is muted, so the system must
+    // keep that promise regardless of how fast this episode cleared).
+    speakerphoneWarningActiveAt.delete(sessionId);
+    const graceTimer = speakerphoneGraceTimers.get(sessionId);
+    if (graceTimer) clearTimeout(graceTimer);
+    speakerphoneGraceTimers.delete(sessionId);
     // Defensive disarm: if the tone is armed but there is NO ACTIVE
     // HoldDetector second-call engagement (e.g. the disengage fired while
     // suspicion was active and deferred the disarm to this path), the clear
@@ -3196,7 +3359,7 @@ export async function onSpeakerphoneCleared(
     await logEvent(
       sessionId,
       "SPEAKERPHONE_CLEARED",
-      `callee audio returned to normal; no further challenge-noise injections (caller-targeted) | ${reason}`.slice(0, 512),
+      `callee audio returned to normal; no further challenge-noise injections (caller-targeted) | strike=${strikes} | ${reason}`.slice(0, 512),
     );
     try {
       const { logCallEvent } = await import("./simulator");
@@ -3210,6 +3373,7 @@ export async function onSpeakerphoneCleared(
         await logCallEvent(callId, "speakerphone_cleared", {
           sessionId,
           reason,
+          strike: strikes,
           target: "caller-inmate",
           at: new Date().toISOString(),
         });
@@ -3228,13 +3392,13 @@ export async function onSpeakerphoneCleared(
  * conference announce. The noise is a forensic challenge aimed at the party
  * the suspicion is ABOUT: with the noise on the inmate's downlink they can't
  * hear the callee clearly while the call is being relayed over speakerphone
- * and are prompted to take it off speaker to hear better. The callee/Leg A
- * participant NEVER gets this noise — Leg A's participant announce channel is
- * reserved EXCLUSIVELY for the in-call merge tone (armMergeTone): a new
- * participant announce replaces the in-progress one, so announcing noise to
- * Leg A would kill the DTMF merge tone and mask its return path (the exact
- * live-test bug this retarget fixes). The call CONTINUES: this never hangs
- * up or redirects any leg.
+ * and are prompted to take it off speaker to hear better. The callee/Leg B
+ * participant NEVER gets this noise — the Leg B participant's announce
+ * channel is reserved EXCLUSIVELY for the in-call merge tone
+ * (announceMergeTone): a new participant announce replaces the in-progress
+ * one, so announcing noise there would kill the merge-tone beep. The caller
+ * and Leg B channels are independent, so the two never contend. The call
+ * CONTINUES: this never hangs up or redirects any leg.
  *
  * If the session has no callerCallSid the announce is skipped (logged) — we
  * do NOT fall back to the Leg A (callee) leg.
@@ -3312,9 +3476,9 @@ export async function injectChallengeNoise(
       );
       return;
     }
-    // CALLER participant ONLY — NEVER the Leg A (callee) participant: Leg A's
-    // announce channel belongs to the DTMF merge tone, and a competing
-    // announce there would replace/kill it (see the docstring above).
+    // CALLER participant ONLY — NEVER the Leg B (callee) participant: Leg B's
+    // announce channel belongs to the merge tone, and a competing announce
+    // there would replace/kill it (see the docstring above).
     await getTwilioClient()
       .conferences(confSid)
       .participants(session.callerCallSid)
@@ -3349,6 +3513,399 @@ export async function injectChallengeNoise(
     }
   } catch (err) {
     console.error(`[verify] injectChallengeNoise failed session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * SPEAKERPHONE STRIKE-LADDER DISPATCHER — the single entry point the
+ * media-stream suspicion handler calls on EVERY detector emission.
+ *
+ * The ladder (per-session, strikes = completed episodes recorded by
+ * onSpeakerphoneCleared):
+ *   strikes 0–1 (episodes 1–2) → challenge noise via injectChallengeNoise
+ *                                (every emission, sustained masking);
+ *   strikes 2   (episode 3)    → FINAL WARNING, exactly once ever
+ *                                (speakerphoneWarnedSessions): the warning
+ *                                prompt is announced to the caller on episode
+ *                                onset, the caller mic is muted after the
+ *                                prompt lands, and a grace timer escalates
+ *                                to supreme if the episode never clears.
+ *                                During a warning episode the noise does NOT
+ *                                run — the warning prompt must be heard.
+ *   strikes ≥3  (episode 4+)   → SUPREME FLAG on episode onset: call flagged,
+ *                                admin alerted, termination prompt played to
+ *                                both parties, call ended.
+ *
+ * `episodeStart` is true only on the FIRST emission of a new episode (the
+ * stream layer computes it from speakerphoneSuspicion membership before
+ * adding). Non-onset refires at strikes ≥2 are deliberate no-ops: the
+ * warning/grace machinery owns those episodes.
+ */
+export async function injectSpeakerphoneChallenge(
+  sessionId: string,
+  reason: string,
+  episodeStart: boolean,
+): Promise<void> {
+  const strikes = speakerphoneStrikes.get(sessionId) ?? 0;
+  if (strikes >= 3) {
+    if (episodeStart) {
+      console.log(
+        `[verify] SPEAKERPHONE_LADDER session=${sessionId} strikes=${strikes} episodeStart → SUPREME`,
+      );
+      await onSpeakerphoneSupreme(sessionId, reason);
+    }
+    return;
+  }
+  if (strikes === 2) {
+    if (episodeStart && !speakerphoneWarnedSessions.has(sessionId)) {
+      console.log(
+        `[verify] SPEAKERPHONE_LADDER session=${sessionId} strikes=2 episodeStart → FINAL WARNING`,
+      );
+      await issueSpeakerphoneWarning(sessionId, reason);
+    }
+    return;
+  }
+  await injectChallengeNoise(sessionId, reason);
+}
+
+/**
+ * STRIKE-3 FINAL WARNING (episode 3 onset, fires exactly once per session):
+ *  1. announce the warning prompt to the CALLER participant (whisper channel
+ *     — the callee keeps hearing normal audio);
+ *  2. after the prompt lands (speakerphoneWarningMs + 500ms buffer), MUTE the
+ *     caller participant — the mic stays muted for the rest of the call, per
+ *     the product rule "mute after the prompt";
+ *  3. start the grace timer: if the relay episode is STILL active
+ *     speakerphoneWarningGraceMs later (no fingerprint-clean clear), escalate
+ *     straight to the supreme flag — "if it happens again" includes "never
+ *     stopped".
+ * Best-effort throughout: failures are logged, never thrown into the media
+ * path. If the announce itself cannot be delivered (no conference/participant
+ * yet), the warning is NOT marked issued so the next episode onset retries.
+ */
+async function issueSpeakerphoneWarning(
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session)) return;
+    if (session.state !== VState.BRIDGED) {
+      console.log(
+        `[verify] SPEAKERPHONE_WARNING session=${sessionId} state=${session.state} — not BRIDGED, deferring warning`,
+      );
+      return;
+    }
+    if (!session.callerCallSid) {
+      console.warn(`[verify] SPEAKERPHONE_WARNING session=${sessionId} — no caller leg, skipping`);
+      return;
+    }
+    const base = getPublicBaseUrl();
+    if (!base) {
+      console.warn(`[verify] SPEAKERPHONE_WARNING session=${sessionId} — no public base URL, skipping`);
+      return;
+    }
+    const confSid = await liveConferenceSid(sessionId);
+    if (!confSid) {
+      console.warn(`[verify] SPEAKERPHONE_WARNING session=${sessionId} — no live conference, skipping`);
+      return;
+    }
+    await getTwilioClient()
+      .conferences(confSid)
+      .participants(session.callerCallSid)
+      .update({
+        announceUrl: `${base}/api/verify/speakerphone-warning.wav`,
+        announceMethod: "GET",
+      });
+    // Mark issued ONLY after the announce succeeded (see docstring).
+    speakerphoneWarnedSessions.add(sessionId);
+    speakerphoneWarningActiveAt.set(sessionId, Date.now());
+    console.log(
+      `[verify] SPEAKERPHONE_WARNING session=${sessionId} caller=${session.callerCallSid} — final warning announced; mute in ${speakerphoneWarningMs() + 500}ms; grace ${speakerphoneWarningGraceMs()}ms | ${reason}`,
+    );
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_WARNING",
+      `strike 3 (third relay episode): final warning announced to caller; caller mic mutes in ${speakerphoneWarningMs() + 500}ms and STAYS muted; next episode (or ${speakerphoneWarningGraceMs()}ms without a clean window) = supreme flag, call ended + admin alerted | ${reason}`.slice(0, 512),
+    );
+    try {
+      const { logCallEvent } = await import("./simulator");
+      const rows = await getDb()
+        .select({ id: schema.calls.id })
+        .from(schema.calls)
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`))
+        .limit(1);
+      const callId = Number(rows.at(0)?.id ?? 0);
+      if (callId) {
+        await logCallEvent(callId, "speakerphone_warning", {
+          sessionId,
+          reason,
+          strike: 3,
+          target: "caller-inmate",
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.warn("[verify] logCallEvent speakerphone_warning mirror failed:", (err as Error).message);
+    }
+    const muteTimer = setTimeout(() => {
+      void muteSpeakerphoneCaller(sessionId);
+    }, speakerphoneWarningMs() + 500);
+    muteTimer.unref?.();
+    speakerphoneMuteTimers.set(sessionId, muteTimer);
+    const graceTimer = setTimeout(() => {
+      void onSpeakerphoneWarningGraceExpired(sessionId);
+    }, speakerphoneWarningGraceMs());
+    graceTimer.unref?.();
+    speakerphoneGraceTimers.set(sessionId, graceTimer);
+  } catch (err) {
+    console.error(`[verify] issueSpeakerphoneWarning failed session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * The strike-3 mute itself: caller (inmate) participant `muted: true` on the
+ * live conference + `calls.muted` mirror. The mute is PERMANENT for the rest
+ * of the call (product rule: "in mute after the prompt") — there is no
+ * unmute path. Mute only blocks the caller's UPLINK; they still hear the
+ * callee and any later termination prompt.
+ */
+async function muteSpeakerphoneCaller(sessionId: string): Promise<void> {
+  try {
+    speakerphoneMuteTimers.delete(sessionId);
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session)) return;
+    if (session.state !== VState.BRIDGED) return;
+    const confSid = await liveConferenceSid(sessionId);
+    if (confSid && session.callerCallSid) {
+      await getTwilioClient()
+        .conferences(confSid)
+        .participants(session.callerCallSid)
+        .update({ muted: true });
+      console.log(
+        `[verify] SPEAKERPHONE_CALLER_MUTED session=${sessionId} caller=${session.callerCallSid} (permanent, post-warning)`,
+      );
+    } else {
+      console.warn(
+        `[verify] SPEAKERPHONE_CALLER_MUTED session=${sessionId} — conference/participant gone; DB mirror still written`,
+      );
+    }
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_CALLER_MUTED",
+      "strike-3 final warning delivered — caller (inmate) mic muted for the remainder of the call",
+    );
+    try {
+      await getDb()
+        .update(schema.calls)
+        .set({ muted: true })
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`));
+      const { logCallEvent } = await import("./simulator");
+      const rows = await getDb()
+        .select({ id: schema.calls.id })
+        .from(schema.calls)
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`))
+        .limit(1);
+      const callId = Number(rows.at(0)?.id ?? 0);
+      if (callId) {
+        await logCallEvent(callId, "speakerphone_caller_muted", {
+          sessionId,
+          target: "caller-inmate",
+          permanent: true,
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.warn("[verify] muted mirror failed:", (err as Error).message);
+    }
+  } catch (err) {
+    console.error(`[verify] muteSpeakerphoneCaller failed session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * Grace-timer expiry for a strike-3 warning episode. If the episode CLEARED
+ * in time, speakerphoneWarningActiveAt was deleted by onSpeakerphoneCleared
+ * and this is a no-op. If it is STILL active, the caller relayed straight
+ * through the warning + mute — escalate to the supreme flag.
+ */
+async function onSpeakerphoneWarningGraceExpired(sessionId: string): Promise<void> {
+  speakerphoneGraceTimers.delete(sessionId);
+  if (!speakerphoneWarningActiveAt.has(sessionId)) return; // cleared in time
+  await onSpeakerphoneSupreme(
+    sessionId,
+    `warning episode persisted ${speakerphoneWarningGraceMs()}ms without a fingerprint-clean window — treated as "happened again"`,
+  );
+}
+
+/**
+ * SUPREME FLAG — the top of the speakerphone strike ladder (episode 4 onset,
+ * or a strike-3 warning episode that never cleared). The call:
+ *  1. transitions BRIDGED → SPEAKERPHONE_TERMINATED (terminal; NEVER a pass);
+ *  2. is FLAGGED on the calls row (flagged=true + flagReason) for review;
+ *  3. alerts the admin by SMS (ADMIN_ALERT_NUMBER; skipped when unset);
+ *  4. plays the termination prompt to BOTH live parties (caller + Leg B
+ *     participant whisper channels — the muted caller still HEARS downlink);
+ *  5. after the prompt lands, hangs up every leg and completes the
+ *     conference by SID (belt-and-braces — a REST redirect cannot reach a
+ *     leg inside an active <Dial><Conference>, so the announce + delayed
+ *     teardown is the reliable in-conference path).
+ * Idempotent per session (speakerphoneSupremeSessions). Best-effort: every
+ * step is individually fault-isolated; the terminal transition has already
+ * happened before any telephony step runs, so a Twilio failure can never
+ * resurrect the call.
+ */
+export async function onSpeakerphoneSupreme(
+  sessionId: string,
+  reason: string,
+): Promise<void> {
+  if (speakerphoneSupremeSessions.has(sessionId)) return;
+  speakerphoneSupremeSessions.add(sessionId);
+  try {
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session)) return;
+    if (session.state !== VState.BRIDGED) {
+      console.log(
+        `[verify] SPEAKERPHONE_SUPREME session=${sessionId} state=${session.state} — not BRIDGED, ignoring | ${reason}`,
+      );
+      return;
+    }
+    // Cancel the pending strike-3 machinery — the ladder is resolved now.
+    const muteTimer = speakerphoneMuteTimers.get(sessionId);
+    if (muteTimer) clearTimeout(muteTimer);
+    speakerphoneMuteTimers.delete(sessionId);
+    const graceTimer = speakerphoneGraceTimers.get(sessionId);
+    if (graceTimer) clearTimeout(graceTimer);
+    speakerphoneGraceTimers.delete(sessionId);
+    speakerphoneWarningActiveAt.delete(sessionId);
+    // The forensic path owns the moment: kill the merge tone so it can never
+    // suppress or mask the termination prompt.
+    if (isMergeToneArmed(sessionId)) disarmMergeTone(sessionId);
+
+    const strikes = speakerphoneStrikes.get(sessionId) ?? 0;
+    const transitioned = await transition(
+      session,
+      VState.SPEAKERPHONE_TERMINATED,
+      `supreme flag after ${strikes} cleared strike(s) + current episode | ${reason}`.slice(0, 256),
+    );
+    if (!transitioned) return;
+    session.completedAt = new Date();
+    session.failureReason =
+      `Supreme flag: repeated speakerphone/relay episodes (${strikes} strikes + final episode) — call ended and flagged for review`.slice(0, 512);
+    await save(session);
+    console.log(
+      `[verify] SPEAKERPHONE_SUPREME session=${sessionId} strikes=${strikes} — call flagged, terminating | ${reason}`,
+    );
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_SUPREME",
+      `supreme flag: speakerphone/relay detected again after ${strikes} strike(s) incl. the final warning — call flagged for review, admin alerted, call ended | ${reason}`.slice(0, 512),
+    );
+
+    // Flag the calls row for review + mirror the event stream.
+    try {
+      await getDb()
+        .update(schema.calls)
+        .set({
+          flagged: true,
+          flagReason: `speakerphone supreme: ${strikes} strikes + final episode`.slice(0, 255),
+        })
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`));
+      const { logCallEvent } = await import("./simulator");
+      const rows = await getDb()
+        .select({ id: schema.calls.id })
+        .from(schema.calls)
+        .where(eq(schema.calls.clientCallId, `guarded-${sessionId}`))
+        .limit(1);
+      const callId = Number(rows.at(0)?.id ?? 0);
+      if (callId) {
+        await logCallEvent(callId, "speakerphone_supreme", {
+          sessionId,
+          strikes,
+          reason,
+          flagged: true,
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.warn("[verify] supreme flag/mirror failed:", (err as Error).message);
+    }
+
+    // Admin SMS alert (best-effort; skipped when ADMIN_ALERT_NUMBER unset or
+    // SMS disabled — the flag + events above are the durable record).
+    const adminTo = adminAlertNumber();
+    if (adminTo) {
+      try {
+        const cfg = smsCfg();
+        const providerReady =
+          cfg.provider === "twilio" ? twilioRestConfigured() : Boolean(cfg.token);
+        if (cfg.enabled && providerReady) {
+          const result = await deliverSms(
+            cfg,
+            adminTo,
+            `SUPREME FLAG: guarded call ${sessionId} ended — repeated speakerphone/relay episodes (${strikes} strikes + final episode). Flagged for review.`,
+          );
+          await logEvent(
+            sessionId,
+            result.ok ? "ADMIN_ALERT_SENT" : "ADMIN_ALERT_FAILED",
+            result.ok
+              ? `supreme-flag SMS delivered to admin (${adminTo}) via ${cfg.provider} id=${result.providerId ?? "n/a"}`
+              : `supreme-flag SMS to admin (${adminTo}) failed: ${result.error ?? "unknown"}`.slice(0, 512),
+          );
+        } else {
+          await logEvent(
+            sessionId,
+            "ADMIN_ALERT_SKIPPED",
+            `ADMIN_ALERT_NUMBER set but SMS disabled/credentials missing (provider=${cfg.provider})`,
+          );
+        }
+      } catch (err) {
+        console.warn("[verify] admin alert SMS failed:", (err as Error).message);
+      }
+    }
+
+    // Termination prompt to BOTH live parties, then delayed teardown.
+    const base = getPublicBaseUrl();
+    const confSid = await liveConferenceSid(sessionId);
+    if (base && confSid) {
+      const url = `${base}/api/verify/speakerphone-terminated.wav`;
+      await Promise.allSettled([
+        session.callerCallSid
+          ? getTwilioClient()
+              .conferences(confSid)
+              .participants(session.callerCallSid)
+              .update({ announceUrl: url, announceMethod: "GET" })
+          : Promise.resolve(),
+        session.legBCallSid
+          ? getTwilioClient()
+              .conferences(confSid)
+              .participants(session.legBCallSid)
+              .update({ announceUrl: url, announceMethod: "GET" })
+          : Promise.resolve(),
+      ]);
+    }
+    // 8.5s ≈ terminated-prompt duration (measured 7.08s) + buffer. Fault-
+    // isolated: the session is already terminal, so nothing here can
+    // resurrect it. Unref'd — a pending teardown must never hold the
+    // process (or a test runner) open.
+    const teardownTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          await hangupAll(session, { caller: true, legA: true, legB: true, ringTest: true });
+          if (confSid) {
+            await getTwilioClient()
+              .conferences(confSid)
+              .update({ status: "completed" });
+            console.log(`[verify] CONFERENCE_COMPLETED session=${sessionId} conf=${confSid} (supreme)`);
+          }
+        } catch (err) {
+          console.warn(`[verify] supreme teardown incomplete session=${sessionId}:`, (err as Error).message);
+        }
+      })();
+    }, 8_500);
+    teardownTimer.unref?.();
+  } catch (err) {
+    console.error(`[verify] onSpeakerphoneSupreme failed session=${sessionId}:`, err);
   }
 }
 
