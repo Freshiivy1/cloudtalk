@@ -8,7 +8,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const dsp = vi.hoisted(() => ({ suspicious: false, amberOnly: false }));
+const dsp = vi.hoisted(() => ({ suspicious: false, amberOnly: false, matchAmber: false }));
 
 vi.mock("./features", () => ({
   // Any non-empty speechFrames lets the first window seed the baseline.
@@ -33,11 +33,19 @@ vi.mock("./compare", () => ({
             score: 0.9,
             components: { flatness: 0.9, gapContrast: 0.8, noiseBed: 0.7, hfLeakage: 0.6, fragmentation: 0.5 },
           }
-      : {
-          state: "GREEN",
-          score: 0.1,
-          components: { flatness: 0.1, gapContrast: 0.1, noiseBed: 0.1, hfLeakage: 0.1, fragmentation: 0.1 },
-        },
+      : dsp.matchAmber
+        ? {
+            // Borderline mid-episode window: MATCH verdict but AMBER print —
+            // must neither clear suspicion nor be absorbed into the baseline.
+            state: "AMBER",
+            score: 0.4,
+            components: { flatness: 0.4, gapContrast: 0.3, noiseBed: 0.3, hfLeakage: 0.2, fragmentation: 0.1 },
+          }
+        : {
+            state: "GREEN",
+            score: 0.1,
+            components: { flatness: 0.1, gapContrast: 0.1, noiseBed: 0.1, hfLeakage: 0.1, fragmentation: 0.1 },
+          },
 }));
 
 import { SpeakerphoneDetector } from "./speakerphone-detector";
@@ -92,7 +100,7 @@ describe("SpeakerphoneDetector arming threshold", () => {
     expect(fires[0].detail).toContain("streak=3");
   });
 
-  it("stops emitting the moment a clean window clears the suspicion (no re-announces after onClean)", () => {
+  it("clears only after 2 consecutive clean windows (hysteresis) — no re-announces after onClean", () => {
     nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
     const fires: Array<{ score: number; detail: string }> = [];
     const cleans: string[] = [];
@@ -110,7 +118,9 @@ describe("SpeakerphoneDetector arming threshold", () => {
     expect(fires).toHaveLength(1);
     now += 60_000; // well past refire — would re-fire if still suspecting
     dsp.suspicious = false;
-    d.pushSamples(WINDOW); // clean → onClean, back to idle
+    d.pushSamples(WINDOW); // clean #1 — hysteresis: NOT cleared yet
+    expect(cleans).toHaveLength(0);
+    d.pushSamples(WINDOW); // clean #2 (consecutive) → onClean, back to idle
     expect(cleans).toHaveLength(1);
     // Suspicion cleared: no further emissions without a fresh streak.
     now += 60_000;
@@ -150,18 +160,24 @@ describe("SpeakerphoneDetector sustained repeat-fire", () => {
     expect(fires).toHaveLength(3);
   });
 
-  it("resets to idle on a clean window — re-trigger needs 2 consecutive again", () => {
+  it("resets to idle after 2 consecutive clean windows — re-trigger needs 2 consecutive suspicious again", () => {
     const { fires, push } = setup();
     push(true);
     push(true); // fire #1
     expect(fires).toHaveLength(1);
 
-    push(false); // clean window → idle (baseline refreshed on MATCH)
+    push(false); // clean #1 — episode survives (hysteresis), baseline frozen
     now += 60_000; // well past the refire interval
-    push(true); // streak 1 — must NOT fire (reset, not cooldown)
-    expect(fires).toHaveLength(1);
-    push(true); // streak 2 — fresh trigger
+    push(true); // still suspecting: refire, NOT a fresh streak
     expect(fires).toHaveLength(2);
+
+    push(false); // clean #1 (consecutive streak restarted by the suspicious window)
+    push(false); // clean #2 → cleared (baseline refresh allowed again)
+    now += 60_000;
+    push(true); // streak 1 — must NOT fire (reset, not cooldown)
+    expect(fires).toHaveLength(2);
+    push(true); // streak 2 — fresh trigger
+    expect(fires).toHaveLength(3);
   });
 
   it("uncapped: keeps emitting every refire interval for as long as suspicion persists", () => {
@@ -412,5 +428,112 @@ describe("SpeakerphoneDetector calibration warm-up (continued)", () => {
     now += 8_000;
     d.pushSamples(WINDOW); // warm-up done → arms
     expect(fires).toHaveLength(1);
+  });
+});
+
+describe("SpeakerphoneDetector baseline-adaptation guard (live 'fires 3-4 times then stops' regression)", () => {
+  function setupGuard() {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    const cleans: string[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 2,
+      refireMs: 4_000,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+      onClean: (detail) => cleans.push(detail),
+    });
+    const push = (suspicious: boolean, matchAmber = false) => {
+      dsp.suspicious = suspicious;
+      dsp.matchAmber = matchAmber;
+      d.pushSamples(WINDOW);
+      dsp.matchAmber = false;
+    };
+    push(false); // baseline seed (absorption #1)
+    expect(d.baselineAbsorptions).toBe(1);
+    return { d, fires, cleans, push };
+  }
+
+  it("a borderline MATCH window mid-episode neither clears suspicion nor poisons the baseline — refires continue past 3-4 pickups", () => {
+    const { d, fires, cleans, push } = setupGuard();
+    push(true);
+    push(true); // fire #1
+    expect(fires).toHaveLength(1);
+
+    // Sustained relay with a borderline MATCH+GREEN window after the 4th
+    // pickup — the exact live-calls pattern that used to end the episode.
+    now += 4_000;
+    push(true); // fire #2
+    now += 4_000;
+    push(true); // fire #3
+    now += 4_000;
+    push(true); // fire #4
+    expect(fires).toHaveLength(4);
+
+    const absorbsBefore = d.baselineAbsorptions;
+    push(false); // borderline MATCH+GREEN mid-episode
+    expect(cleans).toHaveLength(0); // hysteresis: 1 clean window never clears
+    expect(d.baselineAbsorptions).toBe(absorbsBefore); // baseline FROZEN during the episode
+
+    now += 4_000;
+    push(true); // suspicion still active → refire #5 (old code: silence from here on)
+    expect(fires).toHaveLength(5);
+    now += 4_000;
+    push(true); // #6
+    now += 4_000;
+    push(true); // #7
+    expect(fires).toHaveLength(7);
+
+    // Genuine sustained clean audio ends the episode: 2 consecutive cleans.
+    push(false);
+    push(false);
+    expect(cleans).toHaveLength(1);
+    // After clearing, clearly-clean audio may refresh the baseline again.
+    push(false);
+    expect(d.baselineAbsorptions).toBeGreaterThan(absorbsBefore);
+  });
+
+  it("MATCH+AMBER windows never clear the episode and are never absorbed", () => {
+    const { d, fires, cleans, push } = setupGuard();
+    push(true);
+    push(true); // fire #1
+    const absorbsBefore = d.baselineAbsorptions;
+    now += 4_000;
+    push(false, true); // MATCH verdict but AMBER fingerprint
+    expect(cleans).toHaveLength(0);
+    expect(d.baselineAbsorptions).toBe(absorbsBefore);
+    now += 4_000;
+    push(true); // episode continues → refire #2
+    expect(fires).toHaveLength(2);
+  });
+
+  it("baseline absorbs only MATCH+GREEN while idle — AMBER audio never becomes the reference", () => {
+    const { d, push } = setupGuard();
+    expect(d.baselineAbsorptions).toBe(1); // seed only
+    push(false, true); // MATCH+AMBER, not suspecting → NOT absorbed
+    expect(d.baselineAbsorptions).toBe(1);
+    push(false); // MATCH+GREEN, not suspecting → absorbed
+    expect(d.baselineAbsorptions).toBe(2);
+  });
+
+  it("cleanWindowsToClear: 1 preserves single-clean clearing", () => {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: number[] = [];
+    const cleans: string[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 2,
+      refireMs: 4_000,
+      cleanWindowsToClear: 1,
+      onSuspicious: (score) => fires.push(score),
+      onClean: (detail) => cleans.push(detail),
+    });
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // seed
+    dsp.suspicious = true;
+    d.pushSamples(WINDOW);
+    d.pushSamples(WINDOW); // fires
+    expect(fires).toHaveLength(1);
+    dsp.suspicious = false;
+    d.pushSamples(WINDOW); // one clean window clears under the legacy setting
+    expect(cleans).toHaveLength(1);
   });
 });

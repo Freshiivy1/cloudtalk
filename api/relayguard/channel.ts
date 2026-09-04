@@ -198,6 +198,17 @@ function addLineNoise(samples: Float32Array, sr: number, humHz: number, level: n
  * Apply a channel baseline model to normalized 16 kHz mono audio.
  * The input is expected to be peak-normalized; output is peak-normalized again
  * to the same peak so comparisons stay level-matched.
+ *
+ * OFFLINE / CORPUS PREPARATION ONLY — NEVER call this on live Twilio media-
+ * stream audio. Twilio already delivers 8 kHz μ-law telephone-channel audio;
+ * re-applying the 'poor' model would double-compand the μ-law, inject
+ * synthetic line noise, and its steep 3.4 kHz lowpass would erase the
+ * >3.4 kHz HF-leakage feature the relay fingerprint depends on. Live
+ * window-vs-window comparisons therefore run compareClips(a, b, "poor")
+ * directly on un-simulated profiles — both sides of a live call are already
+ * on the prison-phone channel, so thresholds apply without simulation. This
+ * function exists for preparing wideband reference recordings (e.g. 16 kHz
+ * corpus clips) so they can be compared against telephone audio.
  */
 export function applyBaseline(samples: Float32Array, sr: number, mode: BaselineMode): Float32Array {
   let peak = 0;

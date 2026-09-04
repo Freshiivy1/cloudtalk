@@ -54,7 +54,14 @@ import {
 import { decodeMulaw } from "../verification-stream";
 
 const SAMPLE_RATE = 8000;
-/** Prison-phone channel model: the live legs are 8 kHz μ-law telephony. */
+/**
+ * Prison-phone channel THRESHOLDS: both legs of a live call are already
+ * 8 kHz μ-law telephony, so the "poor" margins apply directly to the live
+ * profiles. applyBaseline() itself is deliberately NOT applied to live audio
+ * — see channel.ts (double μ-law companding + synthetic noise would destroy
+ * forensic evidence, and its 3.4 kHz lowpass would erase the HF-leakage
+ * feature the relay fingerprint needs).
+ */
 const BASELINE_MODE = "poor" as const;
 
 /** Top-3 contributing relay-fingerprint features, highest score first. */
@@ -101,6 +108,15 @@ export interface SpeakerphoneDetectorOptions {
    * streak while !bridged closes that race.
    */
   armOnlyWhenBridged?: boolean;
+  /**
+   * Consecutive NON-suspicious windows required to clear a fired suspicion
+   * (default 2). Sustained relay audio routinely produces one borderline
+   * MATCH/AMBER window mid-episode; clearing on a single clean window both
+   * silenced the challenge after a few pickups AND let that window's audio
+   * poison the rolling baseline (see analyzeWindow). Hysteresis keeps the
+   * episode alive through one-off borderline windows.
+   */
+  cleanWindowsToClear?: number;
   /** Called when speakerphone use is suspected. score ∈ 0..1 (relay fp). */
   onSuspicious?: (score: number, detail: string) => void;
   /** Called once when a fired suspicion clears on a clean analysis window. */
@@ -120,12 +136,16 @@ export class SpeakerphoneDetector {
   private readonly onSuspicious?: (score: number, detail: string) => void;
   private readonly onClean?: (detail: string) => void;
   private readonly onWarmupComplete?: (detail: string) => void;
+  private readonly cleanNeed: number;
   private buf: number[] = [];
   private baseline: ClipProfile | null = null;
   private streak = 0;
+  private cleanStreak = 0;
   private windows = 0;
   private lastFiredAt = 0;
   private suspecting = false;
+  /** Test hook: how many times the rolling baseline was (re)built/absorbed. */
+  private baselineAbsorbs = 0;
   /** BRIDGED state + warm-up bookkeeping. */
   private readonly armOnlyWhenBridged: boolean;
   private bridged: boolean;
@@ -143,6 +163,7 @@ export class SpeakerphoneDetector {
     this.onClean = opts.onClean;
     this.onWarmupComplete = opts.onWarmupComplete;
     this.armOnlyWhenBridged = opts.armOnlyWhenBridged ?? false;
+    this.cleanNeed = Math.max(1, opts.cleanWindowsToClear ?? 2);
     this.bridged = opts.bridged ?? false;
     this.warmupDone = this.warmup <= 0;
     if (this.bridged) this.bridgedAt = Date.now();
@@ -165,6 +186,7 @@ export class SpeakerphoneDetector {
     this.warmupWindows = 0;
     this.baseline = null;
     this.streak = 0;
+    this.cleanStreak = 0;
     this.suspecting = false;
     if (!this.warmupDone) {
       console.log(
@@ -210,6 +232,27 @@ export class SpeakerphoneDetector {
     return this.suspecting;
   }
 
+  /** Test hook: number of times the rolling baseline was seeded/absorbed. */
+  get baselineAbsorptions(): number {
+    return this.baselineAbsorbs;
+  }
+
+  /**
+   * Refresh the rolling baseline with new reference audio. HARD RULES:
+   * never while a suspicion episode is active (the reference must stay
+   * "normal direct-call audio" for the whole episode — absorbing relayed
+   * audio mid-episode makes the same audio compare MATCH forever, which is
+   * exactly how the live detector went silent after 3–4 pickups), and only
+   * for clearly-clean windows (MATCH verdict AND GREEN relay fingerprint —
+   * AMBER/RED audio is never allowed to become the reference).
+   */
+  private absorbBaseline(profile: ClipProfile, verdict: Verdict, fpState: string): void {
+    if (this.suspecting) return;
+    if (verdict !== "MATCH" || fpState !== "GREEN") return;
+    this.baseline = profile;
+    this.baselineAbsorbs++;
+  }
+
   private analyzeWindow(window: number[]): void {
     this.windows++;
     // int16 → float, peak-normalized (μ-law levels vary per trunk).
@@ -227,7 +270,10 @@ export class SpeakerphoneDetector {
     // No baseline yet: seed the rolling baseline from the first window that
     // actually contains speech; silent ring-in windows tell us nothing.
     if (!this.baseline) {
-      if (profile.vad.speechFrames.length > 0) this.baseline = profile;
+      if (profile.vad.speechFrames.length > 0) {
+        this.baseline = profile;
+        this.baselineAbsorbs++;
+      }
       return;
     }
 
@@ -254,8 +300,8 @@ export class SpeakerphoneDetector {
     if (this.bridged && !this.warmupDone) {
       this.warmupWindows++;
       if (Date.now() - this.bridgedAt < this.warmup) {
-        // Rolling baseline keeps absorbing the fresh in-call audio.
-        if (verdict === "MATCH") this.baseline = profile;
+        // Rolling baseline keeps absorbing fresh, clearly-clean in-call audio.
+        this.absorbBaseline(profile, verdict, fp.state);
         return;
       }
       this.warmupDone = true;
@@ -274,7 +320,8 @@ export class SpeakerphoneDetector {
     // the warm-up starts. The rolling baseline still absorbs clean audio.
     if (this.armOnlyWhenBridged && !this.bridged) {
       this.streak = 0;
-      if (verdict === "MATCH") this.baseline = profile;
+      this.cleanStreak = 0;
+      this.absorbBaseline(profile, verdict, fp.state);
       return;
     }
 
@@ -286,6 +333,7 @@ export class SpeakerphoneDetector {
 
     if (suspicious) {
       this.streak++;
+      this.cleanStreak = 0;
       const detail =
         `verdict=${verdict} relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
         `weighted=${result.weightedScore.toFixed(2)} confidence=${Math.round(result.confidence)} ` +
@@ -299,21 +347,35 @@ export class SpeakerphoneDetector {
         this.onSuspicious?.(fp.score, detail);
       }
     } else {
-      // Clean window → back to idle: re-firing needs `need` fresh
-      // consecutive suspicious windows again. If masking had fired, surface
-      // the clear transition immediately for live analysis.
-      const wasSuspecting = this.suspecting;
-      this.streak = 0;
-      this.suspecting = false;
-      if (wasSuspecting) {
-        this.onClean?.(
-          `verdict=${verdict} relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
-            `weighted=${result.weightedScore.toFixed(2)} confidence=${Math.round(result.confidence)} — clean window`,
-        );
+      // CLEAN-EPISODE HYSTERESIS + BASELINE FREEZE: while a suspicion episode
+      // is active, a single borderline window must NOT end it — sustained
+      // relay audio routinely produces one MATCH/AMBER window, and clearing on
+      // it (a) silenced the challenge after ~3–4 pickups and (b) let the old
+      // code absorb that relayed audio into the rolling baseline, after which
+      // the same audio compared MATCH forever. Suspicion now clears only after
+      // `cleanNeed` CONSECUTIVE non-suspicious windows, and the baseline stays
+      // frozen for the entire episode (absorbBaseline enforces this).
+      if (this.suspecting) {
+        this.cleanStreak++;
+        if (this.cleanStreak >= this.cleanNeed) {
+          this.suspecting = false;
+          this.streak = 0;
+          this.cleanStreak = 0;
+          this.onClean?.(
+            `verdict=${verdict} relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
+              `weighted=${result.weightedScore.toFixed(2)} confidence=${Math.round(result.confidence)} — ` +
+              `${this.cleanNeed} consecutive clean windows`,
+          );
+        }
+        return;
       }
-      // Rolling baseline: clean windows keep the reference fresh, so a slow
-      // drift (handset → speakerphone mid-call) still shows up as a change.
-      if (verdict === "MATCH") this.baseline = profile;
+      // Not suspecting: a non-suspicious window resets the arming streak.
+      this.streak = 0;
+      this.cleanStreak = 0;
+      // Rolling baseline: clearly-clean windows (MATCH + GREEN fingerprint)
+      // keep the reference fresh, so a slow drift (handset → speakerphone
+      // mid-call) still shows up as a change.
+      this.absorbBaseline(profile, verdict, fp.state);
     }
   }
 }
