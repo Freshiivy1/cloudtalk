@@ -472,6 +472,24 @@ export function secondCallConfirmMs(): number {
 }
 
 /**
+ * Whether a HoldDetector engagement may arm the in-call merge-tone beep at
+ * all. DEFAULT FALSE (2026-09-04): the held canary's uplink carries leaked
+ * live-call audio on handsets that don't fully mute the held line, which
+ * makes the HoldDetector's speech-then-quiet signature indistinguishable
+ * from a genuine canary pickup — every production tone-arming so far has
+ * been a false positive (three separate incidents, zero true detections),
+ * and each one beeped at the callee while its suppression masked the
+ * speakerphone strike ladder. In-call merge supervision continues via the
+ * merge-relay loud-tone listener + prompt fingerprint + the speakerphone
+ * detector. Set VERIFY_HOLD_TONE_ARMING_ENABLED=true to re-enable (only
+ * once a leak discriminator, e.g. cross-stream envelope correlation, is
+ * implemented).
+ */
+export function holdToneArmingEnabled(): boolean {
+  return (process.env.VERIFY_HOLD_TONE_ARMING_ENABLED ?? "").trim().toLowerCase() === "true";
+}
+
+/**
  * Admin phone number (E.164) for the supreme-flag SMS alert. Empty (default)
  * skips the SMS — the call still terminates, is flagged on the calls row,
  * and the event is logged. Env: ADMIN_ALERT_NUMBER.
@@ -688,7 +706,7 @@ export function verifyPrompts() {
       "You will receive a second call. Please do not hang up this call. If you have any call on hold, please end that call. When you are ready, press 1.",
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
-      "Your call has been accepted. Please hold while we connect your call. For call security, please tell the person receiving your call to keep their phone off speakerphone. If speakerphone is necessary, ask them to use a quiet room and keep the phone close. Other voices or excessive background noise may cause the call to be flagged or ended.",
+      "For call security, please tell the person you are calling to keep their phone off speakerphone. If speakerphone is necessary, ask them to use a quiet room and keep the phone close to their mouth. Other voices or excessive background noise may cause this call to be flagged or ended.",
     // GUARDED MODE ONLY: spoken to Leg A immediately after the second press-1,
     // before the verification/bridge hold loop.
     calleeConnectWait:
@@ -3623,6 +3641,7 @@ export async function injectSpeakerphoneChallenge(
   sessionId: string,
   reason: string,
   episodeStart: boolean,
+  noiseSuppressed = false,
 ): Promise<void> {
   const strikes = speakerphoneStrikes.get(sessionId) ?? 0;
   if (strikes >= 3) {
@@ -3641,6 +3660,16 @@ export async function injectSpeakerphoneChallenge(
       );
       await issueSpeakerphoneWarning(sessionId, reason);
     }
+    return;
+  }
+  // Strikes 0-1 = plain challenge noise. An armed merge tone suppresses ONLY
+  // this branch (the noise would mask the tone's echo window) — the warning
+  // and supreme branches above are never suppressed.
+  if (noiseSuppressed) {
+    const detail =
+      `merge tone armed — challenge noise SUPPRESSED so it cannot interrupt the merge tone | ${reason}`;
+    console.log(`[verify-stream] NOISE_SUPPRESSED_MERGE_ACTIVE session=${sessionId} ${detail}`);
+    await logEvent(sessionId, "NOISE_SUPPRESSED_MERGE_ACTIVE", detail.slice(0, 512));
     return;
   }
   await injectChallengeNoise(sessionId, reason);

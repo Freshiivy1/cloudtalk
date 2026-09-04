@@ -480,9 +480,8 @@ export function handleSpeakerphoneSuspicious(
     }
     const mergeToneEffective = vs.isMergeToneEffective(sid);
     const session = await vs.findSession(sid);
-    const mergeActive =
-      mergeToneEffective || !session || vs.isTerminal(session);
-    if (mergeActive) {
+    // Terminal/missing sessions: fully suppress (no prompts on a dead call).
+    if (!session || vs.isTerminal(session)) {
       const reason =
         `merge system active (mergeToneEffective=${mergeToneEffective} state=${session?.state ?? "unknown"}) — ` +
         `speakerphone challenge SUPPRESSED so it cannot interrupt the merge tone | score=${score.toFixed(2)} ${detail}`;
@@ -490,10 +489,18 @@ export function handleSpeakerphoneSuspicious(
       await vs.logEvent(sid, "NOISE_SUPPRESSED_MERGE_ACTIVE", reason.slice(0, 512));
       return;
     }
+    // An armed merge tone suppresses ONLY the strike-1/2 challenge-noise
+    // injection (the noise would mask the tone's echo window). The strike
+    // LADDER — final warning prompt, caller mute, supreme flag — is NEVER
+    // suppressed: the 2026-09-04 retest swallowed the strike-3 warning AND
+    // the strike-4 supreme flag behind a falsely-armed tone, which is how
+    // "2 strikes then a warning then the call ends" silently became
+    // "beep beep and nothing".
     await vs.injectSpeakerphoneChallenge(
       sid,
       `score=${score.toFixed(2)} ${detail}`,
       episodeStart,
+      mergeToneEffective,
     );
   })().catch((err) => console.error("[verify-stream] injectSpeakerphoneChallenge error:", err));
 }
@@ -609,6 +616,14 @@ export function __testSetSpeakerphoneSuspicion(sid: string, active: boolean): vo
  *     it immediately.
  */
 export function handleSecondCallEngaged(sid: string): void {
+  if (!vs.holdToneArmingEnabled()) {
+    // Leak-prone path disabled by default (see vs.holdToneArmingEnabled) —
+    // the HoldDetector still tracks state, but it can never arm the beeps.
+    console.log(
+      `[verify-stream] SECOND CALL ENGAGED sid=${sid} — logged only (merge-tone arming disabled: VERIFY_HOLD_TONE_ARMING_ENABLED unset)`,
+    );
+    return;
+  }
   pendingEngagement.add(sid);
   if (engagementConfirmTimers.has(sid)) return; // re-engage while pending: keep the original timer
   console.log(
@@ -646,6 +661,7 @@ export function handleSecondCallDisengaged(sid: string): void {
  */
 export function resolveDeferredEngagement(sid: string): void {
   if (!pendingEngagement.delete(sid)) return;
+  if (!vs.holdToneArmingEnabled()) return; // arming disabled — never confirm
   const timer = engagementConfirmTimers.get(sid);
   if (timer) {
     clearTimeout(timer);

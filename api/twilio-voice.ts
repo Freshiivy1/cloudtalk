@@ -137,6 +137,11 @@ export async function voiceWebhookHandler(c: Context) {
       // The engine moves this leg into the bridge conference at bridge time.
       const P = vs.verifyPrompts();
       vr.say(P.callerConnect);
+      // The full speakerphone-policy instruction (2026-09-04: the SDK caller
+      // never heard it — only the PSTN-originated caller-hold TwiML included
+      // it, so guarded softphone callers got just "please wait"). The leg is
+      // parked in the pause loop below, so this plays BEFORE the bridge.
+      vr.say(P.callerHold);
       vr.pause({ length: 60 });
       vr.redirect({ method: "POST" }, vs.twimlUrl("caller-wait", guardedSid));
     } else {

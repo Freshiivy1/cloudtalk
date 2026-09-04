@@ -1185,33 +1185,74 @@ describe("speakerphone strike ladder (episodes → warning+mute → supreme flag
 
 describe("speakerphone episode wiring: merge-tone deferral + canary tone silencing (2026-09-04 live regression)", () => {
   it("a hold engagement DURING a speakerphone episode is deferred — no tone armed, zero beeps at the callee", async () => {
+    process.env.VERIFY_HOLD_TONE_ARMING_ENABLED = "true";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_df_caller",
+        legACallSid: "CA_df_legA",
+        legBCallSid: "CA_df_legB",
+      });
+      const sid = s.sessionId;
+      const partBefore = participantUpdates.length;
+      // Relay episode active: the "hold signature" is almost always the relay
+      // room audio bleeding into the held canary's uplink — arming the tone
+      // here is what beeped at the callee for 37s in the live incident.
+      __testSetSpeakerphoneSuspicion(sid, true);
+      handleSecondCallEngaged(sid);
+      await tick(120);
+      expect(vs.isMergeToneArmed(sid)).toBe(false);
+      expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+      // Relay-noise engagements disengage themselves when the relay pauses —
+      // the disengage resolves the deferred marker, so nothing arms at clear.
+      handleSecondCallDisengaged(sid);
+      __testSetSpeakerphoneSuspicion(sid, false);
+      resolveDeferredEngagement(sid);
+      await tick(120);
+      expect(vs.isMergeToneArmed(sid)).toBe(false);
+      expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    } finally {
+      delete process.env.VERIFY_HOLD_TONE_ARMING_ENABLED;
+    }
+  });
+
+  it("merge-tone arming is DISABLED by default (VERIFY_HOLD_TONE_ARMING_ENABLED unset) — engagements are logged, never armed", async () => {
+    delete process.env.VERIFY_HOLD_TONE_ARMING_ENABLED;
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
-      callerCallSid: "CA_df_caller",
-      legACallSid: "CA_df_legA",
-      legBCallSid: "CA_df_legB",
+      callerCallSid: "CA_off_caller",
+      legACallSid: "CA_off_legA",
+      legBCallSid: "CA_off_legB",
     });
     const sid = s.sessionId;
     const partBefore = participantUpdates.length;
-    // Relay episode active: the "hold signature" is almost always the relay
-    // room audio bleeding into the held canary's uplink — arming the tone
-    // here is what beeped at the callee for 37s in the live incident.
-    __testSetSpeakerphoneSuspicion(sid, true);
-    handleSecondCallEngaged(sid);
-    await tick(120);
-    expect(vs.isMergeToneArmed(sid)).toBe(false);
-    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
-    // Relay-noise engagements disengage themselves when the relay pauses —
-    // the disengage resolves the deferred marker, so nothing arms at clear.
-    handleSecondCallDisengaged(sid);
-    __testSetSpeakerphoneSuspicion(sid, false);
-    resolveDeferredEngagement(sid);
-    await tick(120);
-    expect(vs.isMergeToneArmed(sid)).toBe(false);
-    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    // Even with a live stream whose HoldDetector stays engaged, the default
+    // posture never arms: every production arming so far was a false
+    // positive from the handset's two-way held-line leak.
+    const fake = {
+      sid,
+      purpose: "hold-canary",
+      sp: null,
+      hold: { isEngaged: true },
+      merge: null,
+      frames: 0,
+    } as unknown as (typeof activeStreams extends Set<infer T> ? T : never);
+    activeStreams.add(fake);
+    try {
+      handleSecondCallEngaged(sid);
+      await tick(200);
+      resolveDeferredEngagement(sid);
+      await tick(200);
+      expect(vs.isMergeToneArmed(sid)).toBe(false);
+      expect(vs.isSecondCallEngaged(sid)).toBe(false);
+      expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    } finally {
+      activeStreams.delete(fake);
+    }
   });
 
   it("a deferred engagement STILL engaged at episode clear is a genuine hold — the tone arms then", async () => {
+    process.env.VERIFY_HOLD_TONE_ARMING_ENABLED = "true";
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
       callerCallSid: "CA_dg_caller",
@@ -1248,10 +1289,12 @@ describe("speakerphone episode wiring: merge-tone deferral + canary tone silenci
     } finally {
       activeStreams.delete(fake);
       await vs.onSecondCallDisengaged(sid); // disarm + stop the rearm cadence
+      delete process.env.VERIFY_HOLD_TONE_ARMING_ENABLED;
     }
   });
 
   it("a hold engagement in a CLEAN window arms the tone only after persisting through the confirmation delay", async () => {
+    process.env.VERIFY_HOLD_TONE_ARMING_ENABLED = "true";
     process.env.VERIFY_SECOND_CALL_CONFIRM_MS = "500";
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
@@ -1286,11 +1329,13 @@ describe("speakerphone episode wiring: merge-tone deferral + canary tone silenci
     } finally {
       activeStreams.delete(fake);
       await vs.onSecondCallDisengaged(sid); // disarm + stop the rearm cadence
+      delete process.env.VERIFY_HOLD_TONE_ARMING_ENABLED;
       delete process.env.VERIFY_SECOND_CALL_CONFIRM_MS;
     }
   });
 
   it("a 3s false engagement (leaked-audio artifact) NEVER arms the tone — the 2026-09-04 beep-beep-beep regression", async () => {
+    process.env.VERIFY_HOLD_TONE_ARMING_ENABLED = "true";
     process.env.VERIFY_SECOND_CALL_CONFIRM_MS = "800";
     try {
       const s = await makeSession(vs.VState.BRIDGED, {
@@ -1313,6 +1358,7 @@ describe("speakerphone episode wiring: merge-tone deferral + canary tone silenci
         .filter((p) => p.conference === `verify-${sid}`);
       expect(added).toHaveLength(0);
     } finally {
+      delete process.env.VERIFY_HOLD_TONE_ARMING_ENABLED;
       delete process.env.VERIFY_SECOND_CALL_CONFIRM_MS;
     }
   });
@@ -1357,6 +1403,71 @@ describe("speakerphone episode wiring: merge-tone deferral + canary tone silenci
     );
     expect(noises.length).toBeGreaterThan(0);
   });
+});
+
+describe("strike ladder vs merge-tone suppression (2026-09-05 retest regression)", () => {
+  it("an armed merge tone suppresses strike-1/2 noise but NEVER the strike-3 warning or strike-4 supreme", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_sup_caller",
+      legACallSid: "CA_sup_legA",
+      legBCallSid: "CA_sup_legB",
+    });
+    const sid = s.sessionId;
+    // Arm the tone directly (the exact posture of the live incident: a
+    // falsely-armed, fully-effective merge tone riding the episode).
+    await vs.onSecondCallEngaged(sid);
+    expect(vs.isMergeToneEffective(sid)).toBe(true);
+    const partBefore = participantUpdates.length;
+    try {
+      // Episode 1 onset: challenge noise is the ONLY thing suppressed.
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep1", true);
+      await tick(250);
+      let types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("NOISE_SUPPRESSED_MERGE_ACTIVE");
+      expect(
+        participantUpdates
+          .slice(partBefore)
+          .filter((p) => p.conference === `verify-${sid}` && p.announceUrl?.includes("challenge-noise")),
+      ).toHaveLength(0);
+      await vs.onSpeakerphoneCleared(sid, "ep1 cleared"); // strike 1
+      // Episode 2: still noise-suppressed.
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep2", true);
+      await tick(250);
+      await vs.onSpeakerphoneCleared(sid, "ep2 cleared"); // strike 2
+      // Episode 3 onset: the FINAL WARNING must fire despite the armed tone —
+      // the live retest swallowed exactly this behind "beep beep".
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep3", true);
+      await tick(300);
+      types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_WARNING");
+      const warnings = participantUpdates
+        .slice(partBefore)
+        .filter(
+          (p) =>
+            p.conference === `verify-${sid}` &&
+            p.participant === "CA_sup_caller" &&
+            p.announceUrl?.includes("speakerphone-warning"),
+        );
+      expect(warnings.length).toBeGreaterThan(0);
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
+      await vs.onSpeakerphoneCleared(sid, "ep3 cleared"); // strike 3
+      // Episode 4 onset: SUPREME — call ends, still no suppression.
+      handleSpeakerphoneSuspicious(sid, 0.9, "ep4", true);
+      await tick(300);
+      types = (await events(sid)).map((e) => e.eventType);
+      expect(types).toContain("SPEAKERPHONE_SUPREME");
+      expect((await vs.findSession(sid))!.state).toBe(vs.VState.SPEAKERPHONE_TERMINATED);
+      // And at NO point did challenge noise reach the conference.
+      expect(
+        participantUpdates
+          .slice(partBefore)
+          .filter((p) => p.conference === `verify-${sid}` && p.announceUrl?.includes("challenge-noise")),
+      ).toHaveLength(0);
+    } finally {
+      await vs.onSecondCallDisengaged(sid);
+    }
+  }, 20_000);
 });
 
 describe("speakerphoneArmWindows (2-hop forensic arming)", () => {
@@ -2988,7 +3099,7 @@ describe("full flows (mocked Twilio)", () => {
     const res = await postForm("/api/verify/twiml/caller-hold?sid=abc123");
     const body = await res.text();
     expect(body).toContain(
-      "Your call has been accepted. Please hold while we connect your call. For call security, please tell the person receiving your call to keep their phone off speakerphone.",
+      "For call security, please tell the person you are calling to keep their phone off speakerphone.",
     );
     expect(body).toContain("<Conference");
     expect(body).toContain('startConferenceOnEnter="false"');

@@ -745,4 +745,35 @@ describe("SpeakerphoneDetector probe-tone mask (own 852+1336Hz signals are NEUTR
     expect(fires[0].detail).toContain("NO_BASELINE absolute arming");
     expect(d.baselineAbsorptions).toBe(0);
   });
+
+  it("a SHORT 0.5s beep (merge-tone chirp, 2 of 4 sub-windows) is still masked", () => {
+    // v2 sub-window scan: the merge-tone beep is ~0.5s, so a full-window
+    // energy ratio dilutes below threshold — 2 dominated 250ms sub-windows
+    // must suffice (PROBE_SUB_NEED=2).
+    const beep = new Array(8000).fill(0);
+    for (let i = 0; i < 4000; i++) {
+      beep[i] = Math.round(
+        32767 *
+          (0.3 * Math.sin((2 * Math.PI * 852 * i) / 8000) +
+            0.3 * Math.sin((2 * Math.PI * 1336 * i) / 8000)),
+      );
+    }
+    const { d, fires } = setupMask();
+    for (let i = 0; i < 6; i++) d.pushSamples(beep);
+    expect(fires).toHaveLength(0);
+    expect(d.baselineAbsorptions).toBe(0);
+  });
+
+  it("a SINGLE-frequency 852Hz leak (distorted held-line leak lost the 1336Hz pair) is masked via the solo ratio", () => {
+    // The real leak is handset-filtered: one of the pair can survive alone.
+    // PROBE_TONE_SOLO_RATIO catches a lone dominant 852/1336 component.
+    const solo = new Array(8000);
+    for (let i = 0; i < 8000; i++) {
+      solo[i] = Math.round(32767 * 0.4 * Math.sin((2 * Math.PI * 852 * i) / 8000));
+    }
+    const { d, fires } = setupMask();
+    for (let i = 0; i < 6; i++) d.pushSamples(solo);
+    expect(fires).toHaveLength(0);
+    expect(d.baselineAbsorptions).toBe(0);
+  });
 });

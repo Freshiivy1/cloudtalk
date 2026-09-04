@@ -183,14 +183,28 @@ const FORENSIC_LOG_THROTTLE_MS = 5_000;
  */
 const PROBE_TONE_LOW_HZ = 852;
 const PROBE_TONE_HIGH_HZ = 1336;
-const PROBE_TONE_RATIO = 0.05;
+/** Per-sub-window normalized-power threshold for BOTH pair frequencies. */
+const PROBE_TONE_RATIO = 0.04;
+/**
+ * Single-frequency dominance escape hatch: the leak/echo path (handset audio
+ * routing + AGC + μ-law) can heavily attenuate ONE of the pair, so a window
+ * where one frequency holds >15% of a sub-window's power is also treated as
+ * probe-dominated. Speech harmonics spread energy across many bins and
+ * rarely sustain >15% in a single 852/1336 bin across 2+ sub-windows.
+ */
+const PROBE_TONE_SOLO_RATIO = 0.15;
+/** Sub-window length for the mask scan (250 ms — the 0.5 s merge-tone beep
+ *  covers exactly 2 of a 1 s window's 4 sub-windows). */
+const PROBE_SUB_SAMPLES = 2000;
+/** Sub-windows that must be probe-dominated for the whole window to mask. */
+const PROBE_SUB_NEED = 2;
 
-function goertzelPowerLocal(samples: ArrayLike<number>, freq: number): number {
+function goertzelPowerLocal(samples: ArrayLike<number>, freq: number, off: number, len: number): number {
   const w = (2 * Math.PI * freq) / SAMPLE_RATE;
   const cw = 2 * Math.cos(w);
   let s1 = 0;
   let s2 = 0;
-  for (let i = 0; i < samples.length; i++) {
+  for (let i = off; i < off + len; i++) {
     const s0 = samples[i] + cw * s1 - s2;
     s2 = s1;
     s1 = s0;
@@ -198,17 +212,45 @@ function goertzelPowerLocal(samples: ArrayLike<number>, freq: number): number {
   return s1 * s1 + s2 * s2 - cw * s1 * s2;
 }
 
-/** True when the 852+1336 Hz probe pair dominates this (peak-normalized) window. */
-function probeToneDominates(samples: ArrayLike<number>): boolean {
-  let e = 0;
-  for (let i = 0; i < samples.length; i++) e += samples[i] * samples[i];
-  e /= samples.length;
-  if (e < 1e-4) return false; // near-silence: nothing to mask (VAD handles it)
-  const norm = e * samples.length * samples.length;
-  return (
-    goertzelPowerLocal(samples, PROBE_TONE_LOW_HZ) / norm > PROBE_TONE_RATIO &&
-    goertzelPowerLocal(samples, PROBE_TONE_HIGH_HZ) / norm > PROBE_TONE_RATIO
-  );
+export interface ProbeToneMeasurement {
+  masked: boolean;
+  /** Max normalized Goertzel power at 852 / 1336 Hz across sub-windows. */
+  low: number;
+  high: number;
+}
+
+/**
+ * Scan the (peak-normalized) window in 250 ms sub-windows for the system's
+ * own 852+1336 Hz probe signature. A window is masked when ≥PROBE_SUB_NEED
+ * sub-windows are probe-dominated (both ratios > PROBE_TONE_RATIO, or a
+ * single-frequency > PROBE_TONE_SOLO_RATIO). The measured max ratios are
+ * returned for forensic logging — the 2026-09-04 retest showed the raw leak
+ * does NOT always present as a clean dual tone, so production logs must
+ * carry the real numbers for threshold tuning.
+ */
+function measureProbeTone(samples: ArrayLike<number>): ProbeToneMeasurement {
+  let dominated = 0;
+  let low = 0;
+  let high = 0;
+  for (let off = 0; off + PROBE_SUB_SAMPLES <= samples.length; off += PROBE_SUB_SAMPLES) {
+    let e = 0;
+    for (let i = off; i < off + PROBE_SUB_SAMPLES; i++) e += samples[i] * samples[i];
+    e /= PROBE_SUB_SAMPLES;
+    if (e < 1e-4) continue; // silent sub-window: not a probe (VAD handles silence)
+    const norm = e * PROBE_SUB_SAMPLES * PROBE_SUB_SAMPLES;
+    const rl = goertzelPowerLocal(samples, PROBE_TONE_LOW_HZ, off, PROBE_SUB_SAMPLES) / norm;
+    const rh = goertzelPowerLocal(samples, PROBE_TONE_HIGH_HZ, off, PROBE_SUB_SAMPLES) / norm;
+    if (rl > low) low = rl;
+    if (rh > high) high = rh;
+    if (
+      (rl > PROBE_TONE_RATIO && rh > PROBE_TONE_RATIO) ||
+      rl > PROBE_TONE_SOLO_RATIO ||
+      rh > PROBE_TONE_SOLO_RATIO
+    ) {
+      dominated++;
+    }
+  }
+  return { masked: dominated >= PROBE_SUB_NEED, low, high };
 }
 
 export class SpeakerphoneDetector {
@@ -363,12 +405,15 @@ export class SpeakerphoneDetector {
 
     // KNOWN-PROBE-TONE MASK (see the constants above): our own 852+1336 Hz
     // probe signals (canary loud-tone loop leak / merge-tone beep echo) are
-    // NEUTRAL windows — no arming, no clearing, no seeding.
-    if (probeToneDominates(samples)) {
+    // NEUTRAL windows — no arming, no clearing, no seeding. The measured
+    // pair ratios ride along in every forensic line for threshold tuning.
+    const probe = measureProbeTone(samples);
+    if (probe.masked) {
       if (this.bridged && Date.now() - this.lastForensicLogAt >= FORENSIC_LOG_THROTTLE_MS) {
         this.lastForensicLogAt = Date.now();
         console.log(
           `[speakerphone-detector] FORENSIC_WINDOW window=${this.windows} verdict=PROBE_TONE ` +
+            `probe852=${probe.low.toFixed(3)} probe1336=${probe.high.toFixed(3)} ` +
             `masked (own 852+1336Hz probe leak/echo — neutral)`,
         );
       }
@@ -410,6 +455,7 @@ export class SpeakerphoneDetector {
         console.log(
           `[speakerphone-detector] FORENSIC_WINDOW window=${this.windows} verdict=NO_BASELINE ` +
             `relayState=${fp.state} relayScore=${fp.score.toFixed(2)} top=${topFingerprintFeatures(fp)} ` +
+            `probe852=${probe.low.toFixed(3)} probe1336=${probe.high.toFixed(3)} ` +
             `noBaseRedStreak=${this.noBaselineRedStreak} warmup=${this.warmupDone ? "done" : "active"}`,
         );
       }
@@ -514,6 +560,7 @@ export class SpeakerphoneDetector {
         `[speakerphone-detector] FORENSIC_WINDOW window=${this.windows} verdict=${verdict} ` +
           `relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
           `weighted=${result.weightedScore.toFixed(2)} top=${topFingerprintFeatures(fp)} ` +
+          `probe852=${probe.low.toFixed(3)} probe1336=${probe.high.toFixed(3)} ` +
           `streak=${this.streak} warmup=${this.warmupDone ? "done" : "active"}`,
       );
     }
