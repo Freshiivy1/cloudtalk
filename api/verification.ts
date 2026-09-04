@@ -515,18 +515,18 @@ export function verifyPrompts() {
     // returns them here.
     secondCall:
       e.VERIFY_PROMPT_SECOND_CALL ??
-      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. If your phone shows this call on hold, tap it to resume. Press 1 to continue.",
+      "You will receive a second call. Please do not hang up this call. If you have any call on hold, please end that call. When you are ready, press 1.",
     // GUARDED MODE ONLY: the softphone caller hears this after the outbound
     // SDK call connects (parked in the conference while Leg A is verified).
     callerConnect:
       e.VERIFY_PROMPT_CALLER_CONNECT ??
-      "Please wait while we connect your call. You may use speakerphone, but only in a quiet room with no background noise.",
+      "Please wait while we connect your call.",
     ready:
       e.VERIFY_PROMPT_READY ??
-      "Do not end this call. You will receive a second call — please answer it. It will end by itself and return you to this call. If your phone shows this call on hold, tap it to resume. Press 1 to continue.",
+      "You will receive a second call. Please do not hang up this call. If you have any call on hold, please end that call. When you are ready, press 1.",
     callerHold:
       e.VERIFY_PROMPT_CALLER_HOLD ??
-      "Please hold. Your call is being connected. You will hear updates as the line is verified. If you use speakerphone, make sure you are in a quiet room with no background noise, keep the phone close, and speak directly toward it.",
+      "Your call has been accepted. Please hold while we connect your call. For call security, please tell the person receiving your call to keep their phone off speakerphone. If speakerphone is necessary, ask them to use a quiet room and keep the phone close. Other voices or excessive background noise may cause the call to be flagged or ended.",
     // GUARDED MODE ONLY: spoken to Leg A immediately after the second press-1,
     // before the verification/bridge hold loop.
     calleeConnectWait:

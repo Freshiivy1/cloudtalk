@@ -2582,7 +2582,7 @@ describe("full flows (mocked Twilio)", () => {
     const res = await postForm("/api/verify/twiml/caller-hold?sid=abc123");
     const body = await res.text();
     expect(body).toContain(
-      "Please hold. Your call is being connected. You will hear updates as the line is verified.",
+      "Your call has been accepted. Please hold while we connect your call. For call security, please tell the person receiving your call to keep their phone off speakerphone.",
     );
     expect(body).toContain("<Conference");
     expect(body).toContain('startConferenceOnEnter="false"');
@@ -2785,7 +2785,7 @@ describe("guarded single-call flow", () => {
     // voice-id-wait verdict gating, even with an empty/failed recording.
     expect(body).toContain("<Gather");
     expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
-    expect(body).toContain("Press 1 to continue.");
+    expect(body).toContain("When you are ready, press 1.");
     expect(body).not.toContain("/api/verify/twiml/voice-id-wait");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
     // Leg B is still only originated by the second press-1 itself.
