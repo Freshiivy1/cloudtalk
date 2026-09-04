@@ -1130,7 +1130,7 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
         legBCallSid: "CA_lbm_legB",
         streamReadyAt: new Date(Date.now() - 30_000),
         challengeStartedAt: new Date(Date.now() - 30_000),
-        promptLightDurationMs: 18_840,
+        promptLightDurationMs: 21_360,
         promptEndsAt: new Date(Date.now() - 11_000),
         detectionPhase: vs.DetectionPhase.LOUD_DTMF,
       });
@@ -1508,8 +1508,8 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     const s = await makeSession(vs.VState.LEG_B_ANSWERED, {
       legACallSid: "CA_ch_legA",
       challengeStartedAt: started,
-      promptLightDurationMs: 18_840,
-      promptEndsAt: new Date(started.getTime() + 18_840),
+      promptLightDurationMs: 21_360,
+      promptEndsAt: new Date(started.getTime() + 21_360),
       detectionPhase: vs.DetectionPhase.PROMPT_LIGHT,
     });
     const res = await postForm(`/api/verify/twiml/leg-a-challenge?sid=${s.sessionId}`);
@@ -1550,11 +1550,11 @@ describe("guarded live bridge (verification pass → BRIDGED)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("audio/wav");
     expect(res.headers.get("Cache-Control")).toContain("no-store");
-    expect(res.headers.get("X-Prompt-Light-Duration-Ms")).toBe("18840");
+    expect(res.headers.get("X-Prompt-Light-Duration-Ms")).toBe("21360");
     const buf = Buffer.from(await res.arrayBuffer());
     expect(buf.subarray(0, 4).toString("ascii")).toBe("RIFF");
-    // 8 kHz mono PCM16, exactly 18.840s: 150720 frames * 2 bytes + 44 header.
-    expect(buf.length).toBe(44 + 150_720 * 2);
+    // 8 kHz mono PCM16, exactly 21.360s: 170880 frames * 2 bytes + 44 header.
+    expect(buf.length).toBe(44 + 170_880 * 2);
   });
 });
 
@@ -1968,8 +1968,8 @@ describe("webhooks", () => {
       expect(after.streamSid).toBe("MZ_ready_1");
       expect(after.streamReadyAt).not.toBeNull();
       expect(after.challengeStartedAt).not.toBeNull();
-      expect(after.promptLightDurationMs).toBe(18_840);
-      expect(after.promptEndsAt!.getTime()).toBe(after.challengeStartedAt!.getTime() + 18_840);
+      expect(after.promptLightDurationMs).toBe(21_360);
+      expect(after.promptEndsAt!.getTime()).toBe(after.challengeStartedAt!.getTime() + 21_360);
       expect(after.detectionPhase).toBe(vs.DetectionPhase.PROMPT_LIGHT);
 
       // Leg A canary redirected to the challenge TwiML (Phase 1 starts here).
@@ -1982,7 +1982,7 @@ describe("webhooks", () => {
       const cs = relayPosts.find((r) => r.url === "https://relay.example.com/challenge-start");
       expect(cs).toBeTruthy();
       expect(cs!.body.sid).toBe(s.sessionId);
-      expect(cs!.body.promptLightDurationMs).toBe(18_840);
+      expect(cs!.body.promptLightDurationMs).toBe(21_360);
       expect(typeof cs!.body.challengeStartedAt).toBe("number");
       expect(typeof cs!.body.promptEndsAt).toBe("number");
       expect(cs!.body.challengeStartedAt).toBe(after.challengeStartedAt!.getTime());
@@ -3718,7 +3718,7 @@ describe("bridge supervisor", () => {
         streamSid: "MZ_old_stream",
         streamReadyAt: new Date(Date.now() - 60_000),
         challengeStartedAt: new Date(Date.now() - 60_000),
-        promptLightDurationMs: 18_840,
+        promptLightDurationMs: 21_360,
         promptEndsAt: new Date(Date.now() - 41_000),
         detectionPhase: vs.DetectionPhase.LOUD_DTMF,
       });
@@ -3754,7 +3754,7 @@ describe("bridge supervisor", () => {
       expect(cur.streamSid).toBe("MZ_new_stream");
       expect(cur.streamReadyAt).not.toBeNull();
       expect(cur.challengeStartedAt!.getTime()).toBeGreaterThan(Date.now() - 10_000);
-      expect(cur.promptEndsAt!.getTime()).toBe(cur.challengeStartedAt!.getTime() + 18_840);
+      expect(cur.promptEndsAt!.getTime()).toBe(cur.challengeStartedAt!.getTime() + 21_360);
       expect(cur.detectionPhase).toBe(vs.DetectionPhase.PROMPT_LIGHT);
       expect(
         updatedCalls
