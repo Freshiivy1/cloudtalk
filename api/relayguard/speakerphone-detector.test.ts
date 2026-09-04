@@ -314,21 +314,27 @@ describe("SpeakerphoneDetector calibration warm-up", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const d = new SpeakerphoneDetector({ warmupMs: 0 });
     dsp.suspicious = false;
-    d.pushSamples(WINDOW); // baseline seed
+    d.pushSamples(WINDOW); // pre-bridge baseline seed (the bridge RESETS it)
     d.setBridged(true);
-    d.pushSamples(WINDOW); // first bridged window → logs immediately
-    d.pushSamples(WINDOW); // inside the 5s throttle → no second line
+    // First bridged window: no baseline yet → NO_BASELINE forensic line, then
+    // the GREEN window seeds the fresh baseline (fingerprint-gated seeding).
+    d.pushSamples(WINDOW);
     let lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("FORENSIC_WINDOW"));
     expect(lines).toHaveLength(1);
-    const line = String(lines[0][0]);
+    expect(String(lines[0][0])).toContain("verdict=NO_BASELINE");
+    expect(String(lines[0][0])).toContain("relayState=GREEN");
+    d.pushSamples(WINDOW); // inside the 5s throttle → no second line
+    lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("FORENSIC_WINDOW"));
+    expect(lines).toHaveLength(1);
+    now += 6_000; // past the throttle
+    d.pushSamples(WINDOW); // baseline now exists → relative verdict line
+    lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("FORENSIC_WINDOW"));
+    expect(lines).toHaveLength(2);
+    const line = String(lines[1][0]);
     expect(line).toContain("verdict=MATCH");
     expect(line).toContain("relayState=GREEN");
     expect(line).toContain("relayScore=0.10");
     expect(line).toContain("top=flatness="); // top contributing features
-    now += 6_000; // past the throttle
-    d.pushSamples(WINDOW);
-    lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("FORENSIC_WINDOW"));
-    expect(lines).toHaveLength(2);
     logSpy.mockRestore();
   });
 });
@@ -538,5 +544,129 @@ describe("SpeakerphoneDetector baseline-adaptation guard (live 'fires 3-4 times 
     dsp.suspicious = false;
     d.pushSamples(WINDOW); // one clean window clears under the legacy setting
     expect(cleans).toHaveLength(1);
+  });
+});
+
+describe("SpeakerphoneDetector NO_BASELINE absolute arming (relay-from-bridge regression)", () => {
+  /**
+   * 2026-09-04 live incident: relay audio playing FROM THE BRIDGE seeded the
+   * rolling baseline, so every relay window compared MATCH against it and
+   * the detector stayed silent forever. The fix: (1) only GREEN-fingerprint
+   * windows may seed the baseline, and (2) while no baseline exists, `need`
+   * consecutive RED absolute-fingerprint hops arm WITHOUT a relative verdict
+   * (direct speech measures 0.27-0.45 — never RED ≥0.6).
+   */
+  function setupNoBaseline(extra: Record<string, unknown> = {}) {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    const cleans: string[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 2,
+      refireMs: 9_000,
+      bridged: true,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+      onClean: (detail) => cleans.push(detail),
+      ...extra,
+    });
+    const push = (suspicious: boolean, amberOnly = false) => {
+      dsp.suspicious = suspicious;
+      dsp.amberOnly = amberOnly;
+      dsp.matchAmber = false;
+      d.pushSamples(WINDOW);
+    };
+    return { d, fires, cleans, push };
+  }
+
+  it("RED audio NEVER seeds the baseline — the relay can never become the reference", () => {
+    const { d, push } = setupNoBaseline();
+    push(true);
+    push(true);
+    push(true);
+    expect(d.baselineAbsorptions).toBe(0);
+  });
+
+  it("arms via the ABSOLUTE fingerprint after `need` consecutive RED hops with no baseline", () => {
+    const { fires, push } = setupNoBaseline();
+    dsp.matchAmber = false;
+    push(true); // RED hop 1 — below the arming bar
+    expect(fires).toHaveLength(0);
+    push(true); // RED hop 2 → NO_BASELINE absolute arming
+    expect(fires).toHaveLength(1);
+    expect(fires[0].score).toBeCloseTo(0.9);
+    expect(fires[0].detail).toContain("NO_BASELINE absolute arming");
+    expect(fires[0].detail).toContain("baseline never seeded");
+  });
+
+  it("AMBER hops NEVER arm the no-baseline path (direct speech lives in AMBER)", () => {
+    const { fires, push } = setupNoBaseline();
+    push(true, true); // AMBER 0.5
+    push(true, true);
+    push(true, true);
+    push(true, true);
+    expect(fires).toHaveLength(0);
+  });
+
+  it("borderline AMBER dips between RED hops neither advance nor reset the arming streak", () => {
+    // Sustained relay audio oscillates RED↔AMBER (≈0.55–0.6) on 1s hops — a
+    // hard reset on AMBER would let the relay ride just under RED forever.
+    const { fires, push } = setupNoBaseline();
+    push(true); // RED — streak 1
+    push(true, true); // AMBER dip — streak UNTOUCHED
+    push(true, true); // AMBER dip — still untouched
+    expect(fires).toHaveLength(0);
+    push(true); // RED — streak 2 → arm
+    expect(fires).toHaveLength(1);
+    expect(fires[0].detail).toContain("NO_BASELINE absolute arming");
+  });
+
+  it("a NO_BASELINE episode keeps refiring on sustained RED hops (challenge noise stays continuous)", () => {
+    const { fires, push } = setupNoBaseline();
+    push(true);
+    push(true); // armed
+    expect(fires).toHaveLength(1);
+    now += 9_000; // past the refire interval
+    push(true); // still RED mid-episode → sustained refire
+    expect(fires).toHaveLength(2);
+    expect(fires[1].detail).toContain("NO_BASELINE sustained");
+    now += 9_000;
+    push(true, true); // AMBER mid-episode — no refire (RED-only), no clear
+    expect(fires).toHaveLength(2);
+  });
+
+  it("a NO_BASELINE episode clears on the fingerprint-clean streak, then the next GREEN window seeds the baseline", () => {
+    const { d, fires, cleans, push } = setupNoBaseline();
+    push(true);
+    push(true); // armed
+    expect(fires).toHaveLength(1);
+    expect(d.isSuspecting).toBe(true);
+    push(false); // clean 1 of 2 — no seeding mid-episode
+    expect(d.baselineAbsorptions).toBe(0);
+    expect(cleans).toHaveLength(0);
+    push(false); // clean 2 of 2 → episode clears
+    expect(cleans).toHaveLength(1);
+    expect(cleans[0]).toContain("NO_BASELINE episode");
+    expect(d.isSuspecting).toBe(false);
+    expect(d.baselineAbsorptions).toBe(0); // clearing windows never seed
+    push(false); // first post-clear GREEN window → baseline finally seeds
+    expect(d.baselineAbsorptions).toBe(1);
+  });
+
+  it("a mid-episode AMBER dip does NOT clear a NO_BASELINE episode (score >= clean ceiling)", () => {
+    const { fires, cleans, push } = setupNoBaseline();
+    push(true);
+    push(true); // armed
+    expect(fires).toHaveLength(1);
+    push(true, true); // AMBER 0.5 — at the clean ceiling, not below it
+    expect(cleans).toHaveLength(0);
+    push(true, true); // AMBER again — clean streak still 0
+    expect(cleans).toHaveLength(0);
+  });
+
+  it("D2: pre-bridge RED hops never accumulate the no-baseline streak — arming waits for the bridge", () => {
+    const { fires, push } = setupNoBaseline({ bridged: false, armOnlyWhenBridged: true });
+    push(true);
+    push(true);
+    push(true); // 3 RED hops while NOT bridged — must never arm
+    expect(fires).toHaveLength(0);
   });
 });

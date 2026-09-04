@@ -775,8 +775,15 @@ describe("BRIDGED in-call merge detection (continuous armed tone)", () => {
     // The Leg A (callee) participant gets NOTHING — its announce channel is
     // reserved for the in-call merge system.
     expect(added.some((p) => p.participant === "CA_bb_legA")).toBe(false);
-    // No hangup/redirect of any leg — the call continues.
-    expect(updatedCalls.slice(updBefore)).toHaveLength(0);
+    // No hangup of any leg — the call continues. The ONLY redirect is the
+    // canary loud-tone silencing on Leg A (leg-a-hold keeps the leg ALIVE —
+    // a silent pause loop, not a hangup) so its acoustic leak cannot
+    // false-fire the relay's loud-tone listener.
+    const upds = updatedCalls.slice(updBefore);
+    expect(upds.every((u) => u.status !== "completed")).toBe(true);
+    expect(upds).toHaveLength(1);
+    expect(upds[0].sid).toBe("CA_bb_legA");
+    expect(upds[0].url).toContain("leg-a-hold");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.BRIDGED);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).toContain("SPEAKERPHONE_SUSPECTED");
@@ -1173,6 +1180,116 @@ describe("speakerphone strike ladder (episodes → warning+mute → supreme flag
       delete process.env.VERIFY_MERGE_TONE_REARM_MS;
       if (engagedSid) vs.disarmMergeTone(engagedSid);
     }
+  });
+});
+
+describe("speakerphone episode wiring: merge-tone deferral + canary tone silencing (2026-09-04 live regression)", () => {
+  it("a hold engagement DURING a speakerphone episode is deferred — no tone armed, zero beeps at the callee", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_df_caller",
+      legACallSid: "CA_df_legA",
+      legBCallSid: "CA_df_legB",
+    });
+    const sid = s.sessionId;
+    const partBefore = participantUpdates.length;
+    // Relay episode active: the "hold signature" is almost always the relay
+    // room audio bleeding into the held canary's uplink — arming the tone
+    // here is what beeped at the callee for 37s in the live incident.
+    __testSetSpeakerphoneSuspicion(sid, true);
+    handleSecondCallEngaged(sid);
+    await tick(120);
+    expect(vs.isMergeToneArmed(sid)).toBe(false);
+    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    // Relay-noise engagements disengage themselves when the relay pauses —
+    // the disengage resolves the deferred marker, so nothing arms at clear.
+    handleSecondCallDisengaged(sid);
+    __testSetSpeakerphoneSuspicion(sid, false);
+    resolveDeferredEngagement(sid);
+    await tick(120);
+    expect(vs.isMergeToneArmed(sid)).toBe(false);
+    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+  });
+
+  it("a deferred engagement STILL engaged at episode clear is a genuine hold — the tone arms then", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_dg_caller",
+      legACallSid: "CA_dg_legA",
+      legBCallSid: "CA_dg_legB",
+    });
+    const sid = s.sessionId;
+    const partBefore = participantUpdates.length;
+    __testSetSpeakerphoneSuspicion(sid, true);
+    handleSecondCallEngaged(sid);
+    await tick(120);
+    expect(vs.isMergeToneArmed(sid)).toBe(false);
+    // Live stream whose HoldDetector is STILL engaged when the episode ends.
+    const fake = {
+      sid,
+      purpose: "hold-canary",
+      sp: null,
+      hold: { isEngaged: true },
+      merge: null,
+      frames: 0,
+    } as unknown as (typeof activeStreams extends Set<infer T> ? T : never);
+    activeStreams.add(fake);
+    try {
+      __testSetSpeakerphoneSuspicion(sid, false);
+      resolveDeferredEngagement(sid);
+      await tick(150);
+      expect(vs.isMergeToneArmed(sid)).toBe(true);
+      const added = participantUpdates
+        .slice(partBefore)
+        .filter((p) => p.conference === `verify-${sid}`);
+      expect(added.length).toBeGreaterThan(0);
+      expect(added.every((p) => p.participant === "CA_dg_legB")).toBe(true);
+      expect(added.every((p) => p.announceUrl?.includes("/api/verify/merge-tone.wav"))).toBe(true);
+    } finally {
+      activeStreams.delete(fake);
+      await vs.onSecondCallDisengaged(sid); // disarm + stop the rearm cadence
+    }
+  });
+
+  it("silenceCanaryLoudTone redirects Leg A to leg-a-hold exactly once (idempotent) and logs CANARY_TONE_SILENCED", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_cs_caller",
+      legACallSid: "CA_cs_legA",
+      legBCallSid: "CA_cs_legB",
+    });
+    const sid = s.sessionId;
+    const updBefore = updatedCalls.length;
+    await vs.silenceCanaryLoudTone(sid);
+    const redirects = updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_cs_legA");
+    expect(redirects).toHaveLength(1);
+    expect(redirects[0].url).toContain("leg-a-hold");
+    expect((await events(sid)).map((e) => e.eventType)).toContain("CANARY_TONE_SILENCED");
+    // Idempotent — a later refire / stream-ready restart must not redirect again.
+    await vs.silenceCanaryLoudTone(sid);
+    expect(updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_cs_legA")).toHaveLength(1);
+  });
+
+  it("handleSpeakerphoneSuspicious silences the canary loud tone on episode ONSET (before suppression/challenge routing)", async () => {
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_co_caller",
+      legACallSid: "CA_co_legA",
+      legBCallSid: "CA_co_legB",
+    });
+    const sid = s.sessionId;
+    const updBefore = updatedCalls.length;
+    handleSpeakerphoneSuspicious(sid, 0.9, "onset", true);
+    await tick(250);
+    const redirects = updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_co_legA");
+    expect(redirects).toHaveLength(1);
+    expect(redirects[0].url).toContain("leg-a-hold");
+    expect((await events(sid)).map((e) => e.eventType)).toContain("CANARY_TONE_SILENCED");
+    // The challenge noise still lands on the caller (strike-1 path unchanged).
+    const noises = participantUpdates.filter(
+      (p) => p.conference === `verify-${sid}` && p.announceUrl?.includes("challenge-noise"),
+    );
+    expect(noises.length).toBeGreaterThan(0);
   });
 });
 
@@ -1810,13 +1927,17 @@ import {
   verificationRecordingHandler,
 } from "./verification-record";
 import {
+  __testSetSpeakerphoneSuspicion,
   activeStreams,
   attachVerificationStreamServer,
   authenticateStreamStart,
   handleMergeToneFire,
+  handleSecondCallDisengaged,
+  handleSecondCallEngaged,
   handleSpeakerphoneSuspicious,
   inProcessStreamUrl,
   isSpeakerphoneSuspecting,
+  resolveDeferredEngagement,
   verificationStreamDetectedHandler,
   verificationStreamFailedHandler,
   verificationStreamReadyHandler,

@@ -316,6 +316,18 @@ const speakerphoneWarningActiveAt = new Map<string, number>();
 const speakerphoneSupremeSessions = new Set<string>();
 const speakerphoneMuteTimers = new Map<string, NodeJS.Timeout>();
 const speakerphoneGraceTimers = new Map<string, NodeJS.Timeout>();
+/**
+ * Sessions whose canary (Leg A) loud-tone loop has been PERMANENTLY silenced
+ * after a speakerphone episode onset. The loud 852+1336 Hz loop is the
+ * pre-bridge/early-bridge merge canary — but while a relay episode is active
+ * its acoustic leak into the speakerphone mic path can cross the relay's
+ * loud-tone floor and false-fire MERGE_DETECTED (the 2026-09-04 live test:
+ * call killed mid-relay-episode with the wrong reason). Once silenced the
+ * tone never resumes for the session; in-call merge supervision continues
+ * via the HoldDetector + merge-tone beep path. Cleared by
+ * cleanupSessionMaps() on terminal states.
+ */
+const canarySilencedSessions = new Set<string>();
 
 /**
  * Per-session wall-clock of the last SPEAKERPHONE_SUSPECTED event WRITE.
@@ -525,6 +537,7 @@ function cleanupSessionMaps(sessionId: string): void {
   const gt = speakerphoneGraceTimers.get(sessionId);
   if (gt) clearTimeout(gt);
   speakerphoneGraceTimers.delete(sessionId);
+  canarySilencedSessions.delete(sessionId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2298,8 +2311,10 @@ export async function onStreamReady(
 
   // 1) Start the canary challenge on Leg A. The redirect MUST succeed before
   //    we record the challenge as started — otherwise the relay would count
-  //    Phase 1 against a prompt that was never played.
-  if (session.legACallSid) {
+  //    Phase 1 against a prompt that was never played. A SILENCED canary (a
+  //    speakerphone episode already owned this session) is never restarted —
+  //    the relay restart just re-gates readiness without the tone.
+  if (session.legACallSid && !canarySilencedSessions.has(sessionId)) {
     const ok = await redirectCall(session.legACallSid, "leg-a-challenge", sessionId);
     if (!ok) {
       await logEvent(
@@ -3513,6 +3528,50 @@ export async function injectChallengeNoise(
     }
   } catch (err) {
     console.error(`[verify] injectChallengeNoise failed session=${sessionId}:`, err);
+  }
+}
+
+/**
+ * Permanently silence the canary (Leg A) loud-tone loop for this session by
+ * redirecting the held canary leg to the silent self-refreshing `leg-a-hold`
+ * TwiML. Triggered on the FIRST speakerphone episode onset: while relay audio
+ * is present, the loud 852+1336 Hz loop's acoustic leak through the
+ * speakerphone mic path can cross the relay's loud-tone energy floor and
+ * false-fire MERGE_DETECTED (the 2026-09-04 live test — call killed
+ * mid-episode with the wrong reason). The leg stays alive (HoldDetector keeps
+ * watching its uplink); only the tone stops. Once silenced, a later
+ * onStreamReady challenge restart is suppressed (see the gate there), so the
+ * tone can never resume mid-session. Idempotent; best-effort.
+ */
+export async function silenceCanaryLoudTone(sessionId: string): Promise<void> {
+  if (canarySilencedSessions.has(sessionId)) return;
+  canarySilencedSessions.add(sessionId);
+  try {
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session) || session.state !== VState.BRIDGED) {
+      canarySilencedSessions.delete(sessionId);
+      return;
+    }
+    if (!session.legACallSid) {
+      canarySilencedSessions.delete(sessionId);
+      return;
+    }
+    const ok = await redirectCall(session.legACallSid, "leg-a-hold", sessionId);
+    if (!ok) {
+      canarySilencedSessions.delete(sessionId); // allow retry on the next onset
+      return;
+    }
+    console.log(
+      `[verify] CANARY_TONE_SILENCED session=${sessionId} legA=${session.legACallSid} — loud tone loop stopped (speakerphone episode owns the session)`,
+    );
+    await logEvent(
+      sessionId,
+      "CANARY_TONE_SILENCED",
+      "speakerphone episode onset — canary loud 852+1336Hz loop permanently silenced so its acoustic leak cannot false-fire the relay loud-tone listener; in-call merge supervision continues via the HoldDetector + merge-tone beep path",
+    );
+  } catch (err) {
+    canarySilencedSessions.delete(sessionId);
+    console.error(`[verify] silenceCanaryLoudTone failed session=${sessionId}:`, err);
   }
 }
 

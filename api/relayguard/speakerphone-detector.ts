@@ -174,6 +174,14 @@ export class SpeakerphoneDetector {
   private baseline: ClipProfile | null = null;
   private streak = 0;
   private cleanStreak = 0;
+  /**
+   * No-baseline absolute-arming streak: consecutive hops with a RED absolute
+   * relay fingerprint while NO baseline exists (the relay-from-bridge case —
+   * every window so far was too relay-like to seed a reference). Direct-call
+   * speech measures 0.27–0.45 (never RED ≥0.6), so a RED-only streak is a
+   * safe absolute arming signal when no relative verdict is available.
+   */
+  private noBaselineRedStreak = 0;
   private windows = 0;
   private lastFiredAt = 0;
   private suspecting = false;
@@ -221,6 +229,7 @@ export class SpeakerphoneDetector {
     this.baseline = null;
     this.streak = 0;
     this.cleanStreak = 0;
+    this.noBaselineRedStreak = 0;
     this.suspecting = false;
     if (!this.warmupDone) {
       console.log(
@@ -303,17 +312,127 @@ export class SpeakerphoneDetector {
 
     const profile = analyzeClip(samples, SAMPLE_RATE);
 
-    // No baseline yet: seed the rolling baseline from the first window with a
-    // real turn-exchange (≥2 VAD bursts). A single-burst window (one fluent
-    // sentence, a beep, ringback) is not representative enough to anchor every
-    // subsequent comparison — the end-to-end simulation showed a 1-burst seed
-    // window flips relay verdicts to UNCERTAIN. Windows without ≥2 bursts are
-    // scored-and-skipped (fail-safe: no baseline, no arming).
+    // NO-BASELINE PATH — the reference has not been seeded (fresh detector, or
+    // reset at bridge and not yet re-seeded). Three fingerprint-gated rules:
+    //
+    //  1. SEEDING: only a fingerprint-GREEN window with a real turn-exchange
+    //     (≥2 VAD bursts) may become the reference. A single-burst window (one
+    //     fluent sentence, a beep, ringback) is not representative enough to
+    //     anchor every subsequent comparison (the end-to-end simulation showed
+    //     a 1-burst seed flips relay verdicts to UNCERTAIN), and a
+    //     relay-contaminated window must NEVER seed — otherwise every later
+    //     relay window compares MATCH against it and the detector goes
+    //     fail-safe silent forever (the 2026-09-04 live incident: relay audio
+    //     playing FROM BRIDGE seeded the baseline; zero detections, and the
+    //     false HoldDetector engagement + canary-tone leak killed the call
+    //     with the wrong reason instead).
+    //
+    //  2. ABSOLUTE ARMING FALLBACK (relay-from-bridge): while no GREEN window
+    //     has seeded a baseline, a RED absolute fingerprint on `need` hops
+    //     (BRIDGED, post-warm-up) arms WITHOUT a relative verdict. Borderline
+    //     AMBER dips between RED hops neither advance nor reset the streak
+    //     (sustained relay oscillates RED↔AMBER); only GREEN hops reset it.
+    //     Direct-call speech measures 0.27–0.45 — never RED (≥0.6) — so a
+    //     RED-only streak cannot false-arm on normal audio.
+    //
+    //  3. NO-BASELINE CLEARING: an episode armed via rule 2 clears on the
+    //     same fingerprint-clean streak as the baseline path. No seeding
+    //     mid-episode (same freeze rule as the baseline path).
     if (!this.baseline) {
-      if (profile.vad.speechFrames.length > 0 && profile.vad.burstCount >= 2) {
+      const fp = relayFingerprint(profile);
+      if (this.bridged && Date.now() - this.lastForensicLogAt >= FORENSIC_LOG_THROTTLE_MS) {
+        this.lastForensicLogAt = Date.now();
+        console.log(
+          `[speakerphone-detector] FORENSIC_WINDOW window=${this.windows} verdict=NO_BASELINE ` +
+            `relayState=${fp.state} relayScore=${fp.score.toFixed(2)} top=${topFingerprintFeatures(fp)} ` +
+            `noBaseRedStreak=${this.noBaselineRedStreak} warmup=${this.warmupDone ? "done" : "active"}`,
+        );
+      }
+      // Calibration warm-up: same contract as the baseline path — score
+      // internally, never arm, complete (and log) exactly once.
+      if (this.bridged && !this.warmupDone) {
+        this.warmupWindows++;
+        if (Date.now() - this.bridgedAt < this.warmup) return;
+        this.warmupDone = true;
+        console.log(
+          `[speakerphone-detector] FORENSICS_WARMUP_COMPLETE elapsed=${Date.now() - this.bridgedAt}ms ` +
+            `windows=${this.warmupWindows} — no GREEN baseline yet; absolute arming live`,
+        );
+        this.onWarmupComplete?.(
+          `elapsed=${Date.now() - this.bridgedAt}ms windows=${this.warmupWindows} — no baseline (fingerprint-gated), absolute arming live`,
+        );
+      }
+      // Active no-baseline episode: refire on sustained RED hops (same
+      // sustained-masking contract as the baseline path — the challenge
+      // noise must keep looping for the whole episode), clear only on the
+      // fingerprint-clean streak.
+      if (this.suspecting) {
+        if (fp.score < CLEAN_SCORE_CEILING) {
+          this.cleanStreak++;
+          if (this.cleanStreak >= this.cleanNeed) {
+            this.suspecting = false;
+            this.streak = 0;
+            this.cleanStreak = 0;
+            this.noBaselineRedStreak = 0;
+            this.onClean?.(
+              `NO_BASELINE episode — relayState=${fp.state} relayScore=${fp.score.toFixed(2)} — ` +
+                `${this.cleanNeed} consecutive fingerprint-clean windows (relayScore < ${CLEAN_SCORE_CEILING})`,
+            );
+          }
+        } else {
+          this.cleanStreak = 0;
+          if (fp.state === "RED" && Date.now() - this.lastFiredAt >= this.refire) {
+            this.lastFiredAt = Date.now();
+            this.onSuspicious?.(
+              fp.score,
+              `NO_BASELINE sustained — relayScore=${fp.score.toFixed(2)} still RED mid-episode ` +
+                `top=${topFingerprintFeatures(fp)}`,
+            );
+          }
+        }
+        return;
+      }
+      // Seeding (allowed pre-bridge too — the bridge transition resets the
+      // baseline anyway; the GREEN gate is the contamination protection).
+      if (
+        fp.state === "GREEN" &&
+        profile.vad.speechFrames.length > 0 &&
+        profile.vad.burstCount >= 2
+      ) {
         this.baseline = profile;
         this.baselineAbsorbs++;
+        this.noBaselineRedStreak = 0;
+        return;
       }
+      // D2: arming may only accumulate while BRIDGED.
+      if (this.armOnlyWhenBridged && !this.bridged) {
+        this.noBaselineRedStreak = 0;
+        return;
+      }
+      if (fp.state === "RED") {
+        this.noBaselineRedStreak++;
+        if (
+          this.noBaselineRedStreak >= this.need &&
+          Date.now() - this.lastFiredAt >= this.refire
+        ) {
+          this.lastFiredAt = Date.now();
+          this.suspecting = true;
+          this.onSuspicious?.(
+            fp.score,
+            `NO_BASELINE absolute arming — relayScore=${fp.score.toFixed(2)} RED for ` +
+              `${this.noBaselineRedStreak} hops (baseline never seeded: relay present ` +
+              `from bridge) top=${topFingerprintFeatures(fp)}`,
+          );
+        }
+      } else if (fp.state === "GREEN") {
+        this.noBaselineRedStreak = 0;
+      }
+      // AMBER hops are BORDERLINE (mirrors the clean-streak rule): they
+      // neither advance nor reset the RED streak — sustained relay audio
+      // oscillates between RED and AMBER (≈0.55–0.6) on 1s hops, and a hard
+      // reset would let the relay ride just under RED forever. Direct-call
+      // speech measures 0.27–0.45 and NEVER reaches RED, so tolerance of
+      // AMBER dips cannot false-arm on normal audio.
       return;
     }
 

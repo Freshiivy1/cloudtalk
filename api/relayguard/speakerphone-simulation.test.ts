@@ -351,11 +351,56 @@ describe("speakerphone-relay simulation (real DSP, known audio)", () => {
     expect(emissions).toHaveLength(0);
   });
 
-  // KNOWN LIMITATION (documented, fail-safe): if the callee is ALREADY
-  // relaying when the bridge lands, the rolling baseline seeds from relayed
-  // audio and the relative verdict can never go SUSPICIOUS — the detector
-  // stays silent rather than false-arming. Merges are still guarded by the
-  // two-phase canary challenge (prompt fingerprint + loud tone) on Leg A.
-  // The user's scenario — relay STARTING mid-call — is covered above.
+  it("SCENARIO: relay ALREADY playing at bridge → NO_BASELINE absolute arming fires, episode clears on real normal audio, baseline seeds after", () => {
+    // 2026-09-04 live incident regression: the relay was running when the
+    // bridge landed, so the rolling baseline seeded from relayed audio and
+    // every later relay window compared MATCH — the detector stayed silent
+    // forever. The fix: GREEN-fingerprint-gated seeding (relay audio can
+    // never become the reference) + absolute arming on `need` consecutive
+    // RED hops while no baseline exists.
+    const RELAY_S = 6;
+    const NORMAL_TAIL_S = 10;
+    const { d, emissions, clears } = simulate([
+      { label: "relay-from-bridge", pcm: callerRelay.subarray(0, RELAY_S * SR) },
+      { label: "normal", pcm: calleeDirect.subarray(0, NORMAL_TAIL_S * SR) },
+    ]);
+
+    // 1) The relay audio must NEVER have seeded the baseline before arming:
+    //    the first emission carries the NO_BASELINE absolute-arming marker.
+    expect(emissions.length).toBeGreaterThan(0);
+    const first = emissions[0];
+    console.log(
+      `NO_BASELINE PICKUP: first emission t=${first.atMs}ms score=${first.score.toFixed(2)} — ${first.detail}`,
+    );
+    expect(first.detail).toContain("NO_BASELINE absolute arming");
+    // Warm-up is 2 s; the fixture's opening seconds score borderline AMBER
+    // (they neither advance nor reset the RED streak), then 2 RED hops arm —
+    // measured at ≈5.5 s from the bridge (≈3 s after warm-up ends).
+    expect(first.atMs).toBeGreaterThanOrEqual(2_000);
+    expect(first.atMs).toBeLessThanOrEqual(6_500);
+
+    // 2) Zero clears while the relay keeps playing.
+    const relayEndMs = RELAY_S * 1_000;
+    expect(clears.filter((c) => c.atMs < relayEndMs)).toHaveLength(0);
+
+    // 3) When normal audio resumes, the episode clears exactly once on the
+    //    6-hop fingerprint-clean streak (~3 s of confirmed-normal audio).
+    expect(clears).toHaveLength(1);
+    const clear = clears[0];
+    console.log(
+      `NO_BASELINE CLEAR: normal resumed t=${relayEndMs}ms, cleared t=${clear.atMs}ms ` +
+        `(+${clear.atMs - relayEndMs}ms) — ${clear.detail}`,
+    );
+    expect(clear.detail).toContain("NO_BASELINE episode");
+    expect(clear.atMs - relayEndMs).toBeGreaterThanOrEqual(2_000);
+    expect(clear.atMs - relayEndMs).toBeLessThanOrEqual(8_000);
+
+    // 4) After the clear, a GREEN direct window finally seeds the baseline —
+    //    the detector transitions from absolute to relative supervision.
+    expect(d.baselineAbsorptions).toBeGreaterThan(0);
+
+    // 5) No more emissions after the clear.
+    expect(emissions.filter((e) => e.atMs > clear.atMs)).toHaveLength(0);
+  });
 
 });
