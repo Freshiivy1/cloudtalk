@@ -160,6 +160,57 @@ export interface SpeakerphoneDetectorOptions {
 /** Min wall-clock ms between throttled per-window forensic score logs. */
 const FORENSIC_LOG_THROTTLE_MS = 5_000;
 
+/**
+ * KNOWN-PROBE-TONE MASK — the system's own probe signals are the 852+1336 Hz
+ * (DTMF-8) dual tone: the canary's loud challenge loop on Leg A AND the
+ * in-call merge-tone beep bursts announced to Leg B. Both leak/echo into Leg
+ * B's inbound mic path (the 2026-09-04 retest: the canary tone's held-call
+ * leak scored RED 0.68 from the moment the bridge landed and fired a false
+ * episode 6 s in; once the merge tone armed, each 0.5 s beep's acoustic echo
+ * sustained RED hops for the rest of the call — the user heard constant
+ * beeping while "speakerphone" episodes fired with no speakerphone present).
+ * A window DOMINATED by the probe pair is system-generated, not speakerphone
+ * audio, so it is NEUTRAL: no arming streak, no clean streak, no baseline
+ * seed/absorb — the detector waits for a window it can actually judge.
+ *
+ * Discriminator: normalized Goertzel power p/(E·N²) at BOTH pair frequencies
+ * (same scaling as MergeToneDetector — a clean dual tone scores ≈0.25 per
+ * frequency, noise ≈1/N). Speech is broadband and never sustains >5% of
+ * total energy at both 852 and 1336 Hz across a full 1 s window, while a
+ * speakerphone relay bed is noise-like, not a coherent dual tone — so the
+ * mask cannot blind the detector to genuine relay audio. A real mid-call
+ * 3-way merge still trips merge-relay's loud-tone listener (its own job).
+ */
+const PROBE_TONE_LOW_HZ = 852;
+const PROBE_TONE_HIGH_HZ = 1336;
+const PROBE_TONE_RATIO = 0.05;
+
+function goertzelPowerLocal(samples: ArrayLike<number>, freq: number): number {
+  const w = (2 * Math.PI * freq) / SAMPLE_RATE;
+  const cw = 2 * Math.cos(w);
+  let s1 = 0;
+  let s2 = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const s0 = samples[i] + cw * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return s1 * s1 + s2 * s2 - cw * s1 * s2;
+}
+
+/** True when the 852+1336 Hz probe pair dominates this (peak-normalized) window. */
+function probeToneDominates(samples: ArrayLike<number>): boolean {
+  let e = 0;
+  for (let i = 0; i < samples.length; i++) e += samples[i] * samples[i];
+  e /= samples.length;
+  if (e < 1e-4) return false; // near-silence: nothing to mask (VAD handles it)
+  const norm = e * samples.length * samples.length;
+  return (
+    goertzelPowerLocal(samples, PROBE_TONE_LOW_HZ) / norm > PROBE_TONE_RATIO &&
+    goertzelPowerLocal(samples, PROBE_TONE_HIGH_HZ) / norm > PROBE_TONE_RATIO
+  );
+}
+
 export class SpeakerphoneDetector {
   private readonly win: number;
   private readonly hop: number;
@@ -309,6 +360,20 @@ export class SpeakerphoneDetector {
     const scale = peak > 0 ? 0.9 / peak : 1;
     const samples = new Float32Array(window.length);
     for (let i = 0; i < window.length; i++) samples[i] = window[i] * scale;
+
+    // KNOWN-PROBE-TONE MASK (see the constants above): our own 852+1336 Hz
+    // probe signals (canary loud-tone loop leak / merge-tone beep echo) are
+    // NEUTRAL windows — no arming, no clearing, no seeding.
+    if (probeToneDominates(samples)) {
+      if (this.bridged && Date.now() - this.lastForensicLogAt >= FORENSIC_LOG_THROTTLE_MS) {
+        this.lastForensicLogAt = Date.now();
+        console.log(
+          `[speakerphone-detector] FORENSIC_WINDOW window=${this.windows} verdict=PROBE_TONE ` +
+            `masked (own 852+1336Hz probe leak/echo — neutral)`,
+        );
+      }
+      return;
+    }
 
     const profile = analyzeClip(samples, SAMPLE_RATE);
 

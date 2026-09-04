@@ -453,6 +453,25 @@ export function speakerphoneWarningGraceMs(): number {
 }
 
 /**
+ * Hold-engagement CONFIRMATION delay (ms): a HoldDetector engagement arms
+ * the merge tone only if the hold is STILL engaged this long after the
+ * initial engage. The held canary's uplink can carry leaked live-call audio
+ * (phones that don't fully mute the held line's mic/earpiece paths), which
+ * produces short speech-then-quiet false engagements — the 2026-09-04 retest
+ * false-engaged for exactly 3s in a clean window and the armed tone beeped
+ * at the callee for the rest of the call. Genuine holds (the callee picked
+ * up the canary and parked it) persist far longer than leaked-audio
+ * artifacts. Default 6000ms. Env: VERIFY_SECOND_CALL_CONFIRM_MS.
+ */
+export function secondCallConfirmMs(): number {
+  const raw = process.env.VERIFY_SECOND_CALL_CONFIRM_MS;
+  if (!raw) return 6_000;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0) return 6_000;
+  return Math.max(500, Math.min(30_000, Math.floor(v)));
+}
+
+/**
  * Admin phone number (E.164) for the supreme-flag SMS alert. Empty (default)
  * skips the SMS — the call still terminates, is flagged on the calls row,
  * and the event is logged. Env: ADMIN_ALERT_NUMBER.

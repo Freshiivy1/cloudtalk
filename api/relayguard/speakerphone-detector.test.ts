@@ -670,3 +670,79 @@ describe("SpeakerphoneDetector NO_BASELINE absolute arming (relay-from-bridge re
     expect(fires).toHaveLength(0);
   });
 });
+
+describe("SpeakerphoneDetector probe-tone mask (own 852+1336Hz signals are NEUTRAL)", () => {
+  /**
+   * 2026-09-04 retest: the canary's loud 852+1336Hz challenge loop leaked
+   * from the held line into Leg B's mic and scored RED 0.68 from the bridge
+   * (false episode 6s in); later the merge-tone beep (same pair) echoed back
+   * and sustained RED hops for the rest of the call. Windows dominated by
+   * the system's own probe pair must be neutral: no arm, no clear, no seed.
+   */
+  const TONE_WINDOW = (() => {
+    const out = new Array(8000);
+    for (let i = 0; i < 8000; i++) {
+      out[i] = Math.round(
+        32767 *
+          (0.3 * Math.sin((2 * Math.PI * 852 * i) / 8000) +
+            0.3 * Math.sin((2 * Math.PI * 1336 * i) / 8000)),
+      );
+    }
+    return out;
+  })();
+
+  function setupMask() {
+    nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fires: Array<{ score: number; detail: string }> = [];
+    const cleans: string[] = [];
+    const d = new SpeakerphoneDetector({
+      consecutiveWindows: 2,
+      refireMs: 9_000,
+      bridged: true,
+      onSuspicious: (score, detail) => fires.push({ score, detail }),
+      onClean: (detail) => cleans.push(detail),
+    });
+    const push = (suspicious: boolean) => {
+      dsp.suspicious = suspicious;
+      dsp.amberOnly = false;
+      dsp.matchAmber = false;
+      d.pushSamples(WINDOW);
+    };
+    return { d, fires, cleans, push };
+  }
+
+  it("the probe tone NEVER arms the no-baseline path and NEVER seeds the baseline", () => {
+    const { d, fires, push } = setupMask();
+    for (let i = 0; i < 6; i++) d.pushSamples(TONE_WINDOW); // 6s of pure probe tone
+    expect(fires).toHaveLength(0);
+    expect(d.baselineAbsorptions).toBe(0);
+    push(false); // a normal GREEN speech window afterwards still seeds
+    expect(d.baselineAbsorptions).toBe(1);
+    expect(fires).toHaveLength(0);
+  });
+
+  it("masked windows are NEUTRAL mid-episode — they neither advance nor reset the clean streak", () => {
+    const { d, fires, cleans, push } = setupMask();
+    push(true);
+    push(true); // armed
+    expect(fires).toHaveLength(1);
+    push(false); // clean 1 of 2
+    d.pushSamples(TONE_WINDOW); // masked — clean streak untouched
+    d.pushSamples(TONE_WINDOW);
+    expect(cleans).toHaveLength(0);
+    push(false); // clean 2 of 2 → clears (masked windows did not count)
+    expect(cleans).toHaveLength(1);
+  });
+
+  it("masked windows neither advance nor reset the no-baseline RED streak", () => {
+    const { d, fires, push } = setupMask();
+    push(true); // RED — streak 1
+    d.pushSamples(TONE_WINDOW); // masked — neutral (streak untouched at 1)
+    d.pushSamples(TONE_WINDOW); // masked — still untouched
+    expect(fires).toHaveLength(0);
+    push(true); // RED — streak 2 → arm (mask did not reset it)
+    expect(fires).toHaveLength(1);
+    expect(fires[0].detail).toContain("NO_BASELINE absolute arming");
+    expect(d.baselineAbsorptions).toBe(0);
+  });
+});

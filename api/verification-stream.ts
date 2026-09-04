@@ -576,6 +576,8 @@ const speakerphoneSuspicion = new Set<string>();
  * relay-noise engagements disengage themselves when the relay pauses).
  */
 const pendingEngagement = new Set<string>();
+/** Per-session confirmation timer for deferred hold engagements. */
+const engagementConfirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** True while the speakerphone detector is suspecting for this session. */
 export function isSpeakerphoneSuspecting(sid: string): boolean {
@@ -589,25 +591,34 @@ export function __testSetSpeakerphoneSuspicion(sid: string, active: boolean): vo
 }
 
 /**
- * HoldDetector engage wiring (exported for tests). While a speakerphone
- * episode is active the engagement is DEFERRED (see pendingEngagement):
- * relay room audio bleeding into the held canary's uplink produces exactly
- * the speech-then-quiet hold signature — arming the merge tone then beeps at
- * the callee for the whole episode and the beep echo risks poisoning the
- * relay's loud-tone listener.
+ * HoldDetector engage wiring (exported for tests). An engagement NEVER arms
+ * the merge tone immediately — it is DEFERRED (pendingEngagement) and
+ * confirmed only one of two ways:
+ *
+ *  1. PERSISTENCE: the hold is still engaged when the confirmation timer
+ *     fires (vs.secondCallConfirmMs(), default 6s). The held canary's uplink
+ *     can carry LEAKED live-call audio (phones that don't fully mute the
+ *     held line), which produces short speech-then-quiet false engagements —
+ *     the 2026-09-04 retest false-engaged for exactly 3s in a clean window
+ *     and the armed tone beeped at the callee for the rest of the call,
+ *     while its suppression muted the speakerphone strike ladder. Leak
+ *     artifacts disengage themselves within seconds; genuine holds persist.
+ *  2. EPISODE CLEAR: an engagement that is still engaged when a
+ *     speakerphone episode ends is a genuine hold (relay-noise engagements
+ *     disengage themselves mid-episode) — resolveDeferredEngagement confirms
+ *     it immediately.
  */
 export function handleSecondCallEngaged(sid: string): void {
-  if (isSpeakerphoneSuspecting(sid)) {
-    pendingEngagement.add(sid);
-    console.log(
-      `[verify-stream] SECOND CALL ENGAGED sid=${sid} — DEFERRED (speakerphone episode active; likely relay-noise bleed)`,
-    );
-    return;
-  }
-  console.warn(`[verify-stream] SECOND CALL ENGAGED sid=${sid}`);
-  void vs
-    .onSecondCallEngaged(sid)
-    .catch((err) => console.error("[verify-stream] onSecondCallEngaged error:", err));
+  pendingEngagement.add(sid);
+  if (engagementConfirmTimers.has(sid)) return; // re-engage while pending: keep the original timer
+  console.log(
+    `[verify-stream] SECOND CALL ENGAGED sid=${sid} — DEFERRED (confirming hold persistence for ${vs.secondCallConfirmMs()}ms before the merge tone arms)`,
+  );
+  const timer = setTimeout(() => {
+    engagementConfirmTimers.delete(sid);
+    resolveDeferredEngagement(sid);
+  }, vs.secondCallConfirmMs());
+  timer.unref?.();
 }
 
 /** HoldDetector disengage wiring (exported for tests). */
@@ -635,17 +646,22 @@ export function handleSecondCallDisengaged(sid: string): void {
  */
 export function resolveDeferredEngagement(sid: string): void {
   if (!pendingEngagement.delete(sid)) return;
+  const timer = engagementConfirmTimers.get(sid);
+  if (timer) {
+    clearTimeout(timer);
+    engagementConfirmTimers.delete(sid);
+  }
   const hold = [...activeStreams].find((a) => a.sid === sid && a.hold)?.hold;
   if (hold?.isEngaged) {
     console.warn(
-      `[verify-stream] SECOND CALL ENGAGED sid=${sid} — deferred engagement confirmed after episode clear, arming tone`,
+      `[verify-stream] SECOND CALL ENGAGED sid=${sid} — deferred engagement confirmed (hold still engaged), arming tone`,
     );
     void vs
       .onSecondCallEngaged(sid)
       .catch((err) => console.error("[verify-stream] onSecondCallEngaged error:", err));
   } else {
     console.log(
-      `[verify-stream] DEFERRED ENGAGEMENT DROPPED sid=${sid} — hold already disengaged (was relay noise)`,
+      `[verify-stream] DEFERRED ENGAGEMENT DROPPED sid=${sid} — hold already disengaged (was leak/relay noise)`,
     );
   }
 }
@@ -908,6 +924,11 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         // not leave a stale "suspecting" marker blocking merge-tone disarm.
         if (state.purpose === "speakerphone") speakerphoneSuspicion.delete(state.sid);
         pendingEngagement.delete(state.sid);
+        const confirmTimer = engagementConfirmTimers.get(state.sid);
+        if (confirmTimer) {
+          clearTimeout(confirmTimer);
+          engagementConfirmTimers.delete(state.sid);
+        }
         console.log(
           `[verify-stream] closed sid=${state.sid} purpose=${state.purpose} frames=${state.frames}`,
         );

@@ -403,4 +403,50 @@ describe("speakerphone-relay simulation (real DSP, known audio)", () => {
     expect(emissions.filter((e) => e.atMs > clear.atMs)).toHaveLength(0);
   });
 
+  it("SCENARIO: own 852+1336Hz probe leaking into Leg B never arms and never seeds — a genuine relay right after is still picked up ≤2s", () => {
+    // 2026-09-04 retest regression: the canary's loud-tone loop leaked from
+    // the held line into Leg B's mic and false-armed the detector 6s after
+    // the bridge (RED 0.68), and the merge-tone beep echo (same pair) then
+    // sustained false episodes all call. The probe-tone mask must make those
+    // windows NEUTRAL — and must not blunt real relay detection.
+    const tone = new Float32Array(5 * SR);
+    for (let i = 0; i < tone.length; i++) {
+      tone[i] =
+        0.3 * Math.sin((2 * Math.PI * 852 * i) / SR) +
+        0.3 * Math.sin((2 * Math.PI * 1336 * i) / SR);
+    }
+    const NORMAL_S = 8;
+    const RELAY_S = 6;
+    const TAIL_S = 10;
+    const { d, emissions, clears } = simulate([
+      { label: "probe-tone-leak", pcm: tone },
+      { label: "normal", pcm: calleeDirect.subarray(0, NORMAL_S * SR) },
+      { label: "relay", pcm: callerRelay.subarray(0, RELAY_S * SR) },
+      { label: "normal-again", pcm: calleeDirect.subarray(0, TAIL_S * SR) },
+    ]);
+
+    const relayOnsetMs = (5 + NORMAL_S) * 1_000;
+    const relayEndMs = relayOnsetMs + RELAY_S * 1_000;
+
+    // 1) Zero emissions during the probe-tone leak AND the normal lead-in.
+    expect(emissions.filter((e) => e.atMs < relayOnsetMs)).toHaveLength(0);
+
+    // 2) The genuine relay still arms within 2s — via the BASELINE path,
+    //    which proves the tone never poisoned/blocked baseline seeding.
+    expect(emissions.length).toBeGreaterThan(0);
+    const first = emissions[0];
+    console.log(
+      `MASK+PICKUP: relay onset t=${relayOnsetMs}ms, first emission t=${first.atMs}ms ` +
+        `(+${first.atMs - relayOnsetMs}ms) — ${first.detail}`,
+    );
+    expect(first.atMs - relayOnsetMs).toBeLessThanOrEqual(2_000);
+    expect(first.detail).toContain("verdict=SUSPICIOUS RELAY");
+    expect(d.baselineAbsorptions).toBeGreaterThan(0);
+
+    // 3) Episode clears exactly once on the real normal tail.
+    expect(clears).toHaveLength(1);
+    expect(clears[0].atMs - relayEndMs).toBeGreaterThanOrEqual(2_000);
+    expect(clears[0].atMs - relayEndMs).toBeLessThanOrEqual(8_000);
+  });
+
 });

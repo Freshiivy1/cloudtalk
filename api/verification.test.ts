@@ -1251,6 +1251,72 @@ describe("speakerphone episode wiring: merge-tone deferral + canary tone silenci
     }
   });
 
+  it("a hold engagement in a CLEAN window arms the tone only after persisting through the confirmation delay", async () => {
+    process.env.VERIFY_SECOND_CALL_CONFIRM_MS = "500";
+    const s = await makeSession(vs.VState.BRIDGED, {
+      guarded: true,
+      callerCallSid: "CA_pc_caller",
+      legACallSid: "CA_pc_legA",
+      legBCallSid: "CA_pc_legB",
+    });
+    const sid = s.sessionId;
+    const partBefore = participantUpdates.length;
+    const fake = {
+      sid,
+      purpose: "hold-canary",
+      sp: null,
+      hold: { isEngaged: true },
+      merge: null,
+      frames: 0,
+    } as unknown as (typeof activeStreams extends Set<infer T> ? T : never);
+    activeStreams.add(fake);
+    try {
+      handleSecondCallEngaged(sid);
+      await tick(150);
+      // NOT immediate — the merge tone waits for hold persistence.
+      expect(vs.isMergeToneArmed(sid)).toBe(false);
+      expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+      await tick(600); // past the 500ms confirmation, hold still engaged
+      expect(vs.isMergeToneArmed(sid)).toBe(true);
+      const added = participantUpdates
+        .slice(partBefore)
+        .filter((p) => p.conference === `verify-${sid}`);
+      expect(added.length).toBeGreaterThan(0);
+      expect(added.every((p) => p.participant === "CA_pc_legB")).toBe(true);
+    } finally {
+      activeStreams.delete(fake);
+      await vs.onSecondCallDisengaged(sid); // disarm + stop the rearm cadence
+      delete process.env.VERIFY_SECOND_CALL_CONFIRM_MS;
+    }
+  });
+
+  it("a 3s false engagement (leaked-audio artifact) NEVER arms the tone — the 2026-09-04 beep-beep-beep regression", async () => {
+    process.env.VERIFY_SECOND_CALL_CONFIRM_MS = "800";
+    try {
+      const s = await makeSession(vs.VState.BRIDGED, {
+        guarded: true,
+        callerCallSid: "CA_fx_caller",
+        legACallSid: "CA_fx_legA",
+        legBCallSid: "CA_fx_legB",
+      });
+      const sid = s.sessionId;
+      const partBefore = participantUpdates.length;
+      // Live incident shape: engagement in a clean window that disengages
+      // itself ~3s later (leaked live-call audio on the held canary uplink).
+      handleSecondCallEngaged(sid);
+      await tick(300);
+      handleSecondCallDisengaged(sid);
+      await tick(900); // past the confirmation delay — nothing may arm
+      expect(vs.isMergeToneArmed(sid)).toBe(false);
+      const added = participantUpdates
+        .slice(partBefore)
+        .filter((p) => p.conference === `verify-${sid}`);
+      expect(added).toHaveLength(0);
+    } finally {
+      delete process.env.VERIFY_SECOND_CALL_CONFIRM_MS;
+    }
+  });
+
   it("silenceCanaryLoudTone redirects Leg A to leg-a-hold exactly once (idempotent) and logs CANARY_TONE_SILENCED", async () => {
     const s = await makeSession(vs.VState.BRIDGED, {
       guarded: true,
