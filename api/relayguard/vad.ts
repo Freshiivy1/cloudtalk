@@ -114,9 +114,16 @@ export function runVad(levelsDb: Float32Array, sampleRate: number): VadResult {
     burstCV = mean > 1e-9 ? Math.sqrt(varr) / mean : NaN;
   }
 
-  // Gap depth: mean level during inter-burst gaps vs mean level during bursts.
+  // Gap depth: mean level during non-burst frames vs mean level during
+  // bursts. Computed for ANY window with at least one burst — a single-burst
+  // window still has leading/trailing gap frames, and their level is the
+  // decisive speakerphone-relay evidence: on a direct line the bed between
+  // bursts sits ≈60 dB under speech, while a speakerphone AGC lifts it to
+  // ≈8.5 dB under speech. Gating this on ≥2 bursts used to throw that
+  // evidence away for the majority of 1 s analysis windows (single fluent
+  // sentence), forcing downstream consumers onto a relay-like default.
   let gapDepthDb = NaN;
-  if (burstCount >= 2) {
+  if (burstCount >= 1) {
     const inBurst = new Array<boolean>(n).fill(false);
     for (const [a, b] of raw) for (let i = a; i <= b && i < n; i++) inBurst[i] = true;
     let burstSum = 0;

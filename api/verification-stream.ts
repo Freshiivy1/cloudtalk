@@ -589,13 +589,20 @@ async function buildAnalyzers(
     const bridged = session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid);
     if (purpose === "speakerphone") {
       const sp = new SpeakerphoneDetector({
-      // 3 consecutive suspicious 1s windows by default (sustained ~3s
-      // speakerphone-relay detection), env-tunable via
+      // 2 consecutive suspicious hops by default (0.5s sliding hop over the
+      // trailing 1s window → the challenge fires 1.0–2.0s after relay audio
+      // starts, inside the 2s pickup budget), env-tunable via
       // VERIFY_SPEAKERPHONE_ARM_WINDOWS. Arming requires verdict
       // 'SUSPICIOUS RELAY' AND a RED (>=0.6) relay fingerprint on every one
-      // of those windows — AMBER never arms.
+      // of those hops — AMBER never arms.
       consecutiveWindows: vs.speakerphoneArmWindows(),
-        // Calibration warm-up after BRIDGED (default 8s): the detector
+        hopSec: vs.forensicsHopSec(),
+        // Clearing requires 6 consecutive STRONGLY-CLEAN hops (MATCH+GREEN,
+        // ≈3s of confirmed-normal audio) by default — borderline mid-episode
+        // hops can no longer silence the challenge while the relay continues
+        // (env VERIFY_SPEAKERPHONE_CLEAR_WINDOWS).
+        cleanWindowsToClear: vs.speakerphoneClearWindows(),
+        // Calibration warm-up after BRIDGED (default 2s): the detector
         // rebuilds its rolling baseline from live in-call audio and CANNOT
         // arm — normal conversation/ringback no longer false-arms the
         // forensic challenge seconds into the bridge. The stream attaches at

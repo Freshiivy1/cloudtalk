@@ -299,19 +299,58 @@ export function noiseEventThrottleMs(): number {
 }
 
 /**
- * Consecutive suspicious 1s analysis windows the SpeakerphoneDetector
- * requires before the outer-call forensic system fires (challenge noise to
- * the CALLER only — never the merge tone). Default 3 (sustained ~3s
- * speakerphone-relay detection — a brief 2-window blip must NOT fire the
- * challenge). Env-overridable via VERIFY_SPEAKERPHONE_ARM_WINDOWS, floored
- * at 1; an unset, empty, or non-numeric value yields the default 3.
+ * Consecutive suspicious analysis hops the SpeakerphoneDetector requires
+ * before the outer-call forensic system fires (challenge noise to the CALLER
+ * only — never the merge tone). Default 2: with the 0.5 s sliding hop the
+ * detector then fires 1.0–2.0 s after relay audio starts (the 2 s pickup
+ * budget) instead of 3–4 s with the old non-overlapping 3-window rule. Every
+ * arming hop must still clear the full bar — verdict 'SUSPICIOUS RELAY' AND a
+ * RED (≥0.6) relay fingerprint — so a brief blip or borderline audio never
+ * fires. Env-overridable via VERIFY_SPEAKERPHONE_ARM_WINDOWS, floored at 1;
+ * an unset, empty, or non-numeric value yields the default 2.
  */
 export function speakerphoneArmWindows(): number {
   const raw = process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
-  if (!raw) return 3; // unset OR set-but-empty → default
+  if (!raw) return 2; // unset OR set-but-empty → default
   const v = Number(raw);
-  if (!Number.isFinite(v)) return 3;
+  if (!Number.isFinite(v)) return 2;
   return Math.max(1, Math.floor(v));
+}
+
+/**
+ * Consecutive FINGERPRINT-CLEAN hops (absolute relay fingerprint below the
+ * detector's clean ceiling, 0.5) required to CLEAR a fired speakerphone
+ * suspicion and stop the challenge noise. Default 6 ≈ 3 s of confirmed-normal
+ * audio at the 0.5 s hop. Any hop at/above the ceiling RESETS the streak, so
+ * the mid-relay fingerprint dips (≈0.55–0.6) a sustained relay produces can
+ * never chain into a clear — the exact "noise played 3 s then went back to
+ * normal" failure. Clearing is deliberately verdict-independent: the verdict
+ * compares against a frozen single-window baseline whose per-window thinness
+ * varies with phoneme content far past the channel-vote margin, so normal
+ * audio can read SUSPICIOUS against a stale reference — the absolute
+ * fingerprint is the robust "is this relay-like right now" signal.
+ * Env-overridable via VERIFY_SPEAKERPHONE_CLEAR_WINDOWS, floored at 1.
+ */
+export function speakerphoneClearWindows(): number {
+  const raw = process.env.VERIFY_SPEAKERPHONE_CLEAR_WINDOWS;
+  if (!raw) return 6;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return 6;
+  return Math.max(1, Math.floor(v));
+}
+
+/**
+ * Sliding analysis hop (seconds) for the SpeakerphoneDetector: every hop the
+ * trailing 1 s of Leg B audio is analyzed. Default 0.5 — relay onset is seen
+ * by a full analysis within ~1.5 s (2 s pickup budget with 2-hop arming).
+ * Env-overridable via VERIFY_FORENSICS_HOP_SEC.
+ */
+export function forensicsHopSec(): number {
+  const raw = process.env.VERIFY_FORENSICS_HOP_SEC;
+  if (!raw) return 0.5;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v <= 0 || v > 1) return 0.5;
+  return v;
 }
 
 /**
@@ -319,14 +358,17 @@ export function speakerphoneArmWindows(): number {
  * SpeakerphoneDetector scores windows internally (rebuilding its rolling
  * baseline from LIVE in-call audio — the pre-bridge baseline was ringback/IVR
  * audio, and comparing bridged speech against it is what false-armed the
- * detector ~3s into the live-test bridge) but cannot arm. Default 8000.
- * Env-overridable via VERIFY_FORENSICS_WARMUP_MS.
+ * detector ~3s into the live-test bridge) but cannot arm. Default 2000 (4
+ * hops at the 0.5 s hop — enough for the baseline to seed from in-call
+ * speech; the baseline is fully reset at bridge, so the old 8 s suppression
+ * was dead time that delayed real detections). Env-overridable via
+ * VERIFY_FORENSICS_WARMUP_MS.
  */
 export function forensicsWarmupMs(): number {
   const raw = process.env.VERIFY_FORENSICS_WARMUP_MS;
-  if (!raw) return 8_000;
+  if (!raw) return 2_000;
   const v = Number(raw);
-  if (!Number.isFinite(v) || v < 0) return 8_000;
+  if (!Number.isFinite(v) || v < 0) return 2_000;
   return Math.floor(v);
 }
 

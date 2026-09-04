@@ -11,8 +11,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const dsp = vi.hoisted(() => ({ suspicious: false, amberOnly: false, matchAmber: false }));
 
 vi.mock("./features", () => ({
-  // Any non-empty speechFrames lets the first window seed the baseline.
-  analyzeClip: () => ({ vad: { speechFrames: [0] } }),
+  // speechFrames + a real turn-exchange (≥2 bursts) lets the first window
+  // seed the baseline under the detector's seeding rule.
+  analyzeClip: () => ({ vad: { speechFrames: [0], burstCount: 2 } }),
 }));
 
 vi.mock("./compare", () => ({
@@ -35,11 +36,13 @@ vi.mock("./compare", () => ({
           }
       : dsp.matchAmber
         ? {
-            // Borderline mid-episode window: MATCH verdict but AMBER print —
-            // must neither clear suspicion nor be absorbed into the baseline.
+            // Borderline mid-episode window: MATCH verdict but a fingerprint
+            // AT/ABOVE the clean-episode ceiling (0.5) — the mid-relay AMBER
+            // dip zone. Must neither clear suspicion (the clean streak resets)
+            // nor be absorbed into the baseline.
             state: "AMBER",
-            score: 0.4,
-            components: { flatness: 0.4, gapContrast: 0.3, noiseBed: 0.3, hfLeakage: 0.2, fragmentation: 0.1 },
+            score: 0.55,
+            components: { flatness: 0.55, gapContrast: 0.5, noiseBed: 0.4, hfLeakage: 0.2, fragmentation: 0.2 },
           }
         : {
             state: "GREEN",

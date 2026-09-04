@@ -37,10 +37,15 @@
  * KEEPS firing on subsequent suspicious windows, throttled to one emission
  * per refireMs (default 4 s, matching the seamless challenge-noise loop) so
  * the Twilio conference-announce updates from injectChallengeNoise stay
- * effectively continuous. The detector resets to idle only after a CLEAN
- * (non-suspicious) window; that transition fires onClean exactly once so the
- * live analysis page can return to normal on the next poll. Re-arming then
- * again requires `consecutiveWindows` consecutive suspicious windows.
+ * effectively continuous. The detector resets to idle only after
+ * `cleanWindowsToClear` CONSECUTIVE fingerprint-clean windows (absolute relay
+ * fingerprint below CLEAN_SCORE_CEILING — baseline-independent, so a stale or
+ * atypical frozen reference can never block the clear; any hop at or above
+ * the ceiling resets the streak, so mid-relay dips never end the episode) —
+ * and that transition fires onClean exactly once so the live analysis page
+ * can return to normal on the next poll.
+ * Re-arming then again requires `consecutiveWindows` consecutive suspicious
+ * windows.
  * Detection is advisory — the caller (verification-stream.ts) decides what
  * to do; nothing here ever touches the call legs.
  */
@@ -64,6 +69,23 @@ const SAMPLE_RATE = 8000;
  */
 const BASELINE_MODE = "poor" as const;
 
+/**
+ * Clean-episode fingerprint ceiling: while a suspicion episode is active, a
+ * hop counts toward clearing ONLY when its absolute relay fingerprint is
+ * below this score. The ceiling sits between the two populations the
+ * end-to-end simulation measures on 1 s hops: sustained speakerphone-relay
+ * audio never dips below ≈0.55 (AGC-lifted bed → gapContrast/noiseBed stay
+ * high even between bursts), while genuine direct audio — now that vad.ts
+ * measures real gap depth on single-burst windows instead of falling back to
+ * a relay-like default — lands ≤0.45. Clearing on the ABSOLUTE fingerprint
+ * (not the relative verdict) makes the clear immune to the frozen-baseline
+ * content noise that made verdict-based clearing unreliable: same-voice 1 s
+ * windows differ in thinness by up to ~0.4 from phoneme content alone, far
+ * past the 0.08 channel-vote margin, so a verdict against a stale reference
+ * can read SUSPICIOUS on perfectly normal audio.
+ */
+const CLEAN_SCORE_CEILING = 0.5;
+
 /** Top-3 contributing relay-fingerprint features, highest score first. */
 function topFingerprintFeatures(fp: RelayFingerprint): string {
   return Object.entries(fp.components)
@@ -76,6 +98,15 @@ function topFingerprintFeatures(fp: RelayFingerprint): string {
 export interface SpeakerphoneDetectorOptions {
   /** Analysis window in seconds (default 1). */
   windowSec?: number;
+  /**
+   * Hop between consecutive analyses in seconds (default = windowSec, i.e.
+   * non-overlapping windows — the legacy behavior the unit tests rely on).
+   * Production wiring (verification-stream.ts) uses 0.5: every hop the
+   * TRAILING `windowSec` of audio is analyzed, so a relay starting mid-call
+   * produces its first full-relay analysis within ~1.5 s instead of up to 2 s,
+   * and 2 consecutive suspicious hops land within the 2 s pickup budget.
+   */
+  hopSec?: number;
   /** Consecutive suspicious windows required before (re-)firing (default 3). */
   consecutiveWindows?: number;
   /**
@@ -109,12 +140,13 @@ export interface SpeakerphoneDetectorOptions {
    */
   armOnlyWhenBridged?: boolean;
   /**
-   * Consecutive NON-suspicious windows required to clear a fired suspicion
-   * (default 2). Sustained relay audio routinely produces one borderline
-   * MATCH/AMBER window mid-episode; clearing on a single clean window both
-   * silenced the challenge after a few pickups AND let that window's audio
-   * poison the rolling baseline (see analyzeWindow). Hysteresis keeps the
-   * episode alive through one-off borderline windows.
+   * Consecutive MATCH-verdict windows required to clear a fired suspicion
+   * (default 2; production wiring uses 6 ≈ 3 s at the 0.5 s hop). Sustained
+   * relay audio routinely produces borderline UNCERTAIN / AMBER-fingerprint
+   * windows mid-episode, and counting those as "clean" is exactly what
+   * silenced the challenge noise after ~3 s while the relay was still
+   * playing. Borderline windows leave the clean streak untouched (they
+   * neither advance nor reset it); only a suspicious window resets it.
    */
   cleanWindowsToClear?: number;
   /** Called when speakerphone use is suspected. score ∈ 0..1 (relay fp). */
@@ -130,6 +162,7 @@ const FORENSIC_LOG_THROTTLE_MS = 5_000;
 
 export class SpeakerphoneDetector {
   private readonly win: number;
+  private readonly hop: number;
   private readonly need: number;
   private readonly refire: number;
   private readonly warmup: number;
@@ -156,6 +189,7 @@ export class SpeakerphoneDetector {
 
   constructor(opts: SpeakerphoneDetectorOptions = {}) {
     this.win = Math.round((opts.windowSec ?? 1) * SAMPLE_RATE);
+    this.hop = Math.max(1, Math.round((opts.hopSec ?? opts.windowSec ?? 1) * SAMPLE_RATE));
     this.need = opts.consecutiveWindows ?? 3;
     this.refire = opts.refireMs ?? 4_000;
     this.warmup = Math.max(0, opts.warmupMs ?? 0);
@@ -207,8 +241,10 @@ export class SpeakerphoneDetector {
   pushSamples(samples: ArrayLike<number>): void {
     for (let i = 0; i < samples.length; i++) this.buf.push(samples[i]);
     while (this.buf.length >= this.win) {
+      // Sliding analysis: every `hop` samples the TRAILING `win` samples are
+      // analyzed (hop == win = legacy non-overlapping behavior).
       const window = this.buf.slice(0, this.win);
-      this.buf = this.buf.slice(this.win);
+      this.buf = this.buf.slice(this.hop);
       try {
         this.analyzeWindow(window);
       } catch (err) {
@@ -267,10 +303,14 @@ export class SpeakerphoneDetector {
 
     const profile = analyzeClip(samples, SAMPLE_RATE);
 
-    // No baseline yet: seed the rolling baseline from the first window that
-    // actually contains speech; silent ring-in windows tell us nothing.
+    // No baseline yet: seed the rolling baseline from the first window with a
+    // real turn-exchange (≥2 VAD bursts). A single-burst window (one fluent
+    // sentence, a beep, ringback) is not representative enough to anchor every
+    // subsequent comparison — the end-to-end simulation showed a 1-burst seed
+    // window flips relay verdicts to UNCERTAIN. Windows without ≥2 bursts are
+    // scored-and-skipped (fail-safe: no baseline, no arming).
     if (!this.baseline) {
-      if (profile.vad.speechFrames.length > 0) {
+      if (profile.vad.speechFrames.length > 0 && profile.vad.burstCount >= 2) {
         this.baseline = profile;
         this.baselineAbsorbs++;
       }
@@ -348,24 +388,36 @@ export class SpeakerphoneDetector {
       }
     } else {
       // CLEAN-EPISODE HYSTERESIS + BASELINE FREEZE: while a suspicion episode
-      // is active, a single borderline window must NOT end it — sustained
-      // relay audio routinely produces one MATCH/AMBER window, and clearing on
-      // it (a) silenced the challenge after ~3–4 pickups and (b) let the old
-      // code absorb that relayed audio into the rolling baseline, after which
-      // the same audio compared MATCH forever. Suspicion now clears only after
-      // `cleanNeed` CONSECUTIVE non-suspicious windows, and the baseline stays
-      // frozen for the entire episode (absorbBaseline enforces this).
+      // is active, relay-compatible audio must NOT end it — sustained relay
+      // audio routinely produces UNCERTAIN / AMBER-fingerprint windows, and
+      // counting those as "clean" (a) silenced the challenge noise after ~3 s
+      // while the relay was still playing (the exact live-test failure) and
+      // (b) let the old code absorb relayed audio into the rolling baseline,
+      // after which the same audio compared MATCH forever. Suspicion now
+      // clears only after `cleanNeed` CONSECUTIVE hops whose ABSOLUTE relay
+      // fingerprint is below CLEAN_SCORE_CEILING (see the constant's comment
+      // for why the fingerprint — not the verdict — is the clearing signal).
+      // Any hop at/above the ceiling RESETS the clean streak, so the mid-relay
+      // AMBER dips (≈0.55–0.6) the simulation measures can never chain into a
+      // clear. The baseline stays frozen for the entire episode
+      // (absorbBaseline enforces this — absorption still requires MATCH AND
+      // GREEN).
       if (this.suspecting) {
-        this.cleanStreak++;
-        if (this.cleanStreak >= this.cleanNeed) {
-          this.suspecting = false;
-          this.streak = 0;
+        if (fp.score < CLEAN_SCORE_CEILING) {
+          this.cleanStreak++;
+          if (this.cleanStreak >= this.cleanNeed) {
+            this.suspecting = false;
+            this.streak = 0;
+            this.cleanStreak = 0;
+            this.onClean?.(
+              `verdict=${verdict} relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
+                `weighted=${result.weightedScore.toFixed(2)} confidence=${Math.round(result.confidence)} — ` +
+                `${this.cleanNeed} consecutive fingerprint-clean windows ` +
+                `(relayScore < ${CLEAN_SCORE_CEILING})`,
+            );
+          }
+        } else {
           this.cleanStreak = 0;
-          this.onClean?.(
-            `verdict=${verdict} relayState=${fp.state} relayScore=${fp.score.toFixed(2)} ` +
-              `weighted=${result.weightedScore.toFixed(2)} confidence=${Math.round(result.confidence)} — ` +
-              `${this.cleanNeed} consecutive clean windows`,
-          );
         }
         return;
       }

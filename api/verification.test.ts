@@ -245,15 +245,15 @@ describe("two-phase challenge config (corrected architecture)", () => {
 });
 
 describe("forensic precision config", () => {
-  it("forensics warm-up defaults to 8000ms (env-overridable)", () => {
+  it("forensics warm-up defaults to 2000ms (env-overridable)", () => {
     const saved = process.env.VERIFY_FORENSICS_WARMUP_MS;
     delete process.env.VERIFY_FORENSICS_WARMUP_MS;
     try {
-      expect(vs.forensicsWarmupMs()).toBe(8_000);
+      expect(vs.forensicsWarmupMs()).toBe(2_000);
       process.env.VERIFY_FORENSICS_WARMUP_MS = "12000";
       expect(vs.forensicsWarmupMs()).toBe(12_000);
       process.env.VERIFY_FORENSICS_WARMUP_MS = "not-a-number";
-      expect(vs.forensicsWarmupMs()).toBe(8_000);
+      expect(vs.forensicsWarmupMs()).toBe(2_000);
     } finally {
       if (saved === undefined) delete process.env.VERIFY_FORENSICS_WARMUP_MS;
       else process.env.VERIFY_FORENSICS_WARMUP_MS = saved;
@@ -957,12 +957,12 @@ describe("challenge noise / merge system mutual exclusion", () => {
   });
 });
 
-describe("speakerphoneArmWindows (3s forensic arming)", () => {
-  it("defaults to 3 consecutive suspicious windows, env-overridable, floored at 1", () => {
+describe("speakerphoneArmWindows (2-hop forensic arming)", () => {
+  it("defaults to 2 consecutive suspicious hops, env-overridable, floored at 1", () => {
     const saved = process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
     delete process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
     try {
-      expect(vs.speakerphoneArmWindows()).toBe(3);
+      expect(vs.speakerphoneArmWindows()).toBe(2);
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "5";
       expect(vs.speakerphoneArmWindows()).toBe(5);
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "1";
@@ -972,9 +972,9 @@ describe("speakerphoneArmWindows (3s forensic arming)", () => {
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "-4"; // floored to 1
       expect(vs.speakerphoneArmWindows()).toBe(1);
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = "bogus"; // safe default
-      expect(vs.speakerphoneArmWindows()).toBe(3);
+      expect(vs.speakerphoneArmWindows()).toBe(2);
       process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = ""; // set-but-empty → default
-      expect(vs.speakerphoneArmWindows()).toBe(3);
+      expect(vs.speakerphoneArmWindows()).toBe(2);
     } finally {
       if (saved === undefined) delete process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS;
       else process.env.VERIFY_SPEAKERPHONE_ARM_WINDOWS = saved;
