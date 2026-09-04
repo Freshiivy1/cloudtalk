@@ -14,15 +14,20 @@
  * onMergeDetected() and redirect Leg B to the verdict TwiML.
  *
  * Wire-up: api/boot.ts attaches attachVerificationStreamServer() to the HTTP
- * server in production. Leg A's TwiML opens a non-blocking <Start><Stream>
- * to this endpoint (inbound track) so the relayguard speakerphone detector
- * can analyze the callee's uplink audio in-process; Leg B merge detection
- * uses the external relay (VERIFY_STREAM_URL) when configured.
+ * server in production. TWO in-process streams connect here, both identified
+ * EXCLUSIVELY by <Start><Stream> customParameters (sid / leg / purpose /
+ * token) — Twilio does NOT deliver query parameters on Stream URLs:
+ *  - Leg A (callee), purpose=hold-canary: HoldDetector (second-call
+ *    engagement) + the in-call armed MergeToneDetector on the callee uplink.
+ *  - Leg B (live call), purpose=speakerphone: the relayguard SpeakerphoneDetector
+ *    on Leg B's inbound audio — speakerphone relay audio enters the ACTIVE
+ *    Leg B microphone, so it is detectable ONLY here (Leg A is on hold).
+ * Leg B merge-tone detection stays on the external relay (VERIFY_STREAM_URL).
  */
 import type { Server as HttpServer, IncomingMessage } from "http";
 import type { Duplex } from "stream";
 import type { Context } from "hono";
-import { createHmac } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import * as vs from "./verification";
 import { getTwilioClient } from "./twilio-voice";
@@ -51,6 +56,20 @@ export function streamToken(sessionId: string): string {
   return createHmac("sha256", secret)
     .update(`merge-relay-stream:${sessionId}`)
     .digest("hex");
+}
+
+/**
+ * Constant-time validation of a stream's `token` customParameter against the
+ * per-session HMAC (same scheme semantics as the merge relay: missing secret,
+ * sid or token is invalid; mismatches rejected). Used by the in-process
+ * WebSocket start handler — the raw secret never travels inside TwiML.
+ */
+export function streamTokenValid(sid: string, token: unknown): boolean {
+  const secret = process.env.VERIFY_STREAM_SECRET ?? "";
+  if (!secret || !sid || typeof token !== "string" || !token) return false;
+  const expected = Buffer.from(streamToken(sid), "utf8");
+  const actual = Buffer.from(token, "utf8");
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 /**
@@ -195,6 +214,42 @@ export function relayArmUrl(): string | null {
 export function relayChallengeStartUrl(): string | null {
   const base = relayHttpBase();
   return base ? `${base}/challenge-start` : null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Relay cold-start mitigation (Render free tier sleeps after 15 min idle)      */
+/* -------------------------------------------------------------------------- */
+
+/** Injectable fetch for the warm-up ping (tests). null restores global fetch. */
+let warmupFetch: typeof fetch | null = null;
+export function setRelayWarmupFetch(f: typeof fetch | null): void {
+  warmupFetch = f;
+}
+
+/**
+ * Best-effort GET to the relay's /health to start waking a sleeping Render
+ * instance (~22s cold start). Fired when a verification session is initiated
+ * (INITIATED / CALLER_HOLDING, before Leg A) so the relay is warm by the time
+ * Leg B is originated and the readiness deadline starts. NEVER blocks or
+ * fails the call: errors are logged and swallowed. No-op when the relay is
+ * not configured.
+ */
+export function wakeRelay(): void {
+  const base = relayHttpBase();
+  if (!base) return;
+  const f = warmupFetch ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5_000);
+  timer.unref?.();
+  void Promise.resolve(f(`${base}/health`, { signal: controller.signal }))
+    .then(() => console.log(`[verify-stream] relay warm-up ping sent (${base}/health)`))
+    .catch((err) =>
+      console.warn(
+        `[verify-stream] relay warm-up ping failed (${base}/health):`,
+        err instanceof Error ? err.message : err,
+      ),
+    )
+    .finally(() => clearTimeout(timer));
 }
 
 export interface RelayPostResult {
@@ -364,15 +419,17 @@ export class MergeToneDetector {
 export const STREAM_PATH = "/api/verify/stream";
 
 /**
- * wss:// URL of the IN-PROCESS media-stream endpoint for LEG A (callee)
- * speakerphone detection. Unlike Leg B merge detection — which may run on
- * the external relay (VERIFY_STREAM_URL) — the outer-speakerphone analyzer
- * always runs here, on the callee's inbound (uplink) audio track.
+ * wss:// URL of the IN-PROCESS media-stream endpoint, shared by the Leg A
+ * hold-canary stream and the Leg B speakerphone stream. BARE URL — NO query
+ * string: Twilio does not deliver query parameters on Stream URLs (production
+ * showed `connected sid=` blank and SESSION_NOT_FOUND forever). Stream
+ * identity travels EXCLUSIVELY in <Start><Stream> customParameters (sid /
+ * leg / purpose / token) and is authenticated by streamTokenValid().
  */
-export function legAStreamUrl(sessionId: string): string | null {
+export function inProcessStreamUrl(): string | null {
   const base = vs.getPublicBaseUrl();
   if (!base) return null;
-  return `${base.replace(/^http/, "ws")}${STREAM_PATH}?sid=${sessionId}`;
+  return `${base.replace(/^http/, "ws")}${STREAM_PATH}`;
 }
 
 /**
@@ -421,63 +478,158 @@ export function handleSpeakerphoneSuspicious(
   })().catch((err) => console.error("[verify-stream] injectChallengeNoise error:", err));
 }
 
-/** Analyzers attached to a Leg A (callee) uplink stream. */
-interface LegAAnalyzers {
-  sp: SpeakerphoneDetector;
-  hold: HoldDetector;
+/**
+ * Stream purpose (customParameters `purpose`) → which detectors attach and
+ * on which leg's audio:
+ *  - "hold-canary" (leg=legA, callee uplink): HoldDetector second-call
+ *    engagement + the in-call armed MergeToneDetector. NO speakerphone
+ *    analysis — after Leg B answers Leg A is HELD, so speakerphone relay
+ *    audio never reaches this stream.
+ *  - "speakerphone" (leg=legB, live-call inbound): the relayguard
+ *    SpeakerphoneDetector. Speakerphone-relayed audio enters the ACTIVE
+ *    Leg B microphone, so it is detectable ONLY on this stream. The stream
+ *    is attached at Leg B ORIGINATION (initial leg-b TwiML) so the
+ *    detector's calibration warm-up overlaps ring/setup time.
+ */
+export type StreamPurpose = "hold-canary" | "speakerphone";
+
+/** Identity carried by <Start><Stream> customParameters. */
+export interface StreamIdentity {
+  sid: string;
+  leg: "legA" | "legB";
+  purpose: StreamPurpose;
+}
+
+const PURPOSE_LEG: Record<StreamPurpose, "legA" | "legB"> = {
+  "hold-canary": "legA",
+  speakerphone: "legB",
+};
+
+/**
+ * Authenticate a media-stream `start` message. Canonical identification is
+ * the nested Twilio customParameters ONLY (sid / leg / purpose / HMAC token)
+ * — query-string session ids are never consulted (Twilio strips them).
+ * Mirrors the merge relay's scheme: missing parameters → 4400, bad token →
+ * 4403, and the socket is closed by the caller.
+ */
+export function authenticateStreamStart(
+  start: { customParameters?: Record<string, unknown> } | undefined,
+): { ok: true; identity: StreamIdentity } | { ok: false; code: number; reason: string } {
+  const p = start?.customParameters;
+  if (!p || typeof p !== "object" || Object.keys(p).length === 0) {
+    return { ok: false, code: 4400, reason: "missing customParameters" };
+  }
+  const sid = String(p.sid ?? "");
+  const leg = String(p.leg ?? "");
+  const purpose = String(p.purpose ?? "") as StreamPurpose;
+  const expectedLeg = PURPOSE_LEG[purpose];
+  if (!sid || !expectedLeg || leg !== expectedLeg) {
+    return {
+      ok: false,
+      code: 4400,
+      reason: `invalid stream parameters (sid=${sid || "?"} leg=${leg || "?"} purpose=${purpose || "?"})`,
+    };
+  }
+  if (!streamTokenValid(sid, p.token)) {
+    return { ok: false, code: 4403, reason: `invalid stream token sid=${sid}` };
+  }
+  return { ok: true, identity: { sid, leg: expectedLeg, purpose } };
 }
 
 /**
- * Resolve a stream's Twilio CallSid to a verification session via
- * verification_sessions.legACallSid and build the relayguard analyzers for
- * it (speakerphone detector + second-call hold detector). Returns null —
- * gracefully, no throw — when the CallSid is not a known Leg A call or the
- * lookup fails.
+ * Sessions with ACTIVE speakerphone suspicion (set by the Leg B
+ * SpeakerphoneDetector's onSuspicious, cleared by onClean or stream close).
+ * Cross-connection replacement for the old same-connection `sp.isSuspecting`
+ * check: the HoldDetector's disengage path consults this so the merge tone
+ * stays armed while suspicion is active.
  */
-async function legAAnalyzers(callSid: string): Promise<LegAAnalyzers | null> {
+const speakerphoneSuspicion = new Set<string>();
+
+/** True while the speakerphone detector is suspecting for this session. */
+export function isSpeakerphoneSuspecting(sid: string): boolean {
+  return speakerphoneSuspicion.has(sid);
+}
+
+/** Detectors attached to one stream (at most one of sp/hold is set). */
+interface StreamAnalyzers {
+  sp: SpeakerphoneDetector | null;
+  hold: HoldDetector | null;
+}
+
+/**
+ * Live per-connection state, exposed for tests/inspection. Entries are added
+ * on an authenticated `start` and removed on socket close.
+ */
+export interface ActiveStream extends StreamAnalyzers {
+  sid: string;
+  purpose: StreamPurpose;
+  /** Armed in-call merge-tone recognizer (hold-canary streams only). */
+  merge: MergeToneDetector | null;
+  frames: number;
+}
+export const activeStreams = new Set<ActiveStream>();
+
+/**
+ * Build the relayguard analyzers for an authenticated stream, routed by
+ * purpose (see StreamPurpose). Returns null — gracefully, no throw — when
+ * the session is unknown or the lookup fails.
+ */
+async function buildAnalyzers(
+  sid: string,
+  purpose: StreamPurpose,
+): Promise<StreamAnalyzers | null> {
   try {
-    const session = await vs.findSessionByLegACallSid(callSid);
+    const session = await vs.findSession(sid);
     if (!session) {
       console.log(
-        `[verify-stream] stream start callSid=${callSid} — not a Leg A (callee) call, no speakerphone/hold detection`,
+        `[verify-stream] stream start sid=${sid} purpose=${purpose} — session not found, no detectors attached`,
       );
       return null;
     }
-    const sid = session.sessionId;
-    const sp = new SpeakerphoneDetector({
+    const bridged = session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid);
+    if (purpose === "speakerphone") {
+      const sp = new SpeakerphoneDetector({
       // 3 consecutive suspicious 1s windows by default (sustained ~3s
       // speakerphone-relay detection), env-tunable via
       // VERIFY_SPEAKERPHONE_ARM_WINDOWS. Arming requires verdict
       // 'SUSPICIOUS RELAY' AND a RED (>=0.6) relay fingerprint on every one
       // of those windows — AMBER never arms.
       consecutiveWindows: vs.speakerphoneArmWindows(),
-      // Calibration warm-up after BRIDGED (default 8s): the detector rebuilds
-      // its rolling baseline from live in-call audio and CANNOT arm — normal
-      // conversation/ringback no longer false-arms the forensic challenge
-      // seconds into the bridge.
-      warmupMs: vs.forensicsWarmupMs(),
-      // D2: suspicion may only accumulate while BRIDGED — pre-bridge windows
-      // (incl. the race between the actual bridge and the bridged-flag
-      // refresh) never build a streak, so the warm-up can't be outrun by
-      // false-RED windows.
-      armOnlyWhenBridged: true,
-      bridged: session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid),
-      onSuspicious: (score, detail) => handleSpeakerphoneSuspicious(sid, score, detail),
-      onClean: (detail) => {
-        console.log(`[verify-stream] SPEAKERPHONE CLEARED sid=${sid} ${detail}`);
-        void vs
-          .onSpeakerphoneCleared(sid, detail)
-          .catch((err) => console.error("[verify-stream] onSpeakerphoneCleared error:", err));
-      },
-    });
-    // Second-call (call-waiting / add-call) hold detector. Armed ONLY while
-    // the session is BRIDGED — the armed flag is refreshed from the
-    // verification store on stream start and periodically thereafter (see
-    // the connection handler). Engage arms the continuous merge tone;
+        // Calibration warm-up after BRIDGED (default 8s): the detector
+        // rebuilds its rolling baseline from live in-call audio and CANNOT
+        // arm — normal conversation/ringback no longer false-arms the
+        // forensic challenge seconds into the bridge. The stream attaches at
+        // Leg B ORIGINATION, so this warm-up overlaps ring/setup time.
+        warmupMs: vs.forensicsWarmupMs(),
+        // D2: suspicion may only accumulate while BRIDGED — pre-bridge
+        // windows (incl. the race between the actual bridge and the
+        // bridged-flag refresh) never build a streak, so the warm-up can't
+        // be outrun by false-RED windows.
+        armOnlyWhenBridged: true,
+        bridged,
+        onSuspicious: (score, detail) => {
+          speakerphoneSuspicion.add(sid);
+          handleSpeakerphoneSuspicious(sid, score, detail);
+        },
+        onClean: (detail) => {
+          speakerphoneSuspicion.delete(sid);
+          console.log(`[verify-stream] SPEAKERPHONE CLEARED sid=${sid} ${detail}`);
+          void vs
+            .onSpeakerphoneCleared(sid, detail)
+            .catch((err) => console.error("[verify-stream] onSpeakerphoneCleared error:", err));
+        },
+      });
+      return { sp, hold: null };
+    }
+    // hold-canary (Leg A uplink): second-call (call-waiting / add-call) hold
+    // detector ONLY — speakerphone analysis lives on the Leg B stream. Armed
+    // ONLY while the session is BRIDGED — the armed flag is refreshed from
+    // the verification store on stream start and periodically thereafter
+    // (see the connection handler). Engage arms the continuous merge tone;
     // disengage disarms it unless speakerphone suspicion is active.
     const hold = new HoldDetector({
       sessionId: sid,
-      armed: session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid),
+      armed: bridged,
       onSecondCallEngaged: (engagedSid) => {
         console.warn(`[verify-stream] SECOND CALL ENGAGED sid=${engagedSid}`);
         void vs
@@ -485,7 +637,7 @@ async function legAAnalyzers(callSid: string): Promise<LegAAnalyzers | null> {
           .catch((err) => console.error("[verify-stream] onSecondCallEngaged error:", err));
       },
       onSecondCallDisengaged: (disengagedSid) => {
-        if (sp.isSuspecting) {
+        if (isSpeakerphoneSuspecting(disengagedSid)) {
           // Speakerphone suspicion is active — the merge tone stays armed
           // (suspicion is itself a merge-risk signal); skip the disarm.
           console.log(
@@ -499,16 +651,18 @@ async function legAAnalyzers(callSid: string): Promise<LegAAnalyzers | null> {
           .catch((err) => console.error("[verify-stream] onSecondCallDisengaged error:", err));
       },
     });
-    return { sp, hold };
+    return { sp: null, hold };
   } catch (err) {
-    console.error(`[verify-stream] Leg A session lookup failed callSid=${callSid}:`, err);
+    console.error(`[verify-stream] session lookup failed sid=${sid} purpose=${purpose}:`, err);
     return null;
   }
 }
 
 /**
  * Attach the verification media-stream WebSocket endpoint to the HTTP server.
- * Twilio connects to wss://{PUBLIC_BASE_URL}/api/verify/stream?sid=<sessionId>.
+ * Twilio connects to the BARE wss://{PUBLIC_BASE_URL}/api/verify/stream —
+ * identity arrives in the `start` message's customParameters (Twilio strips
+ * query strings on Stream URLs).
  */
 export function attachVerificationStreamServer(server: HttpServer): void {
   const wss = new WebSocketServer({ noServer: true });
@@ -527,37 +681,27 @@ export function attachVerificationStreamServer(server: HttpServer): void {
     });
   });
 
-  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    const sid = new URL(req.url ?? "", "http://localhost").searchParams.get("sid") ?? "";
-    // Dynamic energy floor: while the merge tone is ARMED (second call
-    // engaged via the HoldDetector) a genuine merged echo returns LOUD, so
-    // the elevated VERIFY_MERGE_TONE_ENERGY_FLOOR applies; pre-bridge and
-    // unarmed audio keeps the legacy 1e6 floor.
-    const detector = new MergeToneDetector({
-      energyFloor: () => (vs.isMergeToneArmed(sid) ? vs.mergeToneEnergyFloor() : 1e6),
-    });
-    // Relayguard Leg A analyzers (speakerphone + second-call hold detector)
-    // — attached LAZILY on the stream's `start` event, and only when the
-    // Twilio CallSid resolves to a session's legACallSid. Only CALLEE-side
-    // (Leg A) audio is ANALYZED: the outer speakerphone case is detected on
-    // the callee's uplink, but on suspicion the challenge noise is announced
-    // to the CALLER (inmate) participant ONLY — the callee/Leg A participant
-    // NEVER gets it (that announce channel belongs to the DTMF merge tone),
-    // and the call is NEVER hung up or redirected from here. Leg B merge
-    // detection runs on the external relay (VERIFY_STREAM_URL), so no
-    // analyzers attach there.
-    let analyzers: LegAAnalyzers | null = null;
-    // Frames since the hold detector's armed flag was last refreshed from
-    // the verification store (armed only while the session is BRIDGED).
+  wss.on("connection", (ws: WebSocket) => {
+    // Identity comes EXCLUSIVELY from the `start` message's customParameters
+    // (sid / leg / purpose / token) — the connection is unidentified until an
+    // authenticated start arrives, and pre-start audio is dropped. The old
+    // ?sid= query-string identity is GONE (Twilio strips query strings on
+    // Stream URLs, so it never arrived in production).
+    let state: ActiveStream | null = null;
+    // Frames since the detectors' armed/bridged flags were last refreshed
+    // from the verification store (armed only while the session is BRIDGED).
     let sinceArmedRefresh = 0;
-    let frames = 0;
-    console.log(`[verify-stream] connected sid=${sid}`);
+    console.log("[verify-stream] connected (awaiting authenticated start)");
 
     ws.on("message", (data: Buffer) => {
       let msg: {
         event?: string;
         media?: { track?: string; payload?: string };
-        start?: { callSid?: string };
+        start?: {
+          callSid?: string;
+          streamSid?: string;
+          customParameters?: Record<string, unknown>;
+        };
       };
       try {
         msg = JSON.parse(data.toString("utf8"));
@@ -565,31 +709,66 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         return;
       }
       if (msg.event === "start") {
-        const callSid = msg.start?.callSid ?? "";
-        if (callSid) {
-          void legAAnalyzers(callSid)
-            .then((a) => {
-              if (a) analyzers = a;
-            })
-            .catch((err) =>
-              console.error("[verify-stream] Leg A analyzer attach error:", err),
-            );
+        if (state) return; // already identified — ignore duplicate starts
+        const auth = authenticateStreamStart(msg.start);
+        if (!auth.ok) {
+          console.warn(`[verify-stream] ${auth.reason} — closing (${auth.code})`);
+          try {
+            ws.close(auth.code, auth.reason.slice(0, 120));
+          } catch {
+            /* ignore */
+          }
+          return;
         }
+        const { sid, purpose } = auth.identity;
+        // The in-call ARMED merge-tone recognizer runs on the Leg A
+        // hold-canary stream only. Dynamic energy floor: while the merge tone
+        // is ARMED (second call engaged via the HoldDetector) a genuine
+        // merged echo returns LOUD, so the elevated
+        // VERIFY_MERGE_TONE_ENERGY_FLOOR applies; pre-bridge and unarmed
+        // audio keeps the legacy 1e6 floor. Leg B merge-tone detection is the
+        // external relay's job — the speakerphone stream gets NO merge
+        // recognizer here.
+        const merge =
+          purpose === "hold-canary"
+            ? new MergeToneDetector({
+                energyFloor: () =>
+                  vs.isMergeToneArmed(sid) ? vs.mergeToneEnergyFloor() : 1e6,
+              })
+            : null;
+        state = { sid, purpose, sp: null, hold: null, merge, frames: 0 };
+        activeStreams.add(state);
+        console.log(
+          `[verify-stream] stream start sid=${sid} leg=${auth.identity.leg} purpose=${purpose} streamSid=${msg.start?.streamSid ?? ""} callSid=${msg.start?.callSid ?? ""}`,
+        );
+        void buildAnalyzers(sid, purpose)
+          .then((a) => {
+            if (a && state) {
+              state.sp = a.sp;
+              state.hold = a.hold;
+            }
+          })
+          .catch((err) =>
+            console.error("[verify-stream] analyzer attach error:", err),
+          );
         return;
       }
       if (msg.event !== "media" || !msg.media?.payload) return;
       if (msg.media.track && msg.media.track !== "inbound") return;
-      frames++;
-      analyzers?.sp.push(msg.media.payload);
-      if (analyzers) {
-        analyzers.hold.push(msg.media.payload);
+      if (!state) return; // unidentified — drop audio
+      const st = state;
+      st.frames++;
+      const payload = msg.media.payload;
+      st.sp?.push(payload);
+      st.hold?.push(payload);
+      if (st.sp || st.hold) {
         // D2: event-driven bridge sync — bridgeGuardedLive() flips an
         // in-process registry flag SYNCHRONOUSLY with the bridge, so the
         // detectors see BRIDGED on the very next media frame (not the next
         // DB poll below) and the forensic warm-up starts immediately.
-        if (vs.isBridgedSession(sid)) {
-          analyzers.hold.setArmed(true);
-          analyzers.sp.setBridged(true);
+        if (vs.isBridgedSession(st.sid)) {
+          st.hold?.setArmed(true);
+          st.sp?.setBridged(true);
         }
         // Refresh the hold detector's armed flag AND the speakerphone
         // detector's BRIDGED flag (calibration warm-up starts on the
@@ -600,33 +779,45 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         sinceArmedRefresh++;
         if (sinceArmedRefresh >= 25) {
           sinceArmedRefresh = 0;
-          const hold = analyzers.hold;
-          const sp = analyzers.sp;
+          const hold = st.hold;
+          const sp = st.sp;
           void vs
-            .findSession(sid)
+            .findSession(st.sid)
             .then((s) => {
               const bridged = s?.state === vs.VState.BRIDGED;
-              hold.setArmed(bridged);
-              sp.setBridged(bridged);
+              hold?.setArmed(Boolean(bridged));
+              sp?.setBridged(Boolean(bridged));
             })
             .catch((err) =>
               console.error("[verify-stream] hold armed refresh error:", err),
             );
         }
       }
-      if (detector.push(msg.media.payload)) {
+      if (st.merge?.push(payload)) {
         console.log(
-          `[verify-stream] MERGE TONE DETECTED sid=${sid} after ${frames} frames (~${frames * 20}ms of audio)`,
+          `[verify-stream] MERGE TONE DETECTED sid=${st.sid} after ${st.frames} frames (~${st.frames * 20}ms of audio)`,
         );
-        void handleMergeToneFire(sid)
+        void handleMergeToneFire(st.sid)
           .catch((err) => console.error("[verify-stream] fire error:", err));
       }
     });
 
     ws.on("close", () => {
-      console.log(`[verify-stream] closed sid=${sid} frames=${frames}`);
+      if (state) {
+        activeStreams.delete(state);
+        // The live detector owns suspicion — a dead speakerphone stream must
+        // not leave a stale "suspecting" marker blocking merge-tone disarm.
+        if (state.purpose === "speakerphone") speakerphoneSuspicion.delete(state.sid);
+        console.log(
+          `[verify-stream] closed sid=${state.sid} purpose=${state.purpose} frames=${state.frames}`,
+        );
+      } else {
+        console.log("[verify-stream] closed (unidentified)");
+      }
     });
-    ws.on("error", (err) => console.error(`[verify-stream] ws error sid=${sid}:`, err));
+    ws.on("error", (err) =>
+      console.error(`[verify-stream] ws error sid=${state?.sid ?? "?"}:`, err),
+    );
   });
 }
 

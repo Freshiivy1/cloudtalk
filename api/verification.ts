@@ -212,11 +212,16 @@ export type DetectionPhaseValue = (typeof DetectionPhase)[keyof typeof Detection
  * Readiness deadline (ms) after Leg B answers. If the relay's stream-ready
  * callback has not arrived by then, the session is DETECTION_FAILED (missing
  * readiness) — a live call without monitoring is never allowed to continue.
- * Env-overridable via VERIFY_STREAM_READY_TIMEOUT_MS (mainly for tests).
+ * Default 45s: the merge relay runs on Render's free tier and a cold start
+ * takes ~22s, so the old 15s default could expire before a sleeping relay
+ * even woke (wakeRelay() at session initiation mitigates this; the deadline
+ * is the backstop). Env-overridable via VERIFY_STREAM_READY_TIMEOUT_MS
+ * (mainly for tests). The in-process watchdog timer is scheduled at arming
+ * (scheduleReadinessWatchdog in onLegBAnswered / the recall re-arm).
  */
 export function streamReadyTimeoutMs(): number {
   const v = Number(process.env.VERIFY_STREAM_READY_TIMEOUT_MS);
-  return Number.isFinite(v) && v > 0 ? v : 15_000;
+  return Number.isFinite(v) && v > 0 ? v : 45_000;
 }
 
 /**
@@ -1295,6 +1300,14 @@ export async function initiate(
 
   const created = (await findSession(sessionId))!;
 
+  // Render free-tier cold start: the merge relay sleeps after 15 min idle and
+  // its first request takes ~22s. Ping /health NOW (best-effort, never
+  // blocks or fails the call) so the relay is warm by the time Leg B is
+  // originated and the stream-readiness deadline starts.
+  void import("./verification-stream")
+    .then((m) => m.wakeRelay())
+    .catch(() => {});
+
   if (input.callerClient) {
     // Guarded inmate call: NO REST-originated caller leg. The browser
     // softphone places the OUTBOUND Twilio Voice SDK call itself right after
@@ -1407,6 +1420,12 @@ export async function onGuardedCallerConnected(
   ) {
     session.callerCallSid = callSid;
     await save(session);
+    // Re-wake the merge relay (CALLER_HOLDING, right before Leg A): a guarded
+    // session may sit through voice-ID long enough for Render to sleep again.
+    // Best-effort — never blocks or fails the call.
+    void import("./verification-stream")
+      .then((m) => m.wakeRelay())
+      .catch(() => {});
     await originateAndDialLegA(session);
     return true;
   }

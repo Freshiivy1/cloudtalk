@@ -30,7 +30,7 @@ import type { Context } from "hono";
 import fs from "fs";
 import path from "path";
 import * as vs from "./verification";
-import { legAStreamUrl, relayStreamUrl, streamToken } from "./verification-stream";
+import { inProcessStreamUrl, relayStreamUrl, streamToken } from "./verification-stream";
 import { PROMPT_LIGHT_DURATION_MS, PROMPT_LIGHT_WAV_FILE } from "./generated/prompt-light-asset";
 import {
   CHALLENGE_NOISE_LEVEL,
@@ -359,17 +359,25 @@ export async function verificationTwimlHandler(c: Context) {
           vr.hangup();
           break;
         }
-        // Outer speakerphone detection: open a NON-BLOCKING <Start><Stream>
-        // of the callee's uplink (inbound track) to the in-process relayguard
-        // analyzer. <Start> does not hold or alter the call — the gather
-        // flow below is untouched — and the stream persists for the rest of
-        // the call, so it is started once (first prompt only, not on
-        // re-prompt redirects). Detection always uses the in-process stream
-        // endpoint; Leg B merge detection stays on the external relay.
+        // Hold-canary forensics: open a NON-BLOCKING <Start><Stream> of the
+        // callee's uplink (inbound track) to the in-process analyzer
+        // (HoldDetector second-call engagement + armed merge-tone recognizer;
+        // speakerphone analysis lives on the LEG B stream — Leg A is HELD
+        // after Leg B answers, so relay audio never reaches this stream).
+        // <Start> does not hold or alter the call — the gather flow below is
+        // untouched — and the stream persists for the rest of the call, so it
+        // is started once (first prompt only, not on re-prompt redirects).
+        // Identity travels ONLY in customParameters (sid / leg=legA /
+        // purpose=hold-canary / HMAC token): Twilio strips query strings on
+        // Stream URLs, so the URL is BARE.
         if (a === 0) {
-          const streamUrl = legAStreamUrl(sid);
-          if (streamUrl) {
-            vr.start().stream({ url: streamUrl, track: "inbound_track" });
+          const streamUrl = inProcessStreamUrl();
+          if (streamUrl && process.env.VERIFY_STREAM_SECRET) {
+            const start = vr.start().stream({ url: streamUrl, track: "inbound_track" });
+            start.parameter({ name: "sid", value: sid });
+            start.parameter({ name: "leg", value: "legA" });
+            start.parameter({ name: "purpose", value: "hold-canary" });
+            start.parameter({ name: "token", value: streamToken(sid) });
           }
         }
         const gather = vr.gather({
@@ -514,6 +522,17 @@ export async function verificationTwimlHandler(c: Context) {
           start.parameter({ name: "leg", value: "legB" });
           start.parameter({ name: "mode", value: "merge-detection" });
           start.parameter({ name: "token", value: streamToken(sid) });
+          // Re-open the in-process speakerphone stream too — the recall leg
+          // is the callee's NEW live leg, and the old call's speakerphone
+          // stream died with it.
+          const inProcessUrl = inProcessStreamUrl();
+          if (inProcessUrl) {
+            const spStart = vr.start().stream({ url: inProcessUrl, track: "inbound_track" });
+            spStart.parameter({ name: "sid", value: sid });
+            spStart.parameter({ name: "leg", value: "legB" });
+            spStart.parameter({ name: "purpose", value: "speakerphone" });
+            spStart.parameter({ name: "token", value: streamToken(sid) });
+          }
         }
         vr.say("Reconnecting your call now.");
         serveBridgeConference(vr, sid, "recall");
@@ -562,6 +581,21 @@ export async function verificationTwimlHandler(c: Context) {
         start.parameter({ name: "leg", value: "legB" });
         start.parameter({ name: "mode", value: "merge-detection" });
         start.parameter({ name: "token", value: streamToken(sid) });
+        // SECOND inbound stream (Twilio allows multiple unidirectional
+        // streams per call): in-process SPEAKERPHONE detection on Leg B's
+        // inbound audio. Relayed audio enters the ACTIVE Leg B microphone —
+        // Leg A is held after answer, so this is the only leg where a
+        // speakerphone relay is detectable. Attached HERE, at ORIGINATION
+        // (same document as the merge stream + conference dial), so the
+        // detector's calibration warm-up overlaps Leg B ring/setup time.
+        const inProcessUrl = inProcessStreamUrl();
+        if (inProcessUrl) {
+          const spStart = vr.start().stream({ url: inProcessUrl, track: "inbound_track" });
+          spStart.parameter({ name: "sid", value: sid });
+          spStart.parameter({ name: "leg", value: "legB" });
+          spStart.parameter({ name: "purpose", value: "speakerphone" });
+          spStart.parameter({ name: "token", value: streamToken(sid) });
+        }
         const session = sid ? await vs.findSession(sid) : null;
         if (session?.guarded) {
           // Join the browser caller in the live conference (Leg B = anchor).

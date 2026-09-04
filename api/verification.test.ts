@@ -170,11 +170,13 @@ describe("normalizeE164", () => {
 });
 
 describe("two-phase challenge config (corrected architecture)", () => {
-  it("stream readiness timeout defaults to 15s (env-overridable)", () => {
+  it("stream readiness timeout defaults to 45s (env-overridable)", () => {
     const saved = process.env.VERIFY_STREAM_READY_TIMEOUT_MS;
     delete process.env.VERIFY_STREAM_READY_TIMEOUT_MS;
     try {
-      expect(vs.streamReadyTimeoutMs()).toBe(15_000);
+      // 45s default: outlives a Render free-tier cold start (~22s) so a
+      // sleeping relay cannot independently break first-call monitoring.
+      expect(vs.streamReadyTimeoutMs()).toBe(45_000);
       process.env.VERIFY_STREAM_READY_TIMEOUT_MS = "5000";
       expect(vs.streamReadyTimeoutMs()).toBe(5_000);
     } finally {
@@ -1589,14 +1591,24 @@ import {
   verificationRecordingHandler,
 } from "./verification-record";
 import {
+  activeStreams,
+  attachVerificationStreamServer,
+  authenticateStreamStart,
   handleMergeToneFire,
   handleSpeakerphoneSuspicious,
+  inProcessStreamUrl,
+  isSpeakerphoneSuspecting,
   verificationStreamDetectedHandler,
   verificationStreamFailedHandler,
   verificationStreamReadyHandler,
   relayStreamUrl,
+  setRelayWarmupFetch,
   streamToken,
+  streamTokenValid,
+  wakeRelay,
 } from "./verification-stream";
+import { SpeakerphoneDetector } from "./relayguard/speakerphone-detector";
+import { HoldDetector } from "./relayguard/hold-detector";
 import {
   mergeToneHandler,
   promptLightHandler,
@@ -1689,6 +1701,19 @@ describe("webhooks", () => {
       const streamUrl = body.match(/<Stream[^>]*url="([^"]+)"/)?.[1];
       expect(streamUrl).toBe("wss://relay.example.com/stream");
       expect(streamUrl).not.toContain("?sid=");
+      // SECOND inbound stream: in-process SPEAKERPHONE detection on Leg B,
+      // attached AT ORIGINATION (same document) so the detector warm-up
+      // overlaps ring/setup. Bare in-process URL + customParameters identity
+      // (sid / leg=legB / purpose=speakerphone / HMAC token).
+      const streamUrls = [...body.matchAll(/<Stream[^>]*url="([^"]+)"/g)].map((m) => m[1]);
+      expect(streamUrls).toEqual([
+        "wss://relay.example.com/stream",
+        "wss://verify-test.example.com/api/verify/stream",
+      ]);
+      expect(streamUrls[1]).not.toContain("?");
+      expect(body).toContain('<Parameter name="purpose" value="speakerphone"');
+      expect(body.match(/<Parameter name="leg" value="legB"/g)).toHaveLength(2);
+      expect(body.match(new RegExp(`<Parameter name="token" value="${streamToken(s.sessionId)}"`, "g"))).toHaveLength(2);
       // Immediately continues into the live conference with the browser
       // caller (Leg B = anchor; caller joiner exits end the room).
       expect(body).toContain("<Dial>");
@@ -1718,6 +1743,10 @@ describe("webhooks", () => {
       const body = await res.text();
       expect(body).toContain("<Start>");
       expect(body).toContain('<Parameter name="mode" value="merge-detection"');
+      // Second inbound stream: in-process speakerphone detection (Leg B).
+      expect(body).toContain('<Parameter name="purpose" value="speakerphone"');
+      expect(body).toContain("wss://verify-test.example.com/api/verify/stream");
+      expect(body).not.toContain("/api/verify/stream?sid=");
       expect(body).not.toContain("<Conference");
       expect(body).toContain("<Pause");
       expect(body).toContain(`/api/verify/twiml/leg-b-hold?sid=${s.sessionId}`);
@@ -2217,23 +2246,37 @@ const tick = (ms = 300) => new Promise((r) => setTimeout(r, ms));
 
 describe("Leg A press-1 IVR", () => {
   it("leg-a TwiML serves the accept prompt in a numDigits=1 Gather", async () => {
-    const res = await postForm("/api/verify/twiml/leg-a?sid=abc123");
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).toContain("<Gather");
-    expect(body).toContain('numDigits="1"');
-    // Current acceptance prompt (verifyPrompts().accept — CALL-FLOW.md Phase 2).
-    expect(body).toContain(
-      "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
-    );
-    expect(body).toContain("/api/verify/gather/leg-a-accept?sid=abc123");
-    // timeout falls through to a re-prompt redirect (attempt incremented)
-    expect(body).toContain("&amp;a=1");
-    // Outer speakerphone detection: non-blocking <Start><Stream> of the
-    // callee's uplink to the in-process stream endpoint (first prompt only).
-    expect(body).toContain("<Start>");
-    expect(body).toContain("/api/verify/stream?sid=abc123");
-    expect(body).toContain('track="inbound_track"');
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const res = await postForm("/api/verify/twiml/leg-a?sid=abc123");
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toContain("<Gather");
+      expect(body).toContain('numDigits="1"');
+      // Current acceptance prompt (verifyPrompts().accept — CALL-FLOW.md Phase 2).
+      expect(body).toContain(
+        "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
+      );
+      expect(body).toContain("/api/verify/gather/leg-a-accept?sid=abc123");
+      // timeout falls through to a re-prompt redirect (attempt incremented)
+      expect(body).toContain("&amp;a=1");
+      // Hold-canary forensics: non-blocking <Start><Stream> of the callee's
+      // uplink to the in-process stream endpoint (first prompt only). The
+      // Stream URL is BARE — Twilio strips query strings on Stream URLs, so
+      // identity travels ONLY in customParameters.
+      expect(body).toContain("<Start>");
+      const streamUrl = body.match(/<Stream[^>]*url="([^"]+)"/)?.[1];
+      expect(streamUrl).toBe("wss://verify-test.example.com/api/verify/stream");
+      expect(streamUrl).not.toContain("?");
+      expect(body).not.toContain("/api/verify/stream?sid=");
+      expect(body).toContain('<Parameter name="sid" value="abc123"');
+      expect(body).toContain('<Parameter name="leg" value="legA"');
+      expect(body).toContain('<Parameter name="purpose" value="hold-canary"');
+      expect(body).toContain(`<Parameter name="token" value="${streamToken("abc123")}"`);
+      expect(body).toContain('track="inbound_track"');
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
   });
 
   it("leg-a re-prompt (a>0) does not start a duplicate media stream", async () => {
@@ -2647,6 +2690,7 @@ describe("guarded single-call flow", () => {
   });
 
   it("guarded leg-a TwiML serves the inmate acceptance gather plus the Leg A media stream", async () => {
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
     const g = await makeSession(vs.VState.LEG_A_DIALING, { guarded: true });
     const gRes = await postForm(`/api/verify/twiml/leg-a?sid=${g.sessionId}`);
     expect(gRes.status).toBe(200);
@@ -2657,9 +2701,15 @@ describe("guarded single-call flow", () => {
     );
     // TwiML is XML — query-string '&' is emitted correctly escaped as '&amp;'.
     expect(gBody).toContain(`/api/verify/gather/leg-a-accept?sid=${g.sessionId}&amp;a=0`);
-    // Media stream attached on the first fetch (inbound callee uplink).
+    // Media stream attached on the first fetch (inbound callee uplink) —
+    // bare URL + customParameters identity (no query-string sid).
     expect(gBody).toContain("<Start>");
-    expect(gBody).toContain(`/api/verify/stream?sid=${g.sessionId}`);
+    const gStreamUrl = gBody.match(/<Stream[^>]*url="([^"]+)"/)?.[1];
+    expect(gStreamUrl).toBe("wss://verify-test.example.com/api/verify/stream");
+    expect(gBody).not.toContain("/api/verify/stream?sid=");
+    expect(gBody).toContain(`<Parameter name="sid" value="${g.sessionId}"`);
+    expect(gBody).toContain('<Parameter name="leg" value="legA"');
+    expect(gBody).toContain('<Parameter name="purpose" value="hold-canary"');
     expect(gBody).toContain('track="inbound_track"');
     // No direct bridge and no voice-ID recording before press-1.
     expect(gBody).not.toContain("<Dial>");
@@ -2675,6 +2725,7 @@ describe("guarded single-call flow", () => {
     expect(pBody).toContain("<Gather");
     expect(pBody).toContain("You are receiving a call from an inmate");
     expect((await vs.findSession(p.sessionId))!.state).toBe(vs.VState.LEG_A_DIALING);
+    delete process.env.VERIFY_STREAM_SECRET;
   });
 
   it("guarded press-1 records the save-only voice-ID phrase and falls forward to the ready gather", async () => {
@@ -3789,6 +3840,11 @@ describe("bridge supervisor", () => {
       expect(body).toContain('track="inbound_track"');
       expect(body).toContain('<Parameter name="leg" value="legB"');
       expect(body).toContain('<Parameter name="mode" value="merge-detection"');
+      // ...AND the in-process speakerphone stream (the old call's stream died
+      // with it): bare in-process URL + customParameters identity.
+      expect(body).toContain('<Parameter name="purpose" value="speakerphone"');
+      expect(body).toContain("wss://verify-test.example.com/api/verify/stream");
+      expect(body).not.toContain("/api/verify/stream?sid=");
       // Recall leg can start the room (caller may have left) but never ends it.
       expect(body).toContain('startConferenceOnEnter="true"');
       expect(body).toContain('endConferenceOnExit="false"');
@@ -3811,5 +3867,368 @@ describe("bridge supervisor", () => {
     const json = (await res.json()) as { commit: string; time: string };
     expect(json).toHaveProperty("commit");
     expect(json).toHaveProperty("time");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* In-process media stream: customParameters identity, auth, purpose routing   */
+/* -------------------------------------------------------------------------- */
+
+import { createServer, type Server as HttpServer } from "http";
+import type { AddressInfo } from "net";
+import { WebSocket } from "ws";
+
+describe("in-process stream identity (customParameters, no query string)", () => {
+  it("inProcessStreamUrl is a BARE wss URL (Twilio strips Stream query strings)", () => {
+    const url = inProcessStreamUrl();
+    expect(url).toBe("wss://verify-test.example.com/api/verify/stream");
+    expect(url).not.toContain("?");
+  });
+
+  it("streamTokenValid accepts the per-session HMAC, rejects bad/missing tokens", () => {
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      expect(streamTokenValid("abc123", streamToken("abc123"))).toBe(true);
+      expect(streamTokenValid("abc123", streamToken("other"))).toBe(false);
+      expect(streamTokenValid("abc123", "deadbeef")).toBe(false);
+      expect(streamTokenValid("abc123", "")).toBe(false);
+      expect(streamTokenValid("abc123", undefined)).toBe(false);
+      expect(streamTokenValid("", streamToken("abc123"))).toBe(false);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+    // No secret configured → nothing validates.
+    expect(streamTokenValid("abc123", streamToken("abc123"))).toBe(false);
+  });
+
+  it("authenticateStreamStart routes by purpose and rejects bad identity", () => {
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const good = authenticateStreamStart({
+        customParameters: {
+          sid: "abc123",
+          leg: "legB",
+          purpose: "speakerphone",
+          token: streamToken("abc123"),
+        },
+      });
+      expect(good).toEqual({
+        ok: true,
+        identity: { sid: "abc123", leg: "legB", purpose: "speakerphone" },
+      });
+      const canary = authenticateStreamStart({
+        customParameters: {
+          sid: "abc123",
+          leg: "legA",
+          purpose: "hold-canary",
+          token: streamToken("abc123"),
+        },
+      });
+      expect(canary).toEqual({
+        ok: true,
+        identity: { sid: "abc123", leg: "legA", purpose: "hold-canary" },
+      });
+      // Missing customParameters entirely (the old query-string-only stream).
+      const none = authenticateStreamStart(undefined);
+      expect(none.ok).toBe(false);
+      if (!none.ok) expect(none.code).toBe(4400);
+      // leg/purpose mismatch and unknown purpose.
+      for (const p of [
+        { sid: "abc123", leg: "legB", purpose: "hold-canary", token: streamToken("abc123") },
+        { sid: "abc123", leg: "legA", purpose: "speakerphone", token: streamToken("abc123") },
+        { sid: "abc123", leg: "legA", purpose: "bogus", token: streamToken("abc123") },
+        { sid: "", leg: "legA", purpose: "hold-canary", token: streamToken("abc123") },
+      ]) {
+        const r = authenticateStreamStart({ customParameters: p });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.code).toBe(4400);
+      }
+      // Valid shape, bad token → 4403.
+      const badToken = authenticateStreamStart({
+        customParameters: {
+          sid: "abc123",
+          leg: "legA",
+          purpose: "hold-canary",
+          token: streamToken("attacker"),
+        },
+      });
+      expect(badToken.ok).toBe(false);
+      if (!badToken.ok) expect(badToken.code).toBe(4403);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+});
+
+describe("in-process stream WebSocket (auth + detector routing)", () => {
+  let server: HttpServer | undefined;
+  let wsUrl = "";
+
+  const SILENCE_FRAME = Buffer.alloc(160, 0xff).toString("base64");
+
+  async function connect(): Promise<WebSocket> {
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve, reject) => {
+      ws.on("open", () => resolve());
+      ws.on("error", reject);
+    });
+    return ws;
+  }
+
+  function sendStart(ws: WebSocket, params: Record<string, string> | null): void {
+    ws.send(
+      JSON.stringify({
+        event: "start",
+        sequenceNumber: "1",
+        start: {
+          streamSid: "MZ_test_stream",
+          callSid: "CA_test_call",
+          tracks: ["inbound"],
+          ...(params ? { customParameters: params } : {}),
+        },
+      }),
+    );
+  }
+
+  function sendMedia(ws: WebSocket, n = 3): void {
+    for (let i = 0; i < n; i++) {
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          sequenceNumber: String(i + 2),
+          media: { track: "inbound", payload: SILENCE_FRAME },
+        }),
+      );
+    }
+  }
+
+  function closeCode(ws: WebSocket): Promise<number> {
+    return new Promise((resolve) => ws.on("close", (code) => resolve(code)));
+  }
+
+  /** Wait until the stream is registered AND its detectors are attached. */
+  async function waitAttached(sid: string) {
+    for (let i = 0; i < 200; i++) {
+      const st = [...activeStreams].find(
+        (s) => s.sid === sid && (s.sp !== null || s.hold !== null),
+      );
+      if (st) return st;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`stream ${sid} never attached detectors`);
+  }
+
+  async function boot() {
+    if (server) return;
+    const srv = createServer();
+    attachVerificationStreamServer(srv);
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    server = srv;
+    wsUrl = `ws://127.0.0.1:${(srv.address() as AddressInfo).port}/api/verify/stream`;
+  }
+
+  afterAll(async () => {
+    if (server) await new Promise((r) => server!.close(r));
+  });
+
+  it("rejects a start without customParameters (old ?sid= scheme) with 4400", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      // Even with the legacy ?sid= query param on the URL, identity is never
+      // taken from the query string.
+      const ws = new WebSocket(`${wsUrl}?sid=abc123`);
+      await new Promise<void>((resolve, reject) => {
+        ws.on("open", () => resolve());
+        ws.on("error", reject);
+      });
+      sendStart(ws, null);
+      expect(await closeCode(ws)).toBe(4400);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("rejects a bad token with 4403", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: "abc123",
+        leg: "legB",
+        purpose: "speakerphone",
+        token: streamToken("forged"),
+      });
+      expect(await closeCode(ws)).toBe(4403);
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("purpose=speakerphone (legB): frames feed the SpeakerphoneDetector ONLY", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, { guarded: true });
+    const spPush = vi.spyOn(SpeakerphoneDetector.prototype, "push");
+    const holdPush = vi.spyOn(HoldDetector.prototype, "push");
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: s.sessionId,
+        leg: "legB",
+        purpose: "speakerphone",
+        token: streamToken(s.sessionId),
+      });
+      const st = await waitAttached(s.sessionId);
+      expect(st.purpose).toBe("speakerphone");
+      expect(st.sp).toBeInstanceOf(SpeakerphoneDetector);
+      expect(st.hold).toBeNull();
+      expect(st.merge).toBeNull(); // Leg B merge-tone detection is the relay's
+      sendMedia(ws, 3);
+      await vi.waitFor(() => expect(spPush).toHaveBeenCalledTimes(3));
+      expect(holdPush).not.toHaveBeenCalled();
+      expect(st.frames).toBe(3);
+      expect(isSpeakerphoneSuspecting(s.sessionId)).toBe(false);
+      ws.close();
+    } finally {
+      spPush.mockRestore();
+      holdPush.mockRestore();
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("purpose=hold-canary (legA): frames feed the HoldDetector + armed merge recognizer, NEVER speakerphone", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const s = await makeSession(vs.VState.BRIDGED, { guarded: true });
+    const spPush = vi.spyOn(SpeakerphoneDetector.prototype, "push");
+    const holdPush = vi.spyOn(HoldDetector.prototype, "push");
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: s.sessionId,
+        leg: "legA",
+        purpose: "hold-canary",
+        token: streamToken(s.sessionId),
+      });
+      const st = await waitAttached(s.sessionId);
+      expect(st.purpose).toBe("hold-canary");
+      expect(st.hold).toBeInstanceOf(HoldDetector);
+      expect(st.sp).toBeNull(); // speakerphone analysis moved to Leg B
+      expect(st.merge).not.toBeNull(); // in-call armed merge-tone recognizer stays on Leg A
+      sendMedia(ws, 3);
+      await vi.waitFor(() => expect(holdPush).toHaveBeenCalledTimes(3));
+      expect(spPush).not.toHaveBeenCalled();
+      expect(st.frames).toBe(3);
+      ws.close();
+    } finally {
+      spPush.mockRestore();
+      holdPush.mockRestore();
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("drops media that arrives before an authenticated start", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      // Earlier tests' sockets may still be finishing their close handshake
+      // — wait for the registry to drain first so sizes are comparable.
+      await vi.waitFor(() => expect(activeStreams.size).toBe(0));
+      const ws = await connect();
+      sendMedia(ws, 2); // unidentified — must be dropped, not crash
+      await new Promise((r) => setTimeout(r, 50));
+      expect(activeStreams.size).toBe(0); // no stream registered
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      ws.close();
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+});
+
+describe("relay cold-start warm-up ping", () => {
+  it("wakeRelay GETs the relay /health (base derived from VERIFY_STREAM_URL)", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    const calls: string[] = [];
+    setRelayWarmupFetch((async (url: unknown) => {
+      calls.push(String(url));
+      return { ok: true, status: 200 };
+    }) as unknown as typeof fetch);
+    try {
+      wakeRelay();
+      await vi.waitFor(() => expect(calls).toEqual(["https://relay.example.com/health"]));
+    } finally {
+      setRelayWarmupFetch(null);
+      delete process.env.VERIFY_STREAM_URL;
+    }
+  });
+
+  it("wakeRelay is a no-op when the relay is not configured", async () => {
+    delete process.env.VERIFY_STREAM_URL;
+    const calls: string[] = [];
+    setRelayWarmupFetch((async (url: unknown) => {
+      calls.push(String(url));
+      return { ok: true };
+    }) as unknown as typeof fetch);
+    try {
+      wakeRelay();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(calls).toEqual([]);
+    } finally {
+      setRelayWarmupFetch(null);
+    }
+  });
+
+  it("wakeRelay swallows failures (logged, never thrown)", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    setRelayWarmupFetch((async () => {
+      throw new Error("connection refused");
+    }) as unknown as typeof fetch);
+    try {
+      expect(() => wakeRelay()).not.toThrow();
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      setRelayWarmupFetch(null);
+      delete process.env.VERIFY_STREAM_URL;
+    }
+  });
+
+  it("session INITIATION fires the warm-up ping (best-effort, before Leg A)", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    const calls: string[] = [];
+    setRelayWarmupFetch((async (url: unknown) => {
+      calls.push(String(url));
+      return { ok: true, status: 200 };
+    }) as unknown as typeof fetch);
+    try {
+      const s = await vs.initiate({ calleeNumber: "+61400000000" });
+      createdIds.push(s.sessionId);
+      expect(s.state).toBe(vs.VState.LEG_A_DIALING);
+      await vi.waitFor(() =>
+        expect(calls).toContain("https://relay.example.com/health"),
+      );
+    } finally {
+      setRelayWarmupFetch(null);
+      delete process.env.VERIFY_STREAM_URL;
+    }
+  });
+
+  it("a failed warm-up ping NEVER blocks or fails session initiation", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    setRelayWarmupFetch((async () => {
+      throw new Error("relay unreachable");
+    }) as unknown as typeof fetch);
+    try {
+      const s = await vs.initiate({ calleeNumber: "+61400000000" });
+      createdIds.push(s.sessionId);
+      expect(s.state).toBe(vs.VState.LEG_A_DIALING);
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_A_DIALING);
+    } finally {
+      setRelayWarmupFetch(null);
+      delete process.env.VERIFY_STREAM_URL;
+    }
   });
 });
