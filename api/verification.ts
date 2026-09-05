@@ -781,7 +781,10 @@ export async function findSession(
     .where(eq(schema.verificationSessions.sessionId, sessionId))
     .limit(1);
   if (!rows[0]) {
-    console.warn(`[verify] SESSION_NOT_FOUND sessionId=${sessionId}`);
+    // Never log a BLANK session id — an empty lookup is a caller bug, not a
+    // missing session, and must not spam (the 2026-09-02 query-string bug
+    // produced thousands of `SESSION_NOT_FOUND sessionId=` lines).
+    if (sessionId) console.warn(`[verify] SESSION_NOT_FOUND sessionId=${sessionId}`);
     return null;
   }
   return rows[0];

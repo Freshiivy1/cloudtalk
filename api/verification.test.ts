@@ -1745,6 +1745,48 @@ describe("webhooks", () => {
     expect(body).toContain("<Say>");
   });
 
+  it("AUDIO OWNERSHIP: no caller-side TwiML ever opens a Media Stream — the forensic detector can only receive callee (Leg B inbound) audio", async () => {
+    process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    try {
+      const s = await makeSession(vs.VState.INITIATED, { guarded: true });
+      // The browser/inmate caller's SDK leg:
+      const voice = await postForm("/api/voice/twiml", {
+        guarded: s.sessionId,
+        CallSid: "CA_own_sdk",
+        To: "+61400000000",
+      });
+      expect(await voice.text()).not.toContain("<Stream");
+      // The PSTN caller park + the non-blocking caller wait loop:
+      const hold = await postForm(`/api/verify/twiml/caller-hold?sid=${s.sessionId}`);
+      expect(await hold.text()).not.toContain("<Stream");
+      const wait = await postForm(`/api/verify/twiml/caller-wait?sid=${s.sessionId}`);
+      expect(await wait.text()).not.toContain("<Stream");
+      // And the bridge conference itself carries no stream either — the ONLY
+      // forensic stream in the system is Leg B's own inbound_track (callee
+      // phone → Twilio), proven by the leg-b TwiML test below. Conference
+      // mixed audio / both_tracks / caller-side audio can NEVER reach the
+      // SpeakerphoneDetector.
+      const bridge = await postForm(`/api/verify/twiml/caller-wait?sid=${s.sessionId}`);
+      expect(await bridge.text()).not.toContain('both_tracks');
+    } finally {
+      delete process.env.VERIFY_STREAM_URL;
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("findSession('') returns null WITHOUT logging a blank SESSION_NOT_FOUND (no blank-sid log spam, ever)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(await vs.findSession("")).toBeNull();
+      expect(
+        warn.mock.calls.some((c) => String(c[0]).includes("SESSION_NOT_FOUND")),
+      ).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("leg-b TwiML (guarded): non-blocking inbound Start>Stream + Dial>Conference, no prompt/gather/record", async () => {
     process.env.VERIFY_STREAM_URL = "wss://relay.example.com/stream";
     process.env.VERIFY_STREAM_SECRET = "test-secret";
@@ -4142,6 +4184,70 @@ describe("in-process stream WebSocket (auth + detector routing)", () => {
       });
       expect(await closeCode(ws)).toBe(4403);
     } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("FAIL CLOSED: a well-formed start for an UNKNOWN session is one authoritative failure (4404), never a silent-clean stream", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: "no-such-session",
+        leg: "legB",
+        purpose: "speakerphone",
+        token: streamToken("no-such-session"),
+      });
+      expect(await closeCode(ws)).toBe(4404);
+      // Exactly ONE authoritative failure — and the stream is not registered.
+      await vi.waitFor(() =>
+        expect(
+          warn.mock.calls.some((c) =>
+            String(c[0]).includes(
+              "VERIFY_STREAM_FAILED session=no-such-session leg=legB purpose=speakerphone",
+            ),
+          ),
+        ).toBe(true),
+      );
+      expect([...activeStreams].some((s) => s.sid === "no-such-session")).toBe(false);
+    } finally {
+      warn.mockRestore();
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("VERIFY_STREAM_BOUND startup log proves session/leg/purpose/track/callSid — and NEVER logs the token", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, { guarded: true });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: s.sessionId,
+        leg: "legB",
+        purpose: "speakerphone",
+        token: streamToken(s.sessionId),
+      });
+      const st = await waitAttached(s.sessionId);
+      expect(st.purpose).toBe("speakerphone");
+      const lines = logSpy.mock.calls.map((c) => String(c[0]));
+      const bound = lines.find((l) => l.includes("VERIFY_STREAM_BOUND"));
+      expect(bound).toBeTruthy();
+      expect(bound).toContain(`session=${s.sessionId}`);
+      expect(bound).toContain("leg=legB");
+      expect(bound).toContain("purpose=speakerphone");
+      expect(bound).toContain("track=inbound_track");
+      expect(bound).toContain("callSid=CA_test_call");
+      expect(bound).toContain("detectors=speakerphone");
+      // The signed token is a secret — it must appear in NO log line.
+      const token = streamToken(s.sessionId);
+      expect(lines.some((l) => l.includes(token))).toBe(false);
+      ws.close();
+    } finally {
+      logSpy.mockRestore();
       delete process.env.VERIFY_STREAM_SECRET;
     }
   });

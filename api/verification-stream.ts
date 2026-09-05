@@ -541,12 +541,7 @@ async function buildAnalyzers(
 ): Promise<StreamAnalyzers | null> {
   try {
     const session = await vs.findSession(sid);
-    if (!session) {
-      console.log(
-        `[verify-stream] stream start sid=${sid} purpose=${purpose} — session not found, no detectors attached`,
-      );
-      return null;
-    }
+    if (!session) return null; // caller fails CLOSED (VERIFY_STREAM_FAILED)
     const bridged = session.state === vs.VState.BRIDGED || vs.isBridgedSession(sid);
     if (purpose === "speakerphone") {
       const sp = new SpeakerphoneDetector({
@@ -668,7 +663,10 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         if (state) return; // already identified — ignore duplicate starts
         const auth = authenticateStreamStart(msg.start);
         if (!auth.ok) {
-          console.warn(`[verify-stream] ${auth.reason} — closing (${auth.code})`);
+          // FAIL CLOSED: one malformed start = ONE authoritative rejection
+          // (precise reason + close). No frames are analysed, no session is
+          // touched, nothing is silently treated as clean.
+          console.warn(`[verify-stream] VERIFY_STREAM_REJECTED ${auth.reason} — closing (${auth.code})`);
           try {
             ws.close(auth.code, auth.reason.slice(0, 120));
           } catch {
@@ -683,17 +681,39 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         // merge relay listens on Leg B's inbound stream for Leg A's own
         // audio (prompt fingerprint / watermark / loud tone) crossing over
         // after a physical merge.
-        state = { sid, purpose, sp: null, hold: null, frames: 0 };
-        activeStreams.add(state);
-        console.log(
-          `[verify-stream] stream start sid=${sid} leg=${auth.identity.leg} purpose=${purpose} streamSid=${msg.start?.streamSid ?? ""} callSid=${msg.start?.callSid ?? ""}`,
-        );
+        const st: ActiveStream = { sid, purpose, sp: null, hold: null, frames: 0 };
+        state = st;
+        activeStreams.add(st);
+        const callSid = msg.start?.callSid ?? "";
+        const streamSid = msg.start?.streamSid ?? "";
         void buildAnalyzers(sid, purpose)
           .then((a) => {
-            if (a && state) {
-              state.sp = a.sp;
-              state.hold = a.hold;
+            if (state !== st || !activeStreams.has(st)) return; // socket gone
+            if (!a) {
+              // FAIL CLOSED (identity requirement 5: existing verification
+              // session): a detector stream that cannot bind to its session
+              // must NOT sit connected looking healthy — ONE authoritative
+              // failure log + close. Never silently clean, never log spam.
+              activeStreams.delete(st);
+              state = null;
+              console.warn(
+                `[verify-stream] VERIFY_STREAM_FAILED session=${sid} leg=${auth.identity.leg} purpose=${purpose} callSid=${callSid} — verification session not found; detector stream rejected (fail-closed)`,
+              );
+              try {
+                ws.close(4404, "verification session not found");
+              } catch {
+                /* ignore */
+              }
+              return;
             }
+            st.sp = a.sp;
+            st.hold = a.hold;
+            // The healthy startup line: proves session + leg + purpose +
+            // track + owning call for every bound forensic stream. NEVER
+            // log the token (secret) — identity fields only.
+            console.log(
+              `[verify-stream] VERIFY_STREAM_BOUND session=${sid} leg=${auth.identity.leg} purpose=${purpose} track=inbound_track callSid=${callSid} streamSid=${streamSid} detectors=${a.sp ? "speakerphone" : "hold-canary"}`,
+            );
           })
           .catch((err) =>
             console.error("[verify-stream] analyzer attach error:", err),
