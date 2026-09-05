@@ -134,6 +134,41 @@ vi.mock("twilio", async (importOriginal) => {
   return { ...actual, default: factory };
 });
 
+/** Controllable fake VoiceIdTracker instances (one per armed attempt). */
+const voiceIdMock = vi.hoisted(() => ({
+  instances: [] as Array<{
+    opts: Record<string, unknown>;
+    snap: Record<string, unknown> | null;
+    pushed: string[];
+    disposed: boolean;
+  }>,
+}));
+
+vi.mock("./relayguard/voice-id-tracker", async (importOriginal) => {
+  // Keep the REAL decideVoiceId / matchVoiceIdPhrase — the accent-tolerant
+  // decision matrix is exercised for real. Fake only the streaming tracker
+  // so each test controls the snapshot (voiced duration / relay / quality).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const actual = (await importOriginal()) as any;
+  class FakeVoiceIdTracker {
+    private inst: (typeof voiceIdMock.instances)[number];
+    constructor(opts: Record<string, unknown> = {}) {
+      this.inst = { opts, snap: null, pushed: [], disposed: false };
+      voiceIdMock.instances.push(this.inst);
+    }
+    push(payload: string) {
+      this.inst.pushed.push(payload);
+    }
+    snapshot() {
+      return this.inst.snap;
+    }
+    dispose() {
+      this.inst.disposed = true;
+    }
+  }
+  return { ...actual, VoiceIdTracker: FakeVoiceIdTracker };
+});
+
 const { createdCalls, updatedCalls, participantUpdates, conferenceUpdates } = twilioMock;
 
 const RUN = `t${Date.now().toString(36)}`;
@@ -1006,21 +1041,60 @@ describe("Call Waiting engagement is state-only — Leg B stays clean (legacy to
     expect(conferenceUpdates.slice(confAfterOnset)).toHaveLength(0);
   });
 
-  it("silenceCanaryLoudTone redirects Leg A to leg-a-hold exactly once (idempotent) and logs CANARY_TONE_SILENCED", async () => {
+  it("the canary-silencing path is GONE — no silenceCanaryLoudTone export remains anywhere (task 11 C1)", () => {
+    // A speakerphone event must NEVER silence Leg A / stop the authorised
+    // challenge. The whole silencing path was removed, not just one caller.
+    expect((vs as unknown as Record<string, unknown>).silenceCanaryLoudTone).toBeUndefined();
+  });
+
+  it("speakerphone episode onsets NEVER redirect/update Leg A — the authorised canary challenge keeps playing through every strike (task 11 C1)", async () => {
     const s = await ladderSession("cs");
     const sid = s.sessionId;
     const updBefore = updatedCalls.length;
-    await vs.silenceCanaryLoudTone(sid);
-    const redirects = updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_cs_legA");
-    expect(redirects).toHaveLength(1);
-    expect(redirects[0].url).toContain("leg-a-hold");
-    expect(await eventTypesOf(sid)).toContain("CANARY_TONE_SILENCED");
-    // Idempotent — a later refire / stream-ready restart must not redirect again.
-    await vs.silenceCanaryLoudTone(sid);
-    expect(updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_cs_legA")).toHaveLength(1);
+    // Full ladder run: strike 1, strike 2, and the strike-3 warning
+    // (mute BOTH → conference warning → unmute BOTH). At NO point may any
+    // speakerphone handling touch the Leg A call leg.
+    process.env.VERIFY_SPEAKERPHONE_WARNING_AUDIO_MS = "300";
+    process.env.VERIFY_SPEAKERPHONE_WARNING_UNMUTE_BUFFER_MS = "200";
+    try {
+      epOnset(sid, "ep1");
+      await tick(200);
+      await vs.onSpeakerphoneCleared(sid, "c1");
+      epOnset(sid, "ep2");
+      await tick(200);
+      await vs.onSpeakerphoneCleared(sid, "c2");
+      epOnset(sid, "ep3");
+      await tick(300); // mutes + warning announce
+      await tick(700); // measured completion → unmute BOTH
+      expect(await eventTypesOf(sid)).toContain("SPEAKERPHONE_WARNING_DELIVERED");
+      // Leg A was NEVER redirected, hung up, or re-TwiML'd by any of it.
+      const legAOps = updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_cs_legA");
+      expect(legAOps).toHaveLength(0);
+      const types = await eventTypesOf(sid);
+      expect(types).not.toContain("CANARY_TONE_SILENCED");
+      // Mute/unmute touched ONLY the two conference participants.
+      const muteTargets = partOpsOf(sid)
+        .filter((p) => p.muted !== undefined)
+        .map((p) => p.participant);
+      expect(new Set(muteTargets)).toEqual(new Set(["CA_cs_caller", "CA_cs_legB"]));
+    } finally {
+      delete process.env.VERIFY_SPEAKERPHONE_WARNING_AUDIO_MS;
+      delete process.env.VERIFY_SPEAKERPHONE_WARNING_UNMUTE_BUFFER_MS;
+    }
   });
 
-  it("episode onset silences the canary loud tone FIRST, and strike 1 plays exactly ONE challenge sound to the CALLEE (no mute, no conference announce, nothing to the caller)", async () => {
+  it("handleSpeakerphoneSuspicious cannot redirect Leg A into silence even when called directly at episode onset", async () => {
+    const s = await ladderSession("hs");
+    const sid = s.sessionId;
+    const updBefore = updatedCalls.length;
+    handleSpeakerphoneSuspicious(sid, 0.95, "direct detector emission", true);
+    await tick(250);
+    expect(
+      updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_hs_legA"),
+    ).toHaveLength(0);
+  });
+
+  it("episode onset leaves the canary playing, and strike 1 plays exactly ONE challenge sound to the CALLEE (no mute, no conference announce, nothing to the caller)", async () => {
     const s = await ladderSession("co");
     const sid = s.sessionId;
     const updBefore = updatedCalls.length;
@@ -1028,10 +1102,11 @@ describe("Call Waiting engagement is state-only — Leg B stays clean (legacy to
     const confBefore = conferenceUpdates.length;
     epOnset(sid, "onset");
     await tick(250);
-    const redirects = updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_co_legA");
-    expect(redirects).toHaveLength(1);
-    expect(redirects[0].url).toContain("leg-a-hold");
-    expect(await eventTypesOf(sid)).toContain("CANARY_TONE_SILENCED");
+    // C1: the episode onset does NOT redirect Leg A anywhere — the canary
+    // challenge (prompt-light → loud tone loop) keeps running so a physical
+    // A+B merge still has something to leak into Leg B.
+    expect(updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_co_legA")).toHaveLength(0);
+    expect(await eventTypesOf(sid)).not.toContain("CANARY_TONE_SILENCED");
     // The strike-1 path plays the challenge sound ONCE to the CALLEE (Leg B
     // participant) — a single participant announce; never a mute, never a
     // conference-level announce, never anything to the caller, and never the
@@ -1752,7 +1827,9 @@ import {
   verificationStatusHandler,
   verificationTwimlHandler,
   verificationVersionHandler,
+  verificationVoiceIdResultHandler,
   verificationVoiceprintHandler,
+  voiceIdBeepHandler,
 } from "./verification-webhooks";
 import { voiceWebhookHandler } from "./twilio-voice";
 
@@ -1763,6 +1840,8 @@ hookApp.post("/api/verify/gather/merge", verificationGatherHandler);
 hookApp.post("/api/verify/gather/leg-a-accept", verificationGatherLegAAcceptHandler);
 hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandler);
 hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
+hookApp.post("/api/verify/voice-id-result", verificationVoiceIdResultHandler);
+hookApp.get("/api/verify/voice-id-beep.wav", voiceIdBeepHandler);
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
 hookApp.get("/api/verify/prompt-light.wav", promptLightHandler);
 hookApp.get("/api/verify/speakerphone-challenge.wav", speakerphoneChallengeHandler);
@@ -2927,7 +3006,7 @@ describe("guarded single-call flow", () => {
     delete process.env.VERIFY_STREAM_SECRET;
   });
 
-  it("guarded press-1 records the save-only voice-ID phrase and falls forward to the ready gather", async () => {
+  it("guarded press-1 hands the callee to the REAL voice-ID gate (prompt + beep + speech gather, NO <Record>)", async () => {
     const s = await makeSession(vs.VState.LEG_A_DIALING, { guarded: true });
     const before = createdCalls.length;
     const res = await postForm(`/api/verify/gather/leg-a-accept?sid=${s.sessionId}&a=0`, {
@@ -2936,31 +3015,42 @@ describe("guarded single-call flow", () => {
     });
     const body = await res.text();
     expect(res.status).toBe(200);
-    expect(body).toContain(
-      "Please identify your voice. After the beep, say: my voice identifies me.",
-    );
-    expect(body).toContain("<Record");
-    expect(body).toContain(`/api/verify/voiceprint?sid=${s.sessionId}`);
-    // Save-only: the phrase is captured as evidence, NEVER verified — no
-    // transcription, no wait loop. The failed-action fallback lands on the
-    // second press-1 step (leg-a-ready), the same place the action goes.
-    expect(body).not.toContain('transcribe="true"');
-    expect(body).not.toContain("/api/verify/voiceprint-transcription");
-    expect(body).not.toContain("/api/verify/twiml/voice-id-wait");
-    expect(body).toContain(`/api/verify/twiml/leg-a-ready?sid=${s.sessionId}`);
-    expect(body).not.toContain("/api/verify/gather/leg-a-ready?sid=");
-    expect(body).not.toContain("/api/verify/twiml/leg-a-hold?sid=");
+    // The accept press redirects straight INTO the real voice-ID gate.
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=0`);
+    // The save-only <Record> step is GONE — no recording callback can ever
+    // mark voice ID captured.
+    expect(body).not.toContain("<Record");
+    expect(body).not.toContain("/api/verify/voiceprint");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
-    // Leg B starts only from the SECOND press-1.
+    // The voice-id TwiML itself: exact prompt + beep + a SPEECH gather whose
+    // action carries the per-attempt idempotency key (va).
+    const vRes = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    const vBody = await vRes.text();
+    expect(vRes.status).toBe(200);
+    expect(vBody).toContain(
+      "After the beep, turn off speakerphone, hold the phone to your ear, and say: My voice identifies me.",
+    );
+    expect(vBody).toContain("/api/verify/voice-id-beep.wav");
+    expect(vBody).toContain("<Gather");
+    expect(vBody).toContain('input="speech"');
+    expect(vBody).toContain('hints="my voice identifies me"');
+    expect(vBody).toContain('speechModel="phone_call"');
+    expect(vBody).toContain(`/api/verify/voice-id-result?sid=${s.sessionId}&amp;a=0&amp;va=`);
+    // The attempt is armed + persisted (PROMPTING, attempt key, counter).
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceIdState).toBe(vs.VoiceIdState.PROMPTING);
+    expect(after.voiceIdAttemptId).toBeTruthy();
+    expect(after.voiceIdAttempts).toBe(1);
+    // Leg B starts only from the SECOND press-1 behind the gate.
     expect(
       createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
     ).toBe(false);
-    expect((await vs.findSession(s.sessionId))!.legBCallSid).toBeNull();
+    expect(after.legBCallSid).toBeNull();
     const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("GUARDED_VOICEPRINT_STEP");
+    expect(types).toContain("VOICE_ID_ATTEMPT_STARTED");
   });
 
-  it("voiceprint action stamps the save-only capture and serves the ready gather IMMEDIATELY (no wait loop, no Leg B)", async () => {
+  it("the retired voiceprint <Record> action can NEVER mark voice ID — it fails CLOSED into the real gate", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vp_caller",
@@ -2969,33 +3059,49 @@ describe("guarded single-call flow", () => {
     const before = createdCalls.length;
     const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
       CallSid: "CA_vp_legA",
-      RecordingUrl: "",
-      RecordingDuration: "0",
+      RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_vp_1",
+      RecordingDuration: "3",
       RecordingSid: "RE_vp_1",
     });
     const body = await res.text();
     expect(res.status).toBe(200);
-    // The capture is stamped on the session right away (save-only).
+    // A bare recording callback can NEVER verify: nothing is stamped…
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.voiceIdRecordingSid).toBe("RE_vp_1");
-    expect(after.voiceIdCapturedAt).not.toBeNull();
-    expect(vs.voiceIdFreshForToday(after.voiceIdCapturedAt)).toBe(true);
-    // …and the callee proceeds STRAIGHT to the second press-1 gather — no
-    // voice-id-wait verdict gating, even with an empty/failed recording.
-    expect(body).toContain("<Gather");
-    expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
-    expect(body).toContain("When you are ready, press 1.");
-    expect(body).not.toContain("/api/verify/twiml/voice-id-wait");
-    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
-    // Leg B is still only originated by the second press-1 itself.
+    expect(after.voiceIdCapturedAt).toBeNull();
+    expect(after.voiceIdRecordingSid).toBeNull();
+    expect(after.voiceIdState).not.toBe(vs.VoiceIdState.VERIFIED);
+    // …and the callee is sent INTO the real voice-ID gate, never forward to
+    // the ready gather, even with a perfectly good recording on the callback.
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=0`);
+    expect(body).not.toContain("/api/verify/gather/leg-a-ready?sid=");
     expect(
       createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
     ).toBe(false);
     const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("VOICE_ID_CAPTURED");
+    expect(types).not.toContain("VOICE_ID_VERIFIED");
   });
 
-  it("guarded second press-1 (after the save-only voice-ID) originates Leg B and parks Leg A", async () => {
+  it("the retired voiceprint action serves the ready gather only when ALREADY VERIFIED", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vpv_caller",
+      legACallSid: "CA_vpv_legA",
+    });
+    await setVoiceIdVerified(s.sessionId);
+    const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
+      CallSid: "CA_vpv_legA",
+      RecordingUrl: "",
+      RecordingDuration: "0",
+      RecordingSid: "RE_late",
+    });
+    const body = await res.text();
+    expect(res.status).toBe(200);
+    expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
+    // A late/duplicate callback can never double-stamp or re-verify.
+    expect((await vs.findSession(s.sessionId))!.voiceIdRecordingSid).toBeNull();
+  });
+
+  it("guarded second press-1 WITHOUT VOICE_ID_VERIFIED never originates Leg B (fail CLOSED into the gate)", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vp2_caller",
@@ -3008,11 +3114,32 @@ describe("guarded single-call flow", () => {
     });
     const body = await res.text();
     expect(res.status).toBe(200);
+    // No durable VOICE_ID_VERIFIED → the press is handed back INTO the gate.
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=0`);
+    expect(
+      createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
+    ).toBe(false);
+    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
+  });
+
+  it("guarded second press-1 WITH a persisted VOICE_ID_VERIFIED originates Leg B and parks Leg A", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_vp3_caller",
+      legACallSid: "CA_vp3_legA",
+    });
+    await setVoiceIdVerified(s.sessionId);
+    const before = createdCalls.length;
+    const res = await postForm(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}&a=0`, {
+      CallSid: "CA_vp3_legA",
+      Digits: "1",
+    });
+    const body = await res.text();
+    expect(res.status).toBe(200);
     // The callee is told the bridge is being set up before being parked.
     expect(body).toContain("Please wait while we connect your call.");
     expect(body).toContain("<Pause");
     expect(body).toContain("/api/verify/twiml/leg-a-hold?sid=");
-    expect(body).not.toContain("/api/verify/twiml/voice-id-wait");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_DIALING);
     expect(
       createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
@@ -3059,101 +3186,450 @@ describe("guarded single-call flow", () => {
     expect((await vs.findSession(freshGuarded.sessionId))!.state).toBe(vs.VState.INITIATED);
   });
 });
-/* GUARDED MODE ONLY: save-only voice ID — capture + stamp, NO verification   */
+/* GUARDED MODE ONLY: the REAL voice-ID gate — "My voice identifies me"       */
 /* -------------------------------------------------------------------------- */
 
-describe("save-only voice ID (guarded)", () => {
-  it("voiceprint action stamps voiceIdCapturedAt + voiceIdRecordingSid on the session", async () => {
+/** Stamp a durable VOICE_ID_VERIFIED directly (tests that start PAST the gate). */
+async function setVoiceIdVerified(sessionId: string): Promise<void> {
+  await getDb()
+    .update(schema.verificationSessions)
+    .set({ voiceIdState: vs.VoiceIdState.VERIFIED, voiceIdCapturedAt: new Date() })
+    .where(eq(schema.verificationSessions.sessionId, sessionId));
+}
+
+/** Clean direct-speech tracker snapshot (the fake tracker's passing shape). */
+function goodVoiceIdSnap(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    attemptStartedAtMs: 0,
+    speechStartedAtMs: 120,
+    voicedDurationMs: 1200,
+    sectionCount: 4,
+    sections: [
+      { startMs: 120, endMs: 300 },
+      { startMs: 360, endMs: 620 },
+      { startMs: 700, endMs: 1080 },
+      { startMs: 1140, endMs: 1420 },
+    ],
+    trailingSilenceMs: 650,
+    speechEnded: true,
+    relayConfidence: 0.1,
+    relayWindows: 0,
+    relayConfirmed: false,
+    relayEvidence: "",
+    relayDecisionMs: null,
+    audioQuality: { clippedRatio: 0, meanLevelDb: -20, noiseFloorDb: -50, snrDb: 30 },
+    ended: true,
+    endReason: "speech-end",
+    ...overrides,
+  };
+}
+
+/**
+ * Arm a voice-ID attempt via the voice-id TwiML (exactly as Twilio fetches
+ * it), feed 50 inbound Leg A frames (~1s — PROMPTING→LISTENING + the
+ * validated clip source), and install the fake tracker snapshot. Returns the
+ * armed attempt key the gather action must carry.
+ */
+async function armVoiceIdAttempt(
+  s: VerificationSession,
+  a = 0,
+  snap: Record<string, unknown> | null = null,
+): Promise<string> {
+  const before = voiceIdMock.instances.length;
+  const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=${a}`);
+  expect(res.status).toBe(200);
+  const inst = voiceIdMock.instances[before];
+  expect(inst).toBeTruthy();
+  inst.snap = snap;
+  const frame = Buffer.alloc(160, 0xff).toString("base64");
+  for (let i = 0; i < 50; i++) vs.pushVoiceIdFrame(s.sessionId, frame);
+  await tick(100); // PROMPTING→LISTENING persist
+  const after = (await vs.findSession(s.sessionId))!;
+  expect(after.voiceIdAttemptId).toBeTruthy();
+  return after.voiceIdAttemptId!;
+}
+
+describe("real voice-ID gate (guarded)", () => {
+  it("markVoiceIdCaptured is GONE — no code path can stamp a bare recording callback", () => {
+    expect((vs as unknown as Record<string, unknown>).markVoiceIdCaptured).toBeUndefined();
+  });
+
+  it("FULL PASS: complete phrase + clean direct-handset snapshot verifies, stamps, stores the validated clip, and unlocks the second press-1 → Leg B", async () => {
+    process.env.VERIFY_VOICE_ID_DIR = `/tmp/voice-id-test-${RUN}`;
+    try {
+      const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+        guarded: true,
+        callerCallSid: "CA_vid_caller",
+        legACallSid: "CA_vid_legA",
+      });
+      const attemptId = await armVoiceIdAttempt(s, 0, goodVoiceIdSnap());
+      expect((await vs.findSession(s.sessionId))!.voiceIdState).toBe(vs.VoiceIdState.LISTENING);
+      const res = await postForm(
+        `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+        { SpeechResult: "My voice identifies me", Confidence: "0.91" },
+      );
+      const body = await res.text();
+      expect(res.status).toBe(200);
+      // Verified → the ONLY forward step is the second press-1 gather.
+      expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
+      expect(body).toContain("You will receive a second call");
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.voiceIdState).toBe(vs.VoiceIdState.VERIFIED);
+      expect(after.voiceIdCapturedAt).not.toBeNull();
+      expect(vs.voiceIdFreshForToday(after.voiceIdCapturedAt)).toBe(true);
+      // The validated clip reference is the stream-captured attempt audio —
+      // persisted ONLY after every gate passed.
+      expect(after.voiceIdRecordingSid).toBe(attemptId);
+      expect(after.voiceRecordingUrl).toBe(`local://voice-id/${attemptId}`);
+      expect(after.voiceRecordingDurationSec).toBeGreaterThanOrEqual(1);
+      expect(after.voiceRecordedAt).not.toBeNull();
+      expect(after.voiceIdRetryKind).toBeNull();
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("VOICE_ID_VERIFIED");
+      expect(types).toContain("VOICE_RECORDING_STORED");
+      expect(types).toContain("VOICEPRINT_CAPTURED");
+      // …and the second press-1 now originates Leg B.
+      const before = createdCalls.length;
+      await postForm(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}&a=0`, {
+        CallSid: "CA_vid_legA",
+        Digits: "1",
+      });
+      expect(
+        createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
+      ).toBe(true);
+      expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_DIALING);
+    } finally {
+      delete process.env.VERIFY_VOICE_ID_DIR;
+    }
+  });
+
+  it("PARTIAL phrase ('my voice') → VOICE_ID_RETRY_PHRASE and the phrase retry prompt on the next attempt", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
-      callerCallSid: "CA_svid_caller",
-      legACallSid: "CA_svid_legA",
+      legACallSid: "CA_part_legA",
     });
-    const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
-      CallSid: "CA_svid_legA",
-      RecordingUrl: "",
-      RecordingDuration: "0",
-      RecordingSid: "RE_save_1",
-    });
-    expect(res.status).toBe(200);
+    const attemptId = await armVoiceIdAttempt(s, 0, goodVoiceIdSnap());
+    const res = await postForm(
+      `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+      { SpeechResult: "my voice", Confidence: "0.9" },
+    );
+    const body = await res.text();
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=1`);
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.voiceIdRecordingSid).toBe("RE_save_1");
-    expect(after.voiceIdCapturedAt).not.toBeNull();
-    expect(vs.voiceIdFreshForToday(after.voiceIdCapturedAt)).toBe(true);
-    const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).toContain("VOICE_ID_CAPTURED");
-  });
-
-  it("a stamped capture is fresh only for the same UTC calendar day as the call", async () => {
-    const s = await makeSession(vs.VState.CALL_ACCEPTED, { guarded: true });
-    await vs.markVoiceIdCaptured(s.sessionId, "RE_day_1");
-    const after = (await vs.findSession(s.sessionId))!;
-    expect(vs.voiceIdFreshForToday(after.voiceIdCapturedAt)).toBe(true);
-    const yesterday = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    expect(vs.voiceIdFreshForToday(after.voiceIdCapturedAt, yesterday)).toBe(false);
-  });
-
-  it("markVoiceIdCaptured is a no-op for terminal/unknown sessions", async () => {
-    const s = await makeSession(vs.VState.COMPLETED, { guarded: true });
-    await vs.markVoiceIdCaptured(s.sessionId, "RE_late");
-    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceIdState).toBe(vs.VoiceIdState.RETRY_PHRASE);
+    expect(after.voiceIdRetryKind).toBe("phrase");
     expect(after.voiceIdCapturedAt).toBeNull();
-    expect(after.voiceIdRecordingSid).toBeNull();
-    await vs.markVoiceIdCaptured("no-such-session", "RE_none"); // no throw
+    // The next attempt serves the PHRASE retry prompt (exact copy).
+    const v2 = await (
+      await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=1`)
+    ).text();
+    expect(v2).toContain(
+      "I did not hear the complete phrase. After the beep, please say: My voice identifies me.",
+    );
   });
 
-  it("NO verdict: the voiceprint action proceeds even with an empty recording, and the ready press is never gated", async () => {
+  it("RELAY/speakerphone snapshot → VOICE_ID_RETRY_RELAY and the relay retry prompt (never passes)", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
-      callerCallSid: "CA_sv2_caller",
-      legACallSid: "CA_sv2_legA",
+      legACallSid: "CA_rel_legA",
     });
-    const before = createdCalls.length;
-    // Empty recording (record step failed) — save-only flow still proceeds.
-    const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
-      CallSid: "CA_sv2_legA",
-      RecordingUrl: "",
-      RecordingDuration: "0",
+    const attemptId = await armVoiceIdAttempt(
+      s,
+      0,
+      goodVoiceIdSnap({
+        relayConfirmed: true,
+        relayConfidence: 0.95,
+        relayWindows: 2,
+        relayDecisionMs: 1500,
+        relayEvidence: "RED fingerprint 0.71",
+      }),
+    );
+    const res = await postForm(
+      `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+      { SpeechResult: "My voice identifies me", Confidence: "0.95" },
+    );
+    const body = await res.text();
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=1`);
+    const after = (await vs.findSession(s.sessionId))!;
+    // Relay beats EVERYTHING — even a perfect transcript can never pass.
+    expect(after.voiceIdState).toBe(vs.VoiceIdState.RETRY_RELAY);
+    expect(after.voiceIdRetryKind).toBe("relay");
+    expect(after.voiceIdCapturedAt).toBeNull();
+    const v2 = await (
+      await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=1`)
+    ).text();
+    expect(v2).toContain(
+      "The audio sounded like speakerphone or relayed audio. Please turn off speakerphone, hold the phone to your ear, and say again after the beep: My voice identifies me.",
+    );
+  });
+
+  it("NO SPEECH → nospeech retry kind and the no-speech prompt (silence can never pass)", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      legACallSid: "CA_ns_legA",
     });
+    const attemptId = await armVoiceIdAttempt(
+      s,
+      0,
+      goodVoiceIdSnap({
+        speechStartedAtMs: null,
+        voicedDurationMs: 0,
+        sectionCount: 0,
+        sections: [],
+        speechEnded: false,
+        trailingSilenceMs: 0,
+        endReason: "no-speech",
+      }),
+    );
+    const res = await postForm(
+      `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+    );
+    const body = await res.text();
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=1`);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceIdRetryKind).toBe("nospeech");
+    expect(after.voiceIdCapturedAt).toBeNull();
+    const v2 = await (
+      await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=1`)
+    ).text();
+    expect(v2).toContain(
+      "I did not hear you. After the beep, please hold the phone to your ear and say: My voice identifies me.",
+    );
+  });
+
+  it("DETECTOR UNAVAILABLE (no frames → null snapshot) never passes — audio retry, not a verdict", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      legACallSid: "CA_nf_legA",
+    });
+    // Arm WITHOUT feeding any frame: the tracker snapshot is null.
+    const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    expect(res.status).toBe(200);
+    const attemptId = (await vs.findSession(s.sessionId))!.voiceIdAttemptId!;
+    const res2 = await postForm(
+      `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+      { SpeechResult: "My voice identifies me", Confidence: "0.99" },
+    );
+    const body = await res2.text();
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=1`);
+    const after = (await vs.findSession(s.sessionId))!;
+    // Even a perfect transcript CANNOT pass without direct-path evidence.
+    expect(after.voiceIdState).not.toBe(vs.VoiceIdState.VERIFIED);
+    expect(after.voiceIdCapturedAt).toBeNull();
+    expect(after.voiceIdRetryKind).toBe("audio");
+  });
+
+  it("ATTEMPT LIMIT with clear failure evidence → VOICE_ID_FAILED, the session fails, Leg B NEVER originates", async () => {
+    const saved = process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS;
+    process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS = "1";
+    try {
+      const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+        guarded: true,
+        callerCallSid: "CA_lim_caller",
+        legACallSid: "CA_lim_legA",
+      });
+      const before = createdCalls.length;
+      const attemptId = await armVoiceIdAttempt(
+        s,
+        0,
+        goodVoiceIdSnap({
+          relayConfirmed: true,
+          relayConfidence: 0.95,
+          relayWindows: 2,
+          relayDecisionMs: 1200,
+          relayEvidence: "RED",
+        }),
+      );
+      const res = await postForm(
+        `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+        { SpeechResult: "My voice identifies me", Confidence: "0.9" },
+      );
+      const body = await res.text();
+      expect(body).toContain("We could not verify your voice on this line");
+      expect(body).toContain("<Hangup");
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.voiceIdState).toBe(vs.VoiceIdState.FAILED);
+      expect(after.state).toBe(vs.VState.FAILED);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("VOICE_ID_FAILED");
+      expect(
+        createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
+      ).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS;
+      else process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS = saved;
+    }
+  });
+
+  it("ATTEMPT LIMIT with untrustworthy evidence → VOICE_ID_INCONCLUSIVE (never a pass, never Leg B)", async () => {
+    const saved = process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS;
+    process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS = "1";
+    try {
+      const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+        guarded: true,
+        legACallSid: "CA_inc_legA",
+      });
+      await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+      const attemptId = (await vs.findSession(s.sessionId))!.voiceIdAttemptId!;
+      const res = await postForm(
+        `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
+        { SpeechResult: "My voice identifies me", Confidence: "0.9" },
+      );
+      const body = await res.text();
+      expect(body).toContain("We could not verify your voice on this line");
+      expect(body).toContain("<Hangup");
+      const after = (await vs.findSession(s.sessionId))!;
+      expect(after.voiceIdState).toBe(vs.VoiceIdState.INCONCLUSIVE);
+      expect(after.state).toBe(vs.VState.FAILED);
+      const types = (await events(s.sessionId)).map((e) => e.eventType);
+      expect(types).toContain("VOICE_ID_INCONCLUSIVE");
+    } finally {
+      if (saved === undefined) delete process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS;
+      else process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS = saved;
+    }
+  });
+
+  it("STALE attempt key (duplicate/late callback) can never advance, reopen, or double-count an attempt", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      legACallSid: "CA_stale_legA",
+    });
+    await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    const armed = (await vs.findSession(s.sessionId))!;
+    const res = await postForm(
+      `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=bogus-attempt-id`,
+      { SpeechResult: "My voice identifies me", Confidence: "0.99" },
+    );
+    const body = await res.text();
+    // Re-serves the CURRENT step (same attempt counter) — never forward.
+    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=0`);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceIdState).toBe(armed.voiceIdState);
+    expect(after.voiceIdAttemptId).toBe(armed.voiceIdAttemptId);
+    expect(after.voiceIdAttempts).toBe(armed.voiceIdAttempts);
+    expect(after.voiceIdCapturedAt).toBeNull();
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).not.toContain("VOICE_ID_VERIFIED");
+    expect(types).not.toContain("VOICE_ID_RETRY");
+  });
+
+  it("FAST RELAY ABORT: relay confirmed mid-LISTENING interrupts the attempt and redirects Leg A into the retry", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      callerCallSid: "CA_fa_caller",
+      legACallSid: "CA_fa_legA",
+    });
+    const before = voiceIdMock.instances.length;
+    await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    const inst = voiceIdMock.instances[before];
+    inst.snap = goodVoiceIdSnap({
+      relayConfirmed: true,
+      relayConfidence: 0.93,
+      relayWindows: 2,
+      relayDecisionMs: 1400,
+      relayEvidence: "RED fingerprint 0.71",
+      speechEnded: false,
+      ended: true,
+      endReason: "relay",
+    });
+    const frame = Buffer.alloc(160, 0xff).toString("base64");
+    for (let i = 0; i < 50; i++) vs.pushVoiceIdFrame(s.sessionId, frame);
+    await tick(100);
+    expect((await vs.findSession(s.sessionId))!.voiceIdState).toBe(vs.VoiceIdState.LISTENING);
+    // The tracker fires its confirmed-relay callback (as the real DSP would,
+    // ~0.8–1.5s into the phrase) — the attempt is invalidated WITHOUT waiting
+    // for the phrase to end or the gather to return.
+    const onRelay = inst.opts.onRelayConfirmed as () => void;
+    expect(onRelay).toBeTruthy();
+    onRelay();
+    await tick(500);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceIdState).toBe(vs.VoiceIdState.RETRY_RELAY);
+    expect(after.voiceIdRetryKind).toBe("relay");
+    // Leg A is REST-redirected into the next voice-ID attempt immediately.
+    const redir = updatedCalls.find(
+      (u) => u.sid === "CA_fa_legA" && String(u.url).includes("/twiml/voice-id"),
+    );
+    expect(redir).toBeTruthy();
+    expect(String(redir!.url)).toContain("a=1");
+  });
+
+  it("an over-limit voice-id fetch never re-opens the stage (terminal message + hangup)", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      legACallSid: "CA_ol_legA",
+    });
+    const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=3`);
+    const body = await res.text();
+    expect(body).toContain("We could not verify your voice on this line");
+    expect(body).toContain("<Hangup");
+    expect((await vs.findSession(s.sessionId))!.voiceIdAttemptId).toBeNull();
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).not.toContain("VOICE_ID_ATTEMPT_STARTED");
+  });
+
+  it("VERIFIED re-entry is idempotent — the gate serves the second press-1 gather and late result callbacks are ignored", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      legACallSid: "CA_idem_legA",
+    });
+    await setVoiceIdVerified(s.sessionId);
+    const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
     const body = await res.text();
     expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
-    expect(body).not.toContain("/api/verify/twiml/voice-id-wait");
-    // …and the ready press originates Leg B WITHOUT any voice-ID pass.
-    await postForm(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}&a=0`, {
-      CallSid: "CA_sv2_legA",
-      Digits: "1",
-    });
-    expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.LEG_B_DIALING);
-    expect(
-      createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
-    ).toBe(true);
+    // A late/duplicate gather callback after the pass: ignored, re-serves
+    // the second press-1 step, never re-arms, never double-stamps.
+    const res2 = await postForm(
+      `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=late-callback`,
+      { SpeechResult: "unrelated speech", Confidence: "0.5" },
+    );
+    const body2 = await res2.text();
+    expect(body2).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
+    const after = (await vs.findSession(s.sessionId))!;
+    expect(after.voiceIdState).toBe(vs.VoiceIdState.VERIFIED);
+    expect(after.voiceIdRecordingSid).toBeNull();
     const types = (await events(s.sessionId)).map((e) => e.eventType);
-    expect(types).not.toContain("VOICE_ID_GATE_BLOCKED");
-    expect(types).not.toContain("VOICE_ID_FAILED");
-    expect(types).not.toContain("VOICE_MISMATCH");
+    expect(types).not.toContain("VOICE_ID_ATTEMPT_STARTED");
   });
 
-  it("voice-id-wait TwiML no longer exists (unknown kind → polite hangup, not a wait loop)", async () => {
+  it("onCalleeReady REFUSES Leg B without VOICE_ID_VERIFIED (VOICE_ID_GATE_BLOCKED)", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
-      callerCallSid: "CA_svw_caller",
-      legACallSid: "CA_svw_legA",
+      callerCallSid: "CA_gb_caller",
+      legACallSid: "CA_gb_legA",
     });
-    const res = await postForm(`/api/verify/twiml/voice-id-wait?sid=${s.sessionId}`);
-    expect(res.status).toBe(200);
-    const body = await res.text();
-    expect(body).toContain("Unknown verification step.");
-    expect(body).toContain("<Hangup");
-    expect(body).not.toContain("<Pause");
-    expect(body).not.toContain("voice-id-wait?sid=");
+    const before = createdCalls.length;
+    await vs.onCalleeReady(s.sessionId);
+    expect(
+      createdCalls.slice(before).some((c) => String(c.url).includes("/twiml/leg-b")),
+    ).toBe(false);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("VOICE_ID_GATE_BLOCKED");
   });
 
-  it("the transcription callback route is gone (save-only records are never transcribed)", async () => {
-    const res = await postForm("/api/verify/voiceprint-transcription?sid=abc", {
-      TranscriptionStatus: "completed",
-      TranscriptionText: "my voice identifies me",
+  it("the voice-id beep asset is served", async () => {
+    const res = await hookApp.request("/api/verify/voice-id-beep.wav");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("audio/wav");
+    const buf = Buffer.from(await res.arrayBuffer());
+    expect(buf.length).toBeGreaterThan(44);
+    expect(buf.toString("ascii", 0, 4)).toBe("RIFF");
+  });
+
+  it("every leg-a-challenge-tone fetch stamps legAChallengeLastConfirmedAt (proof-of-life)", async () => {
+    const s = await makeSession(vs.VState.CALL_ACCEPTED, {
+      guarded: true,
+      legACallSid: "CA_lc_legA",
     });
-    expect(res.status).toBe(404);
+    expect((await vs.findSession(s.sessionId))!.legAChallengeLastConfirmedAt).toBeNull();
+    const res = await postForm(`/api/verify/twiml/leg-a-challenge-tone?sid=${s.sessionId}`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("/api/verify/tone.wav");
+    await tick(150);
+    expect(
+      (await vs.findSession(s.sessionId))!.legAChallengeLastConfirmedAt,
+    ).not.toBeNull();
   });
 });
 
@@ -3176,26 +3652,25 @@ describe("call review recordings", () => {
     expect(types).toContain("BRIDGE_RECORDING_STORED");
   });
 
-  it("voice recording is stored even when relayguard profiling fails", async () => {
+  it("the retired voiceprint route stores NO clip — voice clips come ONLY from a passed gate", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       callerCallSid: "CA_vr_caller",
       legACallSid: "CA_vr_legA",
     });
-    // Unreachable recording URL → profiling throws, but the clip is still
-    // persisted for call-review playback.
     const res = await postForm(`/api/verify/voiceprint?sid=${s.sessionId}`, {
       CallSid: "CA_vr_legA",
       RecordingUrl: "https://api.twilio.com/2010-04-01/Accounts/AC_test/Recordings/RE_voice_1",
       RecordingDuration: "3",
     });
     expect(res.status).toBe(200);
-    // processVoiceprint runs fire-and-forget — give it a beat.
-    await tick(1500);
+    // Give any (non-existent) fire-and-forget processing a beat — nothing may
+    // be stored from a bare recording callback (fail-closed retired route).
+    await tick(500);
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.voiceRecordingUrl).toContain("RE_voice_1");
-    expect(after.voiceRecordingDurationSec).toBe(3);
-    expect(after.voiceRecordedAt).not.toBeNull();
+    expect(after.voiceRecordingUrl).toBeNull();
+    expect(after.voiceRecordingDurationSec).toBeNull();
+    expect(after.voiceRecordedAt).toBeNull();
   });
 
   it("audio proxy rejects anonymous requests (no session cookie)", async () => {

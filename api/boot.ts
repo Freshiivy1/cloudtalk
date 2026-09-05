@@ -21,7 +21,9 @@ import {
   verificationVersionHandler,
   verificationToneHandler,
   verificationTwimlHandler,
+  verificationVoiceIdResultHandler,
   verificationVoiceprintHandler,
+  voiceIdBeepHandler,
 } from "./verification-webhooks";
 import {
   verificationBridgeRecordingHandler,
@@ -53,8 +55,11 @@ app.post("/api/verify/recording/merge", verificationRecordingHandler);
 // GUARDED MODE ONLY: bridge conference recording callback + call-review playback.
 app.post("/api/verify/recording/bridge", verificationBridgeRecordingHandler);
 app.get("/api/verify/recording/:sid/:kind", verificationRecordingAudioHandler);
-// GUARDED MODE ONLY: save-only voice-ID <Record> action (capture stamp +
-// immediate second-call handoff — no verification, no transcription).
+// GUARDED MODE ONLY: the REAL voice-ID gate — speech <Gather> action for
+// "My voice identifies me" (verified gate; only VOICE_ID_VERIFIED unlocks
+// the second press-1 → Leg B). The legacy save-only voiceprint route is
+// retired: kept registered so in-flight calls fail CLOSED into the gate.
+app.post("/api/verify/voice-id-result", verificationVoiceIdResultHandler);
 app.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 // TEST-ONLY scripted callee for end-to-end guarded-call self-tests.
 app.post("/api/test/callee-bot", testCalleeBotHandler);
@@ -85,6 +90,8 @@ app.get("/api/verify/prompt-light.wav", promptLightHandler);
 app.get("/api/verify/speakerphone-challenge.wav", speakerphoneChallengeHandler);
 app.get("/api/verify/speakerphone-warning.wav", speakerphoneWarningHandler);
 app.get("/api/verify/speakerphone-terminated.wav", speakerphoneTerminatedHandler);
+// The short beep played before each "My voice identifies me" attempt.
+app.get("/api/verify/voice-id-beep.wav", voiceIdBeepHandler);
 app.use("/api/trpc/*", async (c) => {
   return fetchRequestHandler({
     endpoint: "/api/trpc",

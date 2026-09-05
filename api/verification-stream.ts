@@ -366,16 +366,20 @@ export function inProcessStreamUrl(): string | null {
 
 /**
  * SpeakerphoneDetector.onSuspicious handler (exported for tests): route a
- * detector emission into the strike ladder. On episode ONSET the canary
- * loud-tone loop is silenced FIRST (its acoustic leak can false-fire the
- * relay's loud-tone listener mid-episode and kill the call with the wrong
- * reason). Late frames for terminal/missing sessions are ignored.
+ * detector emission into the strike ladder. Late frames for terminal/missing
+ * sessions are ignored.
  *
  * STRIKE LADDER: `episodeStart` (true on the FIRST emission of a new
  * episode — one continuous suspicious period = ONE strike, refires are
  * no-ops) drives injectSpeakerphoneChallenge in verification.ts: strikes
- * 1–2 are recorded silently, strike 3 is the warning flag (mute → warning
- * to the conference → unmute → resume), strike 4 is the supreme flag.
+ * 1–2 are recorded + the challenge sound is played once to the callee,
+ * strike 3 is the warning flag (mute BOTH → warning to the conference →
+ * unmute BOTH → resume), strike 4 is the supreme flag.
+ *
+ * The canary (Leg A) authorised merge challenge is NEVER touched here
+ * (task 11 C1): speakerphone handling must not silence Leg A, stop its
+ * challenge, or alter the merge detector's armed state — the challenge is
+ * what a physical A+B handset merge leaks into Leg B for the relay to hear.
  */
 export function handleSpeakerphoneSuspicious(
   sid: string,
@@ -387,15 +391,6 @@ export function handleSpeakerphoneSuspicious(
     `[verify-stream] SPEAKERPHONE SUSPECTED sid=${sid} score=${score.toFixed(2)} episodeStart=${episodeStart} ${detail}`,
   );
   void (async () => {
-    // On episode onset, silence the canary loud-tone loop FIRST (regardless
-    // of merge-system suppression below): while relay audio is present, the
-    // loud tone's acoustic leak can false-fire the relay's loud-tone listener
-    // and kill the call with the wrong reason.
-    if (episodeStart) {
-      vs.silenceCanaryLoudTone(sid).catch((err) =>
-        console.error("[verify-stream] silenceCanaryLoudTone error:", err),
-      );
-    }
     const session = await vs.findSession(sid);
     // Terminal/missing sessions: ignore late detector frames (no strike
     // actions on a dead call).
@@ -728,6 +723,12 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       const payload = msg.media.payload;
       st.sp?.push(payload);
       st.hold?.push(payload);
+      // Voice-ID gate (task 11 C2): while a "My voice identifies me" attempt
+      // is armed, the SAME Leg A inbound audio feeds the attempt's streaming
+      // analyzer (VAD / phrase structure / direct-vs-relay). Explicit mode:
+      // this runs ONLY during the voice-ID stage — never live-call strike
+      // logic on this stream, never enrollment analysis after bridge.
+      if (st.purpose === "hold-canary") vs.pushVoiceIdFrame(st.sid, payload);
       if (st.sp || st.hold) {
         // D2: event-driven bridge sync — bridgeGuardedLive() flips an
         // in-process registry flag SYNCHRONOUSLY with the bridge, so the

@@ -50,6 +50,13 @@
       "when": 1788520628762,
       "tag": "0006_speakerphone_supreme_flag",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1788624000000,
+      "tag": "0007_voice_id_gate",
+      "breakpoints": true
     }
   ]
 }

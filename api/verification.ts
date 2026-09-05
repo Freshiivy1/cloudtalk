@@ -21,10 +21,20 @@
  */
 import { TRPCError } from "@trpc/server";
 import { and, desc, eq, gt, lt, ne, notInArray, or } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as schema from "@db/schema";
 import type { VerificationSession } from "@db/schema";
 import { PROMPT_LIGHT_DURATION_MS } from "./generated/prompt-light-asset";
 import { getDb } from "./queries/connection";
+import {
+  decideVoiceId,
+  VoiceIdTracker,
+  type VoiceIdSnapshot,
+  type VoiceIdVerdict,
+} from "./relayguard/voice-id-tracker";
+import { analyzeClip } from "./relayguard/features";
 import {
   getTwilioClient,
   twilioCallerId,
@@ -325,18 +335,15 @@ const speakerphoneUnmuteTimers = new Map<string, NodeJS.Timeout>();
  * the completion flow unmutes the callee exactly when it muted them, and an
  * announce failure can safely restore them. */
 const speakerphoneCalleeMutedSessions = new Set<string>();
-/**
- * Sessions whose canary (Leg A) loud-tone loop has been PERMANENTLY silenced
- * after a speakerphone episode onset. The loud 852+1336 Hz loop is the
- * pre-bridge/early-bridge merge canary — but while a relay episode is active
- * its acoustic leak into the speakerphone mic path can cross the relay's
- * loud-tone floor and false-fire MERGE_DETECTED (the 2026-09-04 live test:
- * call killed mid-relay-episode with the wrong reason). Once silenced the
- * tone never resumes for the session; in-call merge supervision continues
- * via the AUTHORIZED merge-relay detector (Leg A audio crossing into Leg B's
- * inbound stream). Cleared by cleanupSessionMaps() on terminal states.
- */
-const canarySilencedSessions = new Set<string>();
+/* NOTE (2026-09-05, task 11 C1): the canary (Leg A) challenge is NEVER      */
+/* silenced by speakerphone handling. The old canarySilencedSessions set and  */
+/* silenceCanaryLoudTone() are REMOVED: redirecting Leg A into the silent     */
+/* leg-a-hold loop on a speakerphone episode left Leg A with nothing to leak  */
+/* into Leg B after a physical A+B handset merge, so the authorised merge     */
+/* detector could never fire for the rest of the call. The authorised         */
+/* challenge (prompt-light → loud 852+1336 Hz loop) now runs from             */
+/* stream-ready until the call ends / a merge is detected / a terminal       */
+/* state — independent of strikes, warnings, mutes and Call Waiting state.   */
 
 /**
  * Consecutive suspicious analysis hops the SpeakerphoneDetector requires
@@ -453,50 +460,408 @@ export function adminAlertNumber(): string {
 /* GUARDED MODE ONLY: save-only voice ID ("my voice identifies me")            */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* REAL voice-ID gate — "My voice identifies me" (2026-09-05, task 11 C2)      */
+/*                                                                             */
+/* The old SAVE-ONLY, fail-open capture is REPLACED by a verified gate:        */
+/*  - the callee hears a prompt + beep, then a Twilio speech <Gather> listens  */
+/*    while the Leg A inbound Media Stream analyses the SAME audio in near     */
+/*    real time (VoiceIdTracker: VAD / phrase-structure / direct-vs-relay);    */
+/*  - a CONFIRMED relay/speakerphone signature aborts the attempt MID-SPEECH   */
+/*    (REST redirect → relay-retry prompt), never waiting for the phrase;      */
+/*  - the gather action combines the transcript (accent-tolerant ordered       */
+/*    anchor match — supporting evidence) with the tracker evidence per the    */
+/*    decision matrix (decideVoiceId) — uncertainty NEVER passes;              */
+/*  - only a persisted VOICE_ID_VERIFIED stamps voiceIdCapturedAt /            */
+/*    voiceIdRecordingSid and unlocks the second press-1 → Leg B;              */
+/*  - every callback carries the attempt idempotency key (voiceIdAttemptId):   */
+/*    stale/duplicate/late callbacks can never advance or reopen the gate.     */
+/* -------------------------------------------------------------------------- */
+
+/** Persisted voice-ID gate states (verification_sessions.voiceIdState). */
+export const VoiceIdState = {
+  /** TwiML prompt+beep being served for the armed attempt (transient). */
+  PROMPTING: "VOICE_ID_PROMPTING",
+  /** Attempt armed — tracker live on the Leg A stream, gather listening. */
+  LISTENING: "VOICE_ID_LISTENING",
+  /** Gather action received; the decision is being computed. */
+  ANALYZING: "VOICE_ID_ANALYZING",
+  RETRY_RELAY: "VOICE_ID_RETRY_RELAY",
+  RETRY_PHRASE: "VOICE_ID_RETRY_PHRASE",
+  RETRY_AUDIO: "VOICE_ID_RETRY_AUDIO",
+  /** All gates passed — the ONLY state that unlocks the second press-1. */
+  VERIFIED: "VOICE_ID_VERIFIED",
+  /** Evidence clearly failed after the bounded attempt limit. */
+  FAILED: "VOICE_ID_FAILED",
+  /** Detector/network could not produce a trustworthy result. */
+  INCONCLUSIVE: "VOICE_ID_INCONCLUSIVE",
+} as const;
+export type VoiceIdStateValue = (typeof VoiceIdState)[keyof typeof VoiceIdState];
+
+/** Bounded voice-ID attempt limit (env VERIFY_VOICE_ID_MAX_ATTEMPTS, default 3). */
+export function maxVoiceIdAttempts(): number {
+  const v = Number(process.env.VERIFY_VOICE_ID_MAX_ATTEMPTS);
+  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 3;
+}
+
+/** Twilio → app: voice-ID speech <Gather> action (attempt key `va` included). */
+export function voiceIdResultUrl(sessionId: string, attempt: number, attemptId: string): string {
+  return `${requirePublicBaseUrl()}/api/verify/voice-id-result?sid=${sessionId}&a=${attempt}&va=${attemptId}`;
+}
+
+/** Live per-attempt analysis state (in-process; the DB is authoritative). */
+interface VoiceIdActive {
+  attemptId: string;
+  tracker: VoiceIdTracker;
+  /** Decoded float PCM of the attempt (cap 16 s) — the VALIDATED clip source. */
+  pcm: number[];
+  frames: number;
+  /** PROMPTING→LISTENING flip persisted (once, on the first inbound frame). */
+  listenFlipped: boolean;
+}
+const voiceIdActiveAttempts = new Map<string, VoiceIdActive>();
+
+/** μ-law byte → PCM16 (identical to decodeMulaw in verification-stream.ts;
+ * duplicated here to keep verification.ts free of the stream import cycle). */
+function decodeMulawByte(u: number): number {
+  u = ~u & 0xff;
+  let t = ((u & 0x0f) << 3) + 0x84;
+  t <<= (u & 0x70) >> 4;
+  return (u & 0x80) ? 0x84 - t : t - 0x84;
+}
+
 /**
- * Save-only voice ID: after the first press-1 the callee is asked to say
- * "my voice identifies me"; the phrase is recorded and the voiceprint
- * profile is built (VOICEPRINT_CAPTURED evidence), but NO voice matching and
- * NO phrase verification is EVER performed — the capture is call-review
- * evidence, not a gate. The voiceprint <Record> action stamps the capture on
- * the session (voiceIdCapturedAt + voiceIdRecordingSid — see
- * markVoiceIdCaptured) and thereby against the Leg B call it originates, and
- * hands the callee STRAIGHT to the second press-1 gather: no wait loop, no
- * verdict, no re-record. A capture is valid for the SAME UTC calendar day as
- * the call only (voiceIdFreshForToday) — a fresh capture is required each
- * day; a prior-day capture is never reused.
+ * Stream layer hook (Leg A inbound frames only): feed the armed voice-ID
+ * attempt's tracker and retain the attempt audio for the validated clip.
+ * Cheap no-op when no attempt is armed for the session.
  */
+export function pushVoiceIdFrame(sessionId: string, payloadB64: string): void {
+  const entry = voiceIdActiveAttempts.get(sessionId);
+  if (!entry) return;
+  entry.tracker.push(payloadB64);
+  entry.frames++;
+  try {
+    const buf = Buffer.from(payloadB64, "base64");
+    if (entry.pcm.length < 128_000) {
+      for (let i = 0; i < buf.length && entry.pcm.length < 128_000; i++) {
+        entry.pcm.push(decodeMulawByte(buf[i]) / 32768);
+      }
+    }
+  } catch {
+    /* a malformed frame never breaks the gate */
+  }
+  if (!entry.listenFlipped) {
+    entry.listenFlipped = true;
+    void (async () => {
+      const session = await findSession(sessionId);
+      if (
+        session &&
+        !isTerminal(session) &&
+        session.voiceIdAttemptId === entry.attemptId &&
+        session.voiceIdState === VoiceIdState.PROMPTING
+      ) {
+        session.voiceIdState = VoiceIdState.LISTENING;
+        await save(session);
+      }
+    })().catch(() => {});
+  }
+}
+
+/**
+ * Arm a voice-ID attempt (called by the voice-id TwiML BEFORE the prompt +
+ * beep + speech gather are served). Persists VOICE_ID_PROMPTING + the attempt
+ * idempotency key, and starts the streaming tracker on the Leg A inbound
+ * audio. The system prompt/beep are OUTBOUND audio — they never appear on the
+ * callee's inbound track, so the tracker cannot be contaminated by them; the
+ * gather itself only begins listening after the prompt and beep complete.
+ * A retry INVALIDATES the earlier attempt (new attemptId — stale callbacks
+ * naming the old one are rejected).
+ */
+export async function beginVoiceIdAttempt(
+  sessionId: string,
+  attempt: number,
+): Promise<{ ok: boolean; attemptId?: string; reason?: string }> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session) || !session.guarded) {
+    return { ok: false, reason: "invalid session" };
+  }
+  if (session.voiceIdState === VoiceIdState.VERIFIED) {
+    return { ok: false, reason: "already verified" };
+  }
+  if (attempt >= maxVoiceIdAttempts()) return { ok: false, reason: "attempt limit" };
+  const prev = voiceIdActiveAttempts.get(sessionId);
+  if (prev) {
+    prev.tracker.dispose();
+    voiceIdActiveAttempts.delete(sessionId);
+  }
+  const attemptId = randomUUID();
+  const tracker = new VoiceIdTracker({
+    onRelayConfirmed: () => {
+      void handleVoiceIdRelayConfirmed(sessionId, attemptId).catch((err) =>
+        console.error("[verify] voice-id relay abort error:", err),
+      );
+    },
+  });
+  voiceIdActiveAttempts.set(sessionId, {
+    attemptId,
+    tracker,
+    pcm: [],
+    frames: 0,
+    listenFlipped: false,
+  });
+  session.voiceIdState = VoiceIdState.PROMPTING;
+  session.voiceIdAttempts = attempt + 1;
+  session.voiceIdAttemptId = attemptId;
+  await save(session);
+  console.log(
+    `[verify] VOICE_ID_ATTEMPT_STARTED session=${sessionId} attempt=${attempt + 1}/${maxVoiceIdAttempts()} attemptId=${attemptId}`,
+  );
+  await logEvent(
+    sessionId,
+    "VOICE_ID_ATTEMPT_STARTED",
+    JSON.stringify({ attempt: attempt + 1, attemptId }).slice(0, 512),
+  );
+  return { ok: true, attemptId };
+}
+
+export type VoiceIdFinalizeStatus =
+  | "verified"
+  | "retry"
+  | "failed"
+  | "inconclusive"
+  | "stale"
+  | "ignored";
+
+/**
+ * Finalize an armed voice-ID attempt from its gather action (transcript may
+ * be null when the gather ended with no input). Combines the streaming
+ * tracker evidence with the accent-tolerant transcript match via
+ * decideVoiceId and applies the outcome:
+ *  - pass  → persist VOICE_ID_VERIFIED FIRST (durable before any redirect),
+ *            stamp voiceIdCapturedAt + voiceIdRecordingSid, then persist the
+ *            validated clip + voiceprint profile (both post-gate only);
+ *  - retry → persist the retry state (+ kind) and report the next step — a
+ *            retry INVALIDATES the attempt (the next begin re-keys it);
+ *  - limit → VOICE_ID_FAILED (clear evidence) or VOICE_ID_INCONCLUSIVE
+ *            (detector/audio could not produce a trustworthy result), then
+ *            the session itself fails — Leg B is NEVER originated;
+ *  - stale/ignored → no state change at all (duplicate/late callbacks can
+ *            never advance, reopen, or multiply attempts).
+ */
+export async function finalizeVoiceIdAttempt(
+  sessionId: string,
+  attemptId: string,
+  transcript: string | null,
+  transcriptConfidence: number | null,
+): Promise<{ status: VoiceIdFinalizeStatus; verdict?: VoiceIdVerdict; retryKind?: string }> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session)) return { status: "ignored" };
+  if (session.voiceIdState === VoiceIdState.VERIFIED) return { status: "ignored" };
+  if (
+    !attemptId ||
+    attemptId !== session.voiceIdAttemptId ||
+    (session.voiceIdState !== VoiceIdState.PROMPTING &&
+      session.voiceIdState !== VoiceIdState.LISTENING &&
+      session.voiceIdState !== VoiceIdState.ANALYZING)
+  ) {
+    console.warn(
+      `[verify] VOICE_ID_STALE_CALLBACK session=${sessionId} va=${attemptId || "(none)"} current=${session.voiceIdAttemptId ?? "(none)"} state=${session.voiceIdState ?? "(none)"} — ignored`,
+    );
+    return { status: "stale" };
+  }
+  const entry = voiceIdActiveAttempts.get(sessionId);
+  const snap: VoiceIdSnapshot | null =
+    entry && entry.attemptId === attemptId && entry.frames > 0 ? entry.tracker.snapshot() : null;
+  const pcm = entry && entry.attemptId === attemptId ? entry.pcm : [];
+  if (entry) {
+    entry.tracker.dispose();
+    voiceIdActiveAttempts.delete(sessionId);
+  }
+
+  session.voiceIdState = VoiceIdState.ANALYZING;
+  await save(session);
+  const decision = decideVoiceId({ transcript, transcriptConfidence, tracker: snap });
+  const evidence = JSON.stringify({
+    attempt: session.voiceIdAttempts,
+    attemptId,
+    transcript: (transcript ?? "").slice(0, 120),
+    transcriptConfidence,
+    verdict: decision.verdict,
+    reasons: decision.reasons.slice(0, 4),
+    scores: decision.scores,
+    trackerEnd: snap?.endReason ?? null,
+  }).slice(0, 512);
+
+  if (decision.verdict === "pass") {
+    // 1. Atomically persist the VERIFIED gate BEFORE anything else.
+    session.voiceIdState = VoiceIdState.VERIFIED;
+    session.voiceIdCapturedAt = new Date();
+    session.voiceIdRecordingSid = attemptId;
+    session.voiceIdRetryKind = null;
+    await save(session);
+    console.log(`[verify] VOICE_ID_VERIFIED session=${sessionId} attempt=${session.voiceIdAttempts}`);
+    await logEvent(sessionId, "VOICE_ID_VERIFIED", evidence);
+    // 2. Validated clip + voiceprint profile — ONLY after every gate passed
+    //    (speakerphone/relay/partial/clipped audio can never contaminate the
+    //    baseline: those paths never reach this branch).
+    await persistVoiceIdClipAndProfile(sessionId, attemptId, pcm).catch((err) =>
+      console.error("[verify] voice-id clip/profile persist error:", err),
+    );
+    return { status: "verified", verdict: decision.verdict };
+  }
+
+  const attemptsUsed = session.voiceIdAttempts ?? attemptFromId(attemptId, 1);
+  if (attemptsUsed >= maxVoiceIdAttempts()) {
+    const unclear = decision.verdict === "inconclusive" || decision.verdict === "retry-audio";
+    session.voiceIdState = unclear ? VoiceIdState.INCONCLUSIVE : VoiceIdState.FAILED;
+    await save(session);
+    await logEvent(
+      sessionId,
+      unclear ? "VOICE_ID_INCONCLUSIVE" : "VOICE_ID_FAILED",
+      `attempt limit ${maxVoiceIdAttempts()} reached — ${evidence}`,
+    );
+    console.warn(
+      `[verify] ${unclear ? "VOICE_ID_INCONCLUSIVE" : "VOICE_ID_FAILED"} session=${sessionId} — attempt limit reached; Leg B NEVER originates`,
+    );
+    await failSession(
+      session,
+      unclear
+        ? "Voice ID inconclusive: a trustworthy result could not be produced"
+        : "Voice ID failed: the required phrase could not be verified on the direct handset path",
+    );
+    return { status: unclear ? "inconclusive" : "failed", verdict: decision.verdict };
+  }
+
+  const retryState =
+    decision.verdict === "retry-relay"
+      ? VoiceIdState.RETRY_RELAY
+      : decision.verdict === "retry-phrase"
+        ? VoiceIdState.RETRY_PHRASE
+        : VoiceIdState.RETRY_AUDIO;
+  const retryKind = decision.verdict === "inconclusive" ? "audio" : decision.verdict.replace("retry-", "");
+  session.voiceIdState = retryState;
+  session.voiceIdRetryKind = retryKind;
+  await save(session);
+  await logEvent(sessionId, "VOICE_ID_RETRY", evidence);
+  console.log(
+    `[verify] VOICE_ID_RETRY session=${sessionId} kind=${retryKind} attempt=${attemptsUsed}/${maxVoiceIdAttempts()} — ${decision.reasons[0] ?? ""}`,
+  );
+  return { status: "retry", verdict: decision.verdict, retryKind };
+}
+
+/** attempt counter fallback when the row somehow lacks it (defensive). */
+function attemptFromId(_attemptId: string, fallback: number): number {
+  return fallback;
+}
+
+/**
+ * FAST RELAY ABORT — the streaming tracker confirmed speakerphone/relayed
+ * audio MID-PHRASE: do not wait for the phrase to finish. Finalize the
+ * attempt as a relay retry (decideVoiceId sees tracker.relayConfirmed), then
+ * REST-redirect Leg A out of the in-flight gather straight into the retry
+ * prompt + a fresh gather. Never marks captured, never a live-call strike.
+ */
+export async function handleVoiceIdRelayConfirmed(
+  sessionId: string,
+  attemptId: string,
+): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session)) return;
+  if (session.voiceIdState !== VoiceIdState.LISTENING) return;
+  if (!attemptId || attemptId !== session.voiceIdAttemptId) return;
+  console.warn(
+    `[verify] VOICE_ID_RELAY_FAST_ABORT session=${sessionId} — speakerphone/relay confirmed mid-phrase; interrupting the attempt`,
+  );
+  const res = await finalizeVoiceIdAttempt(sessionId, attemptId, null, null);
+  if (res.status === "retry" && session.legACallSid) {
+    await redirectCall(
+      session.legACallSid,
+      "voice-id",
+      sessionId,
+      undefined,
+      `a=${Math.min(session.voiceIdAttempts ?? 1, maxVoiceIdAttempts() - 1)}`,
+    );
+  }
+}
+
+/** 8 kHz mono PCM16 WAV wrapper for the validated attempt clip. */
+function buildWavBytes(samples: number[]): Buffer {
+  const data = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    data.writeInt16LE(Math.round(s * 32767), i * 2);
+  }
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(8000, 24);
+  header.writeUInt32LE(16000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
+}
+
+/**
+ * Persist the VALIDATED attempt clip (stream-captured audio — exactly what
+ * the gates analysed) + build the voiceprint profile. Runs ONLY on a passed
+ * gate; best-effort (a persistence hiccup is logged, never un-verifies).
+ */
+async function persistVoiceIdClipAndProfile(
+  sessionId: string,
+  attemptId: string,
+  pcm: number[],
+): Promise<void> {
+  const session = await findSession(sessionId);
+  if (!session || isTerminal(session)) return;
+  const durationSec = Math.round((pcm.length / 8000) * 10) / 10;
+  try {
+    const dir = process.env.VERIFY_VOICE_ID_DIR ?? path.resolve(process.cwd(), "data", "voice-id");
+    await fs.promises.mkdir(dir, { recursive: true });
+    await fs.promises.writeFile(
+      path.join(dir, `${sessionId}-${attemptId}.wav`),
+      buildWavBytes(pcm),
+    );
+    session.voiceRecordingUrl = `local://voice-id/${attemptId}`;
+    session.voiceRecordingDurationSec = Math.max(1, Math.round(durationSec));
+    session.voiceRecordedAt = new Date();
+    await save(session);
+    await logEvent(
+      sessionId,
+      "VOICE_RECORDING_STORED",
+      `local://voice-id/${attemptId} duration=${durationSec}s — stream-captured validated clip`,
+    );
+  } catch (err) {
+    console.error(`[verify] voice-id clip persist failed session=${sessionId}:`, err);
+  }
+  try {
+    const profile = analyzeClip(Float32Array.from(pcm), 8000);
+    const speechSec = profile.vad.speechFrames.length * 0.064;
+    await logEvent(
+      sessionId,
+      "VOICEPRINT_CAPTURED",
+      `attemptId=${attemptId} duration=${durationSec}s speechSec=${speechSec.toFixed(2)} voicedFrames=${profile.voicePrint.voicedFrames} — VALIDATED voice-ID enrollment (phrase + direct-path + quality gates passed)`,
+    );
+  } catch (err) {
+    console.error(`[verify] voice-id voiceprint failed session=${sessionId}:`, err);
+  }
+}
 
 /**
  * True while a voice-ID capture stamped at `capturedAt` is still fresh for
  * `now` — both fall on the SAME UTC calendar day. A missing capture is never
- * fresh; a prior-day capture is never reused.
+ * fresh; a prior-day capture is never reused. NOTE: voiceIdCapturedAt is
+ * stamped ONLY on VOICE_ID_VERIFIED (the real gate) — never by a bare
+ * recording/gather callback.
  */
 export function voiceIdFreshForToday(capturedAt: Date | null, now: Date = new Date()): boolean {
   if (!capturedAt) return false;
   return capturedAt.toISOString().slice(0, 10) === now.toISOString().slice(0, 10);
-}
-
-/**
- * The voice-ID <Record> action fired — stamp the save-only capture on the
- * session (voiceIdCapturedAt + voiceIdRecordingSid). No attempts, no
- * verdict, no gate: the callee proceeds to the second press-1 immediately
- * and Leg B is originated from that press regardless of profiling outcome.
- */
-export async function markVoiceIdCaptured(
-  sessionId: string,
-  recordingSid: string,
-): Promise<void> {
-  const session = await findSession(sessionId);
-  if (!session || isTerminal(session)) return;
-  session.voiceIdCapturedAt = new Date();
-  session.voiceIdRecordingSid = recordingSid || null;
-  await save(session);
-  await logEvent(
-    sessionId,
-    "VOICE_ID_CAPTURED",
-    `recordingSid=${recordingSid || "(none)"} — save-only voice ID (no matching); valid same UTC day only`,
-  );
 }
 
 
@@ -508,6 +873,11 @@ export async function markVoiceIdCaptured(
 function cleanupSessionMaps(sessionId: string): void {
   pendingLegBAnswer.delete(sessionId);
   pendingStreamReady.delete(sessionId);
+  const vid = voiceIdActiveAttempts.get(sessionId);
+  if (vid) {
+    vid.tracker.dispose();
+    voiceIdActiveAttempts.delete(sessionId);
+  }
   clearReadinessTimer(sessionId);
   bridgedSessions.delete(sessionId);
   secondCallEngagedSessions.delete(sessionId);
@@ -519,7 +889,6 @@ function cleanupSessionMaps(sessionId: string): void {
   if (ut) clearTimeout(ut);
   speakerphoneUnmuteTimers.delete(sessionId);
   speakerphoneCalleeMutedSessions.delete(sessionId);
-  canarySilencedSessions.delete(sessionId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -626,12 +995,29 @@ export function verifyPrompts() {
     accept:
       e.VERIFY_PROMPT_ACCEPT ??
       "You are receiving a call from an inmate. Do not merge or transfer this call. Please press 1 if you accept.",
-    // GUARDED MODE ONLY: spoken after press-1, before the voiceprint <Record>
-    // (save-only — the phrase is captured as call-review evidence, never
-    // verified, so there are no retry/failure prompts).
+    // GUARDED MODE ONLY — REAL voice-ID gate (2026-09-05 C2). Initial prompt
+    // (spoken before the beep + speech gather); the callee must say the
+    // phrase DIRECTLY into the handset. Retry prompts are reason-specific:
+    // relay = speakerphone/relayed audio confirmed; phrase = complete phrase
+    // not heard; audio = unclear/uncertain; nospeech = nothing heard.
     voiceId:
       e.VERIFY_PROMPT_VOICE_ID ??
-      "Please identify your voice. After the beep, say: my voice identifies me.",
+      "After the beep, turn off speakerphone, hold the phone to your ear, and say: My voice identifies me.",
+    voiceIdRetryRelay:
+      e.VERIFY_PROMPT_VOICE_ID_RETRY_RELAY ??
+      "The audio sounded like speakerphone or relayed audio. Please turn off speakerphone, hold the phone to your ear, and say again after the beep: My voice identifies me.",
+    voiceIdRetryPhrase:
+      e.VERIFY_PROMPT_VOICE_ID_RETRY_PHRASE ??
+      "I did not hear the complete phrase. After the beep, please say: My voice identifies me.",
+    voiceIdRetryAudio:
+      e.VERIFY_PROMPT_VOICE_ID_RETRY_AUDIO ??
+      "I could not verify the audio clearly. Please hold the phone to your ear and say again after the beep: My voice identifies me.",
+    voiceIdRetryNoSpeech:
+      e.VERIFY_PROMPT_VOICE_ID_RETRY_NOSPEECH ??
+      "I did not hear you. After the beep, please hold the phone to your ear and say: My voice identifies me.",
+    voiceIdFailed:
+      e.VERIFY_PROMPT_VOICE_ID_FAILED ??
+      "We could not verify your voice on this line. This call will now end. Goodbye.",
     // GUARDED MODE ONLY: spoken after the voice-ID recording; the SECOND
     // press-1 is the explicit trigger that originates Leg B. The callee is
     // pre-taught the call-waiting choreography: answering the second call
@@ -848,10 +1234,20 @@ async function save(session: VerificationSession): Promise<void> {
       voiceRecordingUrl: session.voiceRecordingUrl,
       voiceRecordingDurationSec: session.voiceRecordingDurationSec,
       voiceRecordedAt: session.voiceRecordedAt,
-      // Save-only voice-ID capture stamp (markVoiceIdCaptured) — same-UTC-day
-      // validity is derived at read time via voiceIdFreshForToday.
+      // Real voice-ID gate (2026-09-05 C2): voiceIdCapturedAt is stamped ONLY
+      // on VOICE_ID_VERIFIED — same-UTC-day validity is derived at read time
+      // via voiceIdFreshForToday.
       voiceIdCapturedAt: session.voiceIdCapturedAt,
       voiceIdRecordingSid: session.voiceIdRecordingSid,
+      // Voice-ID gate state machine + per-attempt idempotency key (the DB is
+      // authoritative; in-process maps are disposable caches). NOTE:
+      // legAChallengeLastConfirmedAt is deliberately NOT here — it is written
+      // only by stampLegAChallengeConfirmed's direct UPDATE, so a save() from
+      // an older session snapshot can never clobber a fresher proof-of-life.
+      voiceIdState: session.voiceIdState,
+      voiceIdAttempts: session.voiceIdAttempts,
+      voiceIdAttemptId: session.voiceIdAttemptId,
+      voiceIdRetryKind: session.voiceIdRetryKind,
       bridgeRecordingSid: session.bridgeRecordingSid,
       bridgeRecordingUrl: session.bridgeRecordingUrl,
       bridgeRecordingDurationSec: session.bridgeRecordingDurationSec,
@@ -1191,15 +1587,17 @@ async function redirectCall(
   twimlKind: string,
   sessionId: string,
   bridgeLeg?: "caller" | "legA" | "legB",
+  extraQuery?: string,
 ): Promise<boolean> {
   if (!callSid) return false;
   try {
     // Bridge redirects carry the leg role so the webhook serves the right
     // conference attributes (anchor vs joiner — see bridgeUrl).
-    const url =
+    let url =
       twimlKind === "guarded-bridge" && bridgeLeg
         ? bridgeUrl(sessionId, bridgeLeg)
         : twimlUrl(twimlKind, sessionId);
+    if (extraQuery) url += `&${extraQuery}`;
     await getTwilioClient()
       .calls(callSid)
       .update({ url, method: "POST" });
@@ -1513,19 +1911,29 @@ export async function onCallAccepted(
 }
 
 /**
- * Second press-1 ("ready"). Guarded sessions originate Leg B HERE — after the
- * save-only voice-ID recording, never automatically from the recording
- * callback. Non-guarded Leg B may already be airborne from the legacy
+ * Second press-1 ("ready"). Guarded sessions originate Leg B HERE — ONLY
+ * after a persisted VOICE_ID_VERIFIED (the real voice-ID gate, 2026-09-05
+ * C2). Non-guarded Leg B may already be airborne from the legacy
  * pre-origination path; in that case this confirms and drains the buffered
  * answer without a duplicate call.
  *
- * SAVE-ONLY VOICE ID: there is NO voice-ID verdict gate. The voice-ID phrase
- * is captured as call-review evidence only (stamped via markVoiceIdCaptured);
- * the second press-1 always proceeds to Leg B origination.
+ * FAIL CLOSED: any guarded second press-1 arriving without a durable
+ * VOICE_ID_VERIFIED is refused — no Leg B, no state change, no exception.
  */
 export async function onCalleeReady(sessionId: string): Promise<void> {
   const session = await findSession(sessionId);
   if (!session) return;
+  if (session.guarded && session.voiceIdState !== VoiceIdState.VERIFIED) {
+    console.warn(
+      `[verify] VOICE_ID_GATE_BLOCKED session=${sessionId} voiceIdState=${session.voiceIdState ?? "(none)"} — Leg B origination REFUSED (voice ID not verified)`,
+    );
+    await logEvent(
+      sessionId,
+      "VOICE_ID_GATE_BLOCKED",
+      `second press-1 with voiceIdState=${session.voiceIdState ?? "(none)"} — Leg B NOT originated (fail-closed gate)`,
+    );
+    return;
+  }
   if (session.state === VState.CALL_ACCEPTED) {
     await originateLegB(sessionId);
     return;
@@ -2031,6 +2439,23 @@ export async function onMergeDetected(
  *    only a ready for the NEW stream sid re-gates readiness and restarts the
  *    challenge — Leg A can never start against a stale/dead stream.
  */
+/**
+ * Canary proof-of-life (task 11 C1): the self-refreshing leg-a-challenge-tone
+ * TwiML loop stamps this on every fetch, so the persisted row always shows
+ * the authorised merge challenge was actively playing. Restart-safe and
+ * deliberately silent (no event-log spam — one UPDATE per ~20 s loop).
+ */
+export async function stampLegAChallengeConfirmed(sessionId: string): Promise<void> {
+  try {
+    await getDb()
+      .update(schema.verificationSessions)
+      .set({ legAChallengeLastConfirmedAt: new Date() })
+      .where(eq(schema.verificationSessions.sessionId, sessionId));
+  } catch (err) {
+    console.warn(`[verify] legAChallengeLastConfirmedAt stamp failed session=${sessionId}:`, (err as Error).message);
+  }
+}
+
 export async function onStreamReady(
   sessionId: string,
   streamSid: string,
@@ -2107,10 +2532,10 @@ export async function onStreamReady(
 
   // 1) Start the canary challenge on Leg A. The redirect MUST succeed before
   //    we record the challenge as started — otherwise the relay would count
-  //    Phase 1 against a prompt that was never played. A SILENCED canary (a
-  //    speakerphone episode already owned this session) is never restarted —
-  //    the relay restart just re-gates readiness without the tone.
-  if (session.legACallSid && !canarySilencedSessions.has(sessionId)) {
+  //    Phase 1 against a prompt that was never played. Once started, the
+  //    challenge is NEVER silenced by speakerphone handling (task 11 C1): it
+  //    runs until the call ends, a merge is detected, or a terminal state.
+  if (session.legACallSid) {
     const ok = await redirectCall(session.legACallSid, "leg-a-challenge", sessionId);
     if (!ok) {
       await logEvent(
@@ -3167,49 +3592,14 @@ export async function onSpeakerphoneCleared(
   }
 }
 
-/**
- * Permanently silence the canary (Leg A) loud-tone loop for this session by
- * redirecting the held canary leg to the silent self-refreshing `leg-a-hold`
- * TwiML. Triggered on the FIRST speakerphone episode onset: while relay audio
- * is present, the loud 852+1336 Hz loop's acoustic leak through the
- * speakerphone mic path can cross the relay's loud-tone energy floor and
- * false-fire MERGE_DETECTED (the 2026-09-04 live test — call killed
- * mid-episode with the wrong reason). The leg stays alive (HoldDetector keeps
- * watching its uplink); only the tone stops. Once silenced, a later
- * onStreamReady challenge restart is suppressed (see the gate there), so the
- * tone can never resume mid-session. Idempotent; best-effort.
- */
-export async function silenceCanaryLoudTone(sessionId: string): Promise<void> {
-  if (canarySilencedSessions.has(sessionId)) return;
-  canarySilencedSessions.add(sessionId);
-  try {
-    const session = await findSession(sessionId);
-    if (!session || isTerminal(session) || session.state !== VState.BRIDGED) {
-      canarySilencedSessions.delete(sessionId);
-      return;
-    }
-    if (!session.legACallSid) {
-      canarySilencedSessions.delete(sessionId);
-      return;
-    }
-    const ok = await redirectCall(session.legACallSid, "leg-a-hold", sessionId);
-    if (!ok) {
-      canarySilencedSessions.delete(sessionId); // allow retry on the next onset
-      return;
-    }
-    console.log(
-      `[verify] CANARY_TONE_SILENCED session=${sessionId} legA=${session.legACallSid} — loud tone loop stopped (speakerphone episode owns the session)`,
-    );
-    await logEvent(
-      sessionId,
-      "CANARY_TONE_SILENCED",
-      "speakerphone episode onset — canary loud 852+1336Hz loop permanently silenced so its acoustic leak cannot false-fire the relay loud-tone listener; in-call merge supervision continues via the authorised Leg A→Leg B relay detector (prompt fingerprint + loud-tone listener on Leg B inbound)",
-    );
-  } catch (err) {
-    canarySilencedSessions.delete(sessionId);
-    console.error(`[verify] silenceCanaryLoudTone failed session=${sessionId}:`, err);
-  }
-}
+/* REMOVED (2026-09-05, task 11 C1): silenceCanaryLoudTone() and every        */
+/* related call path. A speakerphone event must NEVER silence Leg A, redirect */
+/* it into the silent leg-a-hold loop, stop the authorised challenge, or      */
+/* change the merge detector's armed state — doing so disabled merge          */
+/* protection for the remainder of the call (Leg A had nothing left to leak   */
+/* into Leg B after a physical A+B handset merge). The authorised challenge   */
+/* now runs independently of all speakerphone handling until the call ends,   */
+/* a merge is detected, or the session goes terminal.                         */
 
 /**
  * SPEAKERPHONE STRIKE-LADDER DISPATCHER — the single entry point the

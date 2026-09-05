@@ -233,6 +233,30 @@ export const verificationSessions = mysqlTable(
     voiceIdCapturedAt: timestamp("voiceIdCapturedAt", { fsp: 3 }),
     voiceIdRecordingSid: varchar("voiceIdRecordingSid", { length: 64 }),
     /**
+     * GUARDED MODE ONLY — REAL voice-ID gate (2026-09-05, task 11 C2):
+     * the "My voice identifies me" stage is now a VERIFIED gate, not a
+     * save-only capture. voiceIdState is the persisted gate state:
+     * VOICE_ID_PROMPTING | VOICE_ID_LISTENING | VOICE_ID_ANALYZING |
+     * VOICE_ID_RETRY_RELAY | VOICE_ID_RETRY_PHRASE | VOICE_ID_RETRY_AUDIO |
+     * VOICE_ID_VERIFIED | VOICE_ID_FAILED | VOICE_ID_INCONCLUSIVE.
+     * voiceIdCapturedAt/voiceIdRecordingSid above are stamped ONLY on
+     * VOICE_ID_VERIFIED (every gate passed) — never by a bare recording or
+     * gather callback. voiceIdAttemptId is the idempotency key for the
+     * in-flight attempt: stale/duplicate callbacks naming an older attempt
+     * are ignored. Leg B originates only while voiceIdState=VOICE_ID_VERIFIED.
+     */
+    voiceIdState: varchar("voiceIdState", { length: 32 }),
+    voiceIdAttempts: int("voiceIdAttempts").default(0),
+    voiceIdAttemptId: varchar("voiceIdAttemptId", { length: 64 }),
+    voiceIdRetryKind: varchar("voiceIdRetryKind", { length: 16 }),
+    /**
+     * Canary (Leg A) challenge proof-of-life: stamped on every
+     * leg-a-challenge-tone TwiML fetch (the self-refreshing loud-tone loop),
+     * so a restart/ops review can confirm the authorised merge challenge was
+     * actively playing — merge protection never silently lapses (task 11 C1).
+     */
+    legAChallengeLastConfirmedAt: timestamp("legAChallengeLastConfirmedAt", { fsp: 3 }),
+    /**
      * GUARDED MODE ONLY: the live bridge conference recording (record-from-
      * start) — the full two-way conversation for call review.
      */
