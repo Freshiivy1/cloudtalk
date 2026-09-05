@@ -298,14 +298,15 @@ export function isBridgedSession(sessionId: string): boolean {
  * A new strike requires: previous episode ended → audio normal for the
  * recovery period (the detector's fingerprint-clean streak, ≈3s) →
  * detector rearmed → a new episode independently confirmed. Ladder:
- *   strike 1  → recorded (timestamp + detector evidence); call continues.
- *   strike 2  → recorded; call continues UNCHANGED (a milestone only).
- *   strike 3  → WARNING FLAG: mute the inmate FIRST, play the warning to
- *               the conference (recipient hears it; the inmate hears it
- *               receive-only), unmute when playback completes, resume.
+ *   strike 1  → recorded (timestamp + detector evidence) + the challenge
+ *               sound is played ONCE to the callee; call returns to normal.
+ *   strike 2  → same as strike 1 (record + one challenge sound to the callee).
+ *   strike 3  → WARNING FLAG: mute BOTH the inmate AND the callee (callee
+ *               best-effort) FIRST, play the warning to the conference
+ *               (both hear it receive-only), unmute BOTH when playback
+ *               completes, resume.
  *   strike 4  → SUPREME FLAG: admin notified exactly once, call ended.
- * Strikes 1–2 inject NO audio into either leg. All entries are cleared by
- * cleanupSessionMaps() on terminal states. */
+ * All entries are cleared by cleanupSessionMaps() on terminal states. */
 const speakerphoneStrikes = new Map<string, number>();
 /** Sessions whose strike-3 warning was successfully delivered (plays once ever). */
 const speakerphoneWarnedSessions = new Set<string>();
@@ -319,6 +320,11 @@ const speakerphoneSupremeSessions = new Set<string>();
 /** Pending unmute timers for the strike-3 warning flow (completion-driven:
  * measured warning-audio duration + buffer, never a blind guess). */
 const speakerphoneUnmuteTimers = new Map<string, NodeJS.Timeout>();
+/** Sessions whose CALLEE (Leg B participant) was successfully muted for the
+ * strike-3 warning (best-effort half of "mute both if possible") — tracked so
+ * the completion flow unmutes the callee exactly when it muted them, and an
+ * announce failure can safely restore them. */
+const speakerphoneCalleeMutedSessions = new Set<string>();
 /**
  * Sessions whose canary (Leg A) loud-tone loop has been PERMANENTLY silenced
  * after a speakerphone episode onset. The loud 852+1336 Hz loop is the
@@ -512,6 +518,7 @@ function cleanupSessionMaps(sessionId: string): void {
   const ut = speakerphoneUnmuteTimers.get(sessionId);
   if (ut) clearTimeout(ut);
   speakerphoneUnmuteTimers.delete(sessionId);
+  speakerphoneCalleeMutedSessions.delete(sessionId);
   canarySilencedSessions.delete(sessionId);
 }
 
@@ -3218,12 +3225,14 @@ export async function silenceCanaryLoudTone(sessionId: string): Promise<void> {
  * the recovery period — that is exactly the detector's fingerprint-clean
  * clear streak, so an onset can only arrive after a valid recovery.
  *
- * Ladder:
- *   strike 1 → recorded (timestamp + detector evidence); call continues.
- *   strike 2 → recorded; call continues UNCHANGED (a milestone only).
- *   strike 3 → WARNING FLAG (issueSpeakerphoneWarning): mute the inmate,
- *              play the warning to the conference, unmute on completion,
- *              resume. NOT supreme.
+ * Ladder (2026-09-05 rev B):
+ *   strike 1 → recorded (timestamp + detector evidence) + challenge sound
+ *              played ONCE to the callee; call returns to normal.
+ *   strike 2 → same (record + one challenge sound to the callee).
+ *   strike 3 → WARNING FLAG (issueSpeakerphoneWarning): mute BOTH parties
+ *              (inmate confirmed, callee best-effort), play the warning to
+ *              the conference, unmute both on completion, resume.
+ *              NOT supreme.
  *   strike 4 → SUPREME FLAG (onSpeakerphoneSupreme): only if the strike-3
  *              warning was actually DELIVERED; otherwise the warning is
  *              retried (a supreme without a delivered warning would punish
@@ -3232,10 +3241,8 @@ export async function silenceCanaryLoudTone(sessionId: string): Promise<void> {
  * While the strike-3 warning flow is in progress (muted → playing →
  * unmute) detector callbacks are coalesced away: the warning audio itself
  * must never create strike 4, and duplicate callbacks from the same
- * episode are ignored.
- *
- * Strikes 1–2 inject NO audio into either leg — the challenge-noise path
- * was removed with the legacy merge-tone path on 2026-09-05.
+ * episode are ignored. The strike 1–2 challenge sound is a ONE-SHOT
+ * participant announce at episode onset — never a repeated tone.
  */
 export async function injectSpeakerphoneChallenge(
   sessionId: string,
@@ -3291,8 +3298,12 @@ export async function injectSpeakerphoneChallenge(
   }
   if (strikes <= 2) {
     console.log(
-      `[verify] SPEAKERPHONE_LADDER session=${sessionId} strike=${strikes} — recorded only; call continues unchanged`,
+      `[verify] SPEAKERPHONE_LADDER session=${sessionId} strike=${strikes} — recorded; challenge sound to the callee, then back to normal`,
     );
+    // Strikes 1–2: the strike is persisted above; now play the challenge
+    // sound ONCE to the callee (Leg B participant) — then the call simply
+    // continues. No mute, no flags, no repeat.
+    await playSpeakerphoneChallenge(sessionId, strikes);
     return;
   }
   const warned = speakerphoneWarnedSessions.has(sessionId);
@@ -3314,21 +3325,69 @@ export async function injectSpeakerphoneChallenge(
 }
 
 /**
+ * STRIKE 1–2 CHALLENGE SOUND — played ONCE per episode to the CALLEE (the
+ * Leg B conference participant): a single participant announce of the
+ * system's challenge sound, then the call returns to normal. This is NOT
+ * the removed legacy merge-detection tone: it is the deliberate, spec'd
+ * strike-1/2 user-facing challenge, one shot at episode onset, never
+ * repeated, never a mute/flag/teardown. Best-effort: a failed announce is
+ * logged and the strike record (already persisted) stands.
+ */
+async function playSpeakerphoneChallenge(
+  sessionId: string,
+  strikes: number,
+): Promise<void> {
+  try {
+    const session = await findSession(sessionId);
+    if (!session || isTerminal(session) || session.state !== VState.BRIDGED) return;
+    if (!session.legBCallSid) {
+      console.warn(`[verify] SPEAKERPHONE_CHALLENGE session=${sessionId} — no Leg B participant, challenge skipped`);
+      return;
+    }
+    const base = getPublicBaseUrl();
+    if (!base) return;
+    const confSid = await liveConferenceSid(sessionId);
+    if (!confSid) return;
+    await getTwilioClient()
+      .conferences(confSid)
+      .participants(session.legBCallSid)
+      .update({
+        announceUrl: `${base}/api/verify/speakerphone-challenge.wav`,
+        announceMethod: "GET",
+      });
+    console.log(
+      `[verify] SPEAKERPHONE_CHALLENGE session=${sessionId} strike=${strikes} — challenge sound played to the callee (one shot); call continues normally`,
+    );
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_CHALLENGE",
+      `strike ${strikes}: challenge sound played ONCE to the callee (Leg B participant); call returns to normal — no mute, no flag`.slice(0, 512),
+    );
+  } catch (err) {
+    console.warn(
+      `[verify] SPEAKERPHONE_CHALLENGE session=${sessionId} strike=${strikes} announce failed (best-effort):`,
+      (err as Error).message,
+    );
+  }
+}
+
+/**
  * STRIKE-3 WARNING FLAG (plays exactly once per session when delivery
  * succeeds). Ordered contract:
- *  1. MUTE the inmate's outbound conference audio FIRST and confirm the
- *     mute succeeded — they must not talk over the warning, but they are
- *     NOT disconnected and still RECEIVE audio (hears the warning
- *     receive-only). If the mute fails the warning is NOT played, nothing
- *     is marked delivered, and the next episode retries.
+ *  1. MUTE BOTH PARTIES' outbound conference audio FIRST: the inmate's mute
+ *     is REQUIRED and confirmed (failure → warning not played, retried next
+ *     episode); the CALLEE's mute is best-effort ("if possible") — attempted
+ *     and logged, but a failure does not block the warning. Neither party is
+ *     disconnected — both still RECEIVE audio (they hear the warning
+ *     receive-only and cannot talk over it).
  *  2. PLAY the warning to the whole conference (conference-level announce)
- *     so the RECIPIENT hears it directly and the muted inmate hears it
+ *     so the RECIPIENT hears it directly and the muted parties hear it
  *     receive-only. If the announce fails, record the delivery failure and
- *     SAFELY UNMUTE immediately — the inmate is never left muted.
- *  3. UNMUTE on playback completion: the served asset's duration is
+ *     SAFELY UNMUTE BOTH immediately — nobody is ever left muted.
+ *  3. UNMUTE BOTH on playback completion: the served asset's duration is
  *     MEASURED (speakerphoneWarningAudioMs) — completion = measured
- *     duration + delivery buffer, then the unmute is confirmed (with
- *     retries, so a transient Twilio error can never leave the inmate
+ *     duration + delivery buffer, then the unmutes are confirmed (with
+ *     retries, so a transient Twilio error can never leave anyone
  *     permanently muted). Delivery is recorded (SPEAKERPHONE_WARNING +
  *     SPEAKERPHONE_CALLER_UNMUTED), the count stays at strike 3, and the
  *     call resumes.
@@ -3394,6 +3453,33 @@ async function issueSpeakerphoneWarning(
       "SPEAKERPHONE_CALLER_MUTED",
       "strike 3: inmate outbound audio muted before warning playback (confirmed); still receives conference audio; NOT disconnected",
     );
+    // 1b. MUTE the CALLEE too ("mute both if possible") — BEST-EFFORT: the
+    // callee must not talk over the warning either, but a callee-mute
+    // failure never blocks the warning (the inmate mute is the required
+    // half). Tracked in speakerphoneCalleeMutedSessions so completion (and
+    // failure paths) restore exactly what was muted.
+    if (session.legBCallSid) {
+      try {
+        await getTwilioClient()
+          .conferences(confSid)
+          .participants(session.legBCallSid)
+          .update({ muted: true });
+        speakerphoneCalleeMutedSessions.add(sessionId);
+        console.log(
+          `[verify] SPEAKERPHONE_CALLEE_MUTED session=${sessionId} legB=${session.legBCallSid} — muted BEFORE warning playback (receive-only)`,
+        );
+        await logEvent(
+          sessionId,
+          "SPEAKERPHONE_CALLEE_MUTED",
+          "strike 3: callee outbound audio muted before warning playback (best-effort, confirmed); still receives conference audio; NOT disconnected",
+        );
+      } catch (err) {
+        console.warn(
+          `[verify] SPEAKERPHONE_CALLEE_MUTED session=${sessionId} — callee mute failed (best-effort, warning continues):`,
+          (err as Error).message,
+        );
+      }
+    }
     // 2. PLAY the warning to the CONFERENCE — the recipient hears it
     //    directly; the muted inmate hears it in receive-only mode.
     try {
@@ -3404,13 +3490,14 @@ async function issueSpeakerphoneWarning(
           announceMethod: "GET",
         });
     } catch (err) {
-      console.error(`[verify] SPEAKERPHONE_WARNING session=${sessionId} — announce failed after mute, unmuting:`, err);
+      console.error(`[verify] SPEAKERPHONE_WARNING session=${sessionId} — announce failed after mute, unmuting both:`, err);
       await logEvent(
         sessionId,
         "SPEAKERPHONE_WARNING_FAILED",
-        `strike 3: warning announce failed — delivery NOT claimed; inmate safely unmuted | ${(err as Error).message}`.slice(0, 512),
+        `strike 3: warning announce failed — delivery NOT claimed; both parties safely unmuted | ${(err as Error).message}`.slice(0, 512),
       ).catch(() => {});
       await unmuteSpeakerphoneCaller(sessionId, "warning announce failed — safe unmute");
+      await unmuteSpeakerphoneCallee(sessionId, "warning announce failed — safe unmute");
       return; // NOT marked warned — retried on the next episode
     }
     // Mark issued ONLY after the announce succeeded (see docstring).
@@ -3418,12 +3505,12 @@ async function issueSpeakerphoneWarning(
     speakerphoneWarningActiveAt.set(sessionId, Date.now());
     const unmuteInMs = speakerphoneWarningAudioMs() + speakerphoneWarningUnmuteBufferMs();
     console.log(
-      `[verify] SPEAKERPHONE_WARNING session=${sessionId} conf=${confSid} — warning playing to conference (recipient + inmate receive-only); unmute in ${unmuteInMs}ms (measured audio ${speakerphoneWarningAudioMs()}ms + buffer) | ${reason}`,
+      `[verify] SPEAKERPHONE_WARNING session=${sessionId} conf=${confSid} — warning playing to conference (BOTH parties muted receive-only); unmute both in ${unmuteInMs}ms (measured audio ${speakerphoneWarningAudioMs()}ms + buffer) | ${reason}`,
     );
     await logEvent(
       sessionId,
       "SPEAKERPHONE_WARNING",
-      `strike ${strikes} (warning flag): warning playing to the conference — recipient hears it, inmate receive-only with mic muted; unmute in ${unmuteInMs}ms; next distinct confirmed episode after recovery = supreme flag (call ended + admin alerted) | ${reason}`.slice(0, 512),
+      `strike ${strikes} (warning flag): warning playing to the conference — both parties hear it receive-only with mics muted (inmate confirmed, callee best-effort); unmute both in ${unmuteInMs}ms; next distinct confirmed episode after recovery = supreme flag (call ended + admin alerted) | ${reason}`.slice(0, 512),
     );
     try {
       const { logCallEvent } = await import("./simulator");
@@ -3494,11 +3581,43 @@ async function unmuteSpeakerphoneCaller(sessionId: string, why: string): Promise
 }
 
 /**
+ * Raw unmute of the CALLEE's outbound conference audio (only attempted when
+ * the callee was actually muted for this warning — see
+ * speakerphoneCalleeMutedSessions). Same confirmation semantics as the
+ * caller unmute; best-effort DB mirror is caller-only by design.
+ */
+async function unmuteSpeakerphoneCallee(sessionId: string, why: string): Promise<boolean> {
+  if (!speakerphoneCalleeMutedSessions.has(sessionId)) return true; // never muted
+  try {
+    const session = await findSession(sessionId);
+    if (!session) return false;
+    const confSid = await liveConferenceSid(sessionId);
+    if (confSid && session.legBCallSid) {
+      await getTwilioClient()
+        .conferences(confSid)
+        .participants(session.legBCallSid)
+        .update({ muted: false });
+    }
+    speakerphoneCalleeMutedSessions.delete(sessionId);
+    console.log(`[verify] SPEAKERPHONE_CALLEE_UNMUTED session=${sessionId} — ${why}`);
+    await logEvent(
+      sessionId,
+      "SPEAKERPHONE_CALLEE_UNMUTED",
+      `callee outbound audio restored (confirmed) — ${why}`.slice(0, 512),
+    );
+    return true;
+  } catch (err) {
+    console.error(`[verify] unmuteSpeakerphoneCallee failed session=${sessionId} (${why}):`, err);
+    return false;
+  }
+}
+
+/**
  * Strike-3 playback completion: the measured warning duration + buffer has
- * elapsed — unmute the inmate, confirm, record successful delivery, and
+ * elapsed — unmute BOTH parties, confirm, record successful delivery, and
  * resume the two-way conversation with the count retained at strike 3.
- * The unmute is retried (3 attempts, 2s apart) so a transient Twilio error
- * can NEVER leave the inmate permanently muted; a final failure raises a
+ * The unmutes are retried (3 attempts, 2s apart) so a transient Twilio
+ * error can NEVER leave anyone permanently muted; a final failure raises a
  * loud SPEAKERPHONE_UNMUTE_FAILED event for ops.
  */
 async function completeSpeakerphoneWarning(sessionId: string): Promise<void> {
@@ -3506,16 +3625,21 @@ async function completeSpeakerphoneWarning(sessionId: string): Promise<void> {
   for (let attempt = 1; attempt <= 3; attempt++) {
     const session = await findSession(sessionId).catch(() => null);
     if (!session || isTerminal(session)) return; // call already ending — moot
-    const ok = await unmuteSpeakerphoneCaller(
+    const okCaller = await unmuteSpeakerphoneCaller(
       sessionId,
       `warning playback complete (measured ${speakerphoneWarningAudioMs()}ms asset + buffer), attempt ${attempt}`,
     );
+    const okCallee = await unmuteSpeakerphoneCallee(
+      sessionId,
+      `warning playback complete (measured ${speakerphoneWarningAudioMs()}ms asset + buffer), attempt ${attempt}`,
+    );
+    const ok = okCaller && okCallee;
     if (ok) {
       speakerphoneWarningActiveAt.delete(sessionId);
       await logEvent(
         sessionId,
         "SPEAKERPHONE_WARNING_DELIVERED",
-        "strike-3 warning successfully delivered: played to the conference with the inmate muted receive-only, inmate unmuted after completion, call resumed — count retained at strike 3; detection rearms once audio is normal",
+        "strike-3 warning successfully delivered: played to the conference with both parties muted receive-only, both unmuted after completion, call resumed — count retained at strike 3; detection rearms once audio is normal",
       ).catch(() => {});
       try {
         const { logCallEvent } = await import("./simulator");
@@ -3541,12 +3665,12 @@ async function completeSpeakerphoneWarning(sessionId: string): Promise<void> {
     if (attempt < 3) await new Promise((r) => setTimeout(r, 2_000));
   }
   console.error(
-    `[verify] SPEAKERPHONE_UNMUTE_FAILED session=${sessionId} — 3 unmute attempts failed; OPS: inmate may still be muted`,
+    `[verify] SPEAKERPHONE_UNMUTE_FAILED session=${sessionId} — 3 unmute attempts failed; OPS: a party may still be muted`,
   );
   await logEvent(
     sessionId,
     "SPEAKERPHONE_UNMUTE_FAILED",
-    "strike-3 unmute failed after 3 confirmed attempts — inmate may still be muted; manual ops intervention required",
+    "strike-3 unmute failed after 3 confirmed attempts — inmate and/or callee may still be muted; manual ops intervention required",
   ).catch(() => {});
 }
 
@@ -3589,6 +3713,7 @@ export async function onSpeakerphoneSupreme(
     if (unmuteTimer) clearTimeout(unmuteTimer);
     speakerphoneUnmuteTimers.delete(sessionId);
     speakerphoneWarningActiveAt.delete(sessionId);
+    speakerphoneCalleeMutedSessions.delete(sessionId);
 
     const strikes = speakerphoneStrikes.get(sessionId) ?? 0;
     const transitioned = await transition(

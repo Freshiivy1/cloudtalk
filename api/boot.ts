@@ -9,6 +9,7 @@ import { createOAuthCallbackHandler } from "./kimi/auth";
 import { statusCallbackHandler, voiceWebhookHandler } from "./twilio-voice";
 import {
   promptLightHandler,
+  speakerphoneChallengeHandler,
   speakerphoneTerminatedHandler,
   speakerphoneWarningHandler,
   verificationGatherHandler,
@@ -77,9 +78,11 @@ app.get("/api/verify/tone.wav", verificationToneHandler);
 // Phase 1 challenge asset (prompt + light DTMF-8 watermark), audio/wav,
 // no-store, measured duration surfaced via X-Prompt-Light-Duration-Ms.
 app.get("/api/verify/prompt-light.wav", promptLightHandler);
-// Speakerphone strike ladder: strike-3 warning (conference announce — the
-// recipient hears it, the muted inmate hears it receive-only) and the
-// supreme-flag termination notice (announced to both live parties).
+// Speakerphone strike ladder: strike 1–2 challenge sound (one-shot announce
+// to the callee), strike-3 warning (conference announce — both muted parties
+// hear it receive-only) and the supreme-flag termination notice (announced
+// to both live parties).
+app.get("/api/verify/speakerphone-challenge.wav", speakerphoneChallengeHandler);
 app.get("/api/verify/speakerphone-warning.wav", speakerphoneWarningHandler);
 app.get("/api/verify/speakerphone-terminated.wav", speakerphoneTerminatedHandler);
 app.use("/api/trpc/*", async (c) => {

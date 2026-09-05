@@ -104,6 +104,15 @@ export async function speakerphoneWarningHandler(c: Context) {
   return serveSpeakerphonePrompt(c, "speakerphone-warning.wav");
 }
 
+/**
+ * GET /api/verify/speakerphone-challenge.wav — the STRIKE 1–2 challenge
+ * sound, announced ONCE per episode to the callee (Leg B participant).
+ * Serves the established relayguard challenge-noise asset (16 kHz mono).
+ */
+export async function speakerphoneChallengeHandler(c: Context) {
+  return serveSpeakerphonePrompt(c, "relayguard-challenge-noise-70pct-16k.wav");
+}
+
 /** GET /api/verify/speakerphone-terminated.wav — supreme-flag termination. */
 export async function speakerphoneTerminatedHandler(c: Context) {
   return serveSpeakerphonePrompt(c, "speakerphone-terminated.wav");

@@ -497,11 +497,13 @@ describe("state machine", () => {
 /* continuous suspicious period are refires — never extra strikes. A new       */
 /* strike requires the previous episode to end, audio to be normal for the     */
 /* recovery period (the detector's fingerprint-clean clear streak), and the    */
-/* detector to rearm. Strike 1-2: record only. Strike 3: WARNING FLAG (mute    */
-/* the inmate FIRST → play the warning to the conference → unmute on measured  */
-/* playback completion → resume; count stays 3). Strike 4: SUPREME FLAG, only  */
-/* after a DELIVERED warning. Leg B NEVER gets a detection tone — the legacy   */
-/* merge-tone/challenge-noise injection path was removed on 2026-09-05.        */
+/* detector to rearm. Strike 1-2 (rev B): record + play the challenge sound   */
+/* ONCE to the CALLEE (Leg B participant), then the call returns to normal.   */
+/* Strike 3: WARNING FLAG (mute BOTH the inmate — required — AND the callee — */
+/* best-effort — FIRST → play the warning to the conference → unmute BOTH on  */
+/* measured playback completion → resume; count stays 3). Strike 4: SUPREME   */
+/* FLAG, only after a DELIVERED warning. The legacy merge-tone/challenge-     */
+/* noise detection-tone injection path stays removed (2026-09-05).            */
 /* -------------------------------------------------------------------------- */
 
 const ladderSession = (tag: string) =>
@@ -523,11 +525,10 @@ const partOpsOf = (sid: string) =>
 const confOpsOf = (sid: string) =>
   conferenceUpdates.filter((u) => u.conference === `verify-${sid}`);
 
-describe("speakerphone strike ladder (2026-09-05 spec)", () => {
-  it("strikes 1 and 2 are recorded ONCE each (timestamp + evidence) and the call continues with NO audio, mute, flag, admin alert or teardown", async () => {
+describe("speakerphone strike ladder (2026-09-05 spec rev B)", () => {
+  it("strikes 1 and 2 are recorded ONCE each (timestamp + evidence) and each plays the challenge sound ONCE to the CALLEE — then the call returns to normal (no mute, flag, admin alert or teardown)", async () => {
     const s = await ladderSession("s12");
     const sid = s.sessionId;
-    const partBefore = participantUpdates.length;
     const confBefore = conferenceUpdates.length;
 
     epOnset(sid, "ep1");
@@ -537,6 +538,17 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
     expect(strikes[0].details).toContain("strike 1");
     expect(strikes[0].details).toContain("confirmed at"); // timestamp persisted
     expect(strikes[0].details).toContain("ep1"); // detector evidence persisted
+    // Strike 1 → the challenge sound is played ONCE to the CALLEE (the Leg B
+    // conference participant): exactly one participant announce of the
+    // challenge asset, addressed to Leg B — never to the caller, never a
+    // conference-level announce, never a mute.
+    let challenges = partOpsOf(sid).filter((p) =>
+      p.announceUrl?.includes("speakerphone-challenge.wav"),
+    );
+    expect(challenges).toHaveLength(1);
+    expect(challenges[0].participant).toBe("CA_s12_legB");
+    expect(challenges[0].announceMethod).toBe("GET");
+    expect(partOpsOf(sid).some((p) => p.muted !== undefined)).toBe(false);
     await vs.onSpeakerphoneCleared(sid, "ep1 cleared");
 
     epOnset(sid, "ep2");
@@ -544,16 +556,24 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
     strikes = await strikesOf(sid);
     expect(strikes).toHaveLength(2);
     expect(strikes[1].details).toContain("strike 2");
+    // Strike 2 → exactly one MORE challenge announce to the callee (2 total).
+    challenges = partOpsOf(sid).filter((p) =>
+      p.announceUrl?.includes("speakerphone-challenge.wav"),
+    );
+    expect(challenges).toHaveLength(2);
+    expect(challenges.every((p) => p.participant === "CA_s12_legB")).toBe(true);
     await vs.onSpeakerphoneCleared(sid, "ep2 cleared");
 
-    // The call continues UNCHANGED: still BRIDGED, and nothing was played,
-    // announced, muted, flagged, SMS'd or hung up anywhere.
+    // …then the call goes back to NORMAL: still BRIDGED, no conference
+    // announce, no mute, no flag, no SMS, no hangup anywhere.
     expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
-    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
     expect(conferenceUpdates.slice(confBefore)).toHaveLength(0);
+    expect(partOpsOf(sid).some((p) => p.muted !== undefined)).toBe(false);
     const types = await eventTypesOf(sid);
+    expect(types.filter((t) => t === "SPEAKERPHONE_CHALLENGE")).toHaveLength(2);
     expect(types).not.toContain("SPEAKERPHONE_WARNING");
     expect(types).not.toContain("SPEAKERPHONE_CALLER_MUTED");
+    expect(types).not.toContain("SPEAKERPHONE_CALLEE_MUTED");
     expect(types).not.toContain("SPEAKERPHONE_SUPREME");
     expect(twilioMock.sentMessages.some((m) => m.body.includes(sid))).toBe(false);
     // The recovery event between the episodes documents the rearm contract.
@@ -599,7 +619,7 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
     expect(await strikesOf(sid)).toHaveLength(2);
   });
 
-  it("FULL LADDER: ep1-2 recorded silently, ep3 = WARNING FLAG (mute→warning→unmute→resume, count stays 3), ep4 = SUPREME FLAG (flag once + admin SMS once + full teardown)", async () => {
+  it("FULL LADDER: ep1-2 recorded + challenge sound to the callee each, ep3 = WARNING FLAG (mute BOTH→warning→unmute BOTH→resume, count stays 3), ep4 = SUPREME FLAG (flag once + admin SMS once + full teardown)", async () => {
     process.env.VERIFY_SPEAKERPHONE_WARNING_AUDIO_MS = "300";
     process.env.VERIFY_SPEAKERPHONE_WARNING_UNMUTE_BUFFER_MS = "200";
     process.env.ADMIN_ALERT_NUMBER = "+61400000999";
@@ -616,51 +636,68 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
       await tick(150);
       await vs.onSpeakerphoneCleared(sid, "ep2 cleared");
       expect(await strikesOf(sid)).toHaveLength(2);
-      // Strikes 1-2: ZERO telephony side effects on this conference.
-      expect(partOpsOf(sid)).toHaveLength(0);
+      // Strikes 1-2: EXACTLY ONE challenge announce to the CALLEE per episode
+      // — and nothing else (no mutes, no conference-level ops).
+      const challenges = partOpsOf(sid).filter((p) =>
+        p.announceUrl?.includes("speakerphone-challenge.wav"),
+      );
+      expect(challenges).toHaveLength(2);
+      expect(challenges.every((p) => p.participant === "CA_ld_legB")).toBe(true);
+      expect(partOpsOf(sid).some((p) => p.muted !== undefined)).toBe(false);
       expect(confOpsOf(sid)).toHaveLength(0);
 
       // EPISODE 3 → WARNING FLAG (NOT supreme; the call must not end).
       epOnset(sid, "ep3");
       await tick(300);
       expect(await strikesOf(sid)).toHaveLength(3);
-      // The inmate was MUTED FIRST and the mute confirmed BEFORE playback:
-      // the recorded op sequence proves mute precedes the conference announce.
+      // BOTH parties were MUTED FIRST and the mutes confirmed BEFORE playback:
+      // the recorded op sequence proves both mutes precede the conference
+      // announce (inmate mute required, callee mute best-effort).
       let ops = twilioMock.opLog.slice(opBefore);
       const muteIdx = ops.findIndex((o) => o === "p:CA_ld_caller:mute");
+      const calleeMuteIdx = ops.findIndex((o) => o === "p:CA_ld_legB:mute");
       const announceIdx = ops.findIndex((o) => o === `c:verify-${sid}:announce`);
       expect(muteIdx).toBeGreaterThanOrEqual(0);
+      expect(calleeMuteIdx).toBeGreaterThanOrEqual(0);
       expect(announceIdx).toBeGreaterThan(muteIdx);
-      // The warning plays to the CONFERENCE: the recipient hears it directly
-      // and the muted inmate hears it receive-only (not disconnected).
+      expect(announceIdx).toBeGreaterThan(calleeMuteIdx);
+      // The warning plays to the CONFERENCE: both muted parties hear it
+      // receive-only (neither is disconnected).
       const announce = confOpsOf(sid)[0];
       expect(announce.announceUrl).toContain("/api/verify/speakerphone-warning.wav");
       expect(announce.announceMethod).toBe("GET");
       let types = await eventTypesOf(sid);
       expect(types).toContain("SPEAKERPHONE_CALLER_MUTED");
+      expect(types).toContain("SPEAKERPHONE_CALLEE_MUTED");
       expect(types).toContain("SPEAKERPHONE_WARNING");
       expect(types).not.toContain("SPEAKERPHONE_SUPREME");
       expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
 
       // While the warning plays, detector callbacks are coalesced: the
       // warning audio itself can NEVER create strike 4, and the warning
-      // plays EXACTLY ONCE (no second mute, no second announce).
+      // plays EXACTLY ONCE (no second mutes, no second announce).
       epRefire(sid, "warning audio leaking back into the mic");
       await vs.injectSpeakerphoneChallenge(sid, "pathological duplicate onset", true);
       await tick(200);
       expect(await strikesOf(sid)).toHaveLength(3);
       ops = twilioMock.opLog.slice(opBefore);
       expect(ops.filter((o) => o === "p:CA_ld_caller:mute")).toHaveLength(1);
+      expect(ops.filter((o) => o === "p:CA_ld_legB:mute")).toHaveLength(1);
       expect(ops.filter((o) => o === `c:verify-${sid}:announce`)).toHaveLength(1);
 
-      // UNMUTE on playback completion (measured 300ms asset + 200ms buffer):
+      // UNMUTE BOTH on playback completion (measured 300ms asset + 200ms buffer):
       await tick(700);
-      const unmuteIdx = twilioMock.opLog
-        .slice(opBefore)
-        .findIndex((o) => o === "p:CA_ld_caller:unmute");
+      ops = twilioMock.opLog.slice(opBefore);
+      const unmuteIdx = ops.findIndex((o) => o === "p:CA_ld_caller:unmute");
+      const calleeUnmuteIdx = ops.findIndex((o) => o === "p:CA_ld_legB:unmute");
       expect(unmuteIdx).toBeGreaterThan(announceIdx);
+      expect(calleeUnmuteIdx).toBeGreaterThan(announceIdx);
+      expect(
+        partOpsOf(sid).some((p) => p.participant === "CA_ld_legB" && p.muted === false),
+      ).toBe(true);
       types = await eventTypesOf(sid);
       expect(types).toContain("SPEAKERPHONE_CALLER_UNMUTED");
+      expect(types).toContain("SPEAKERPHONE_CALLEE_UNMUTED");
       expect(types).toContain("SPEAKERPHONE_WARNING_DELIVERED");
       // The conversation RESUMED: still BRIDGED, count retained at strike 3,
       // still no supreme / admin alert / teardown.
@@ -750,10 +787,17 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
       expect(types).toContain("SPEAKERPHONE_WARNING_FAILED");
       expect(types).not.toContain("SPEAKERPHONE_WARNING");
       expect(types).not.toContain("SPEAKERPHONE_CALLER_MUTED");
-      // The mute comes FIRST, so a mute failure means no announce was ever
-      // attempted — and no mute state can linger.
+      // The inmate mute comes FIRST, so its failure means no announce was
+      // ever attempted, the callee mute was never attempted either, and no
+      // mute state can linger. The only participant ops on this conference
+      // so far are the two strike-1/2 challenge announces to the callee.
       expect(confOpsOf(sid)).toHaveLength(0);
-      expect(partOpsOf(sid)).toHaveLength(0);
+      const mfParts = partOpsOf(sid);
+      expect(
+        mfParts.filter((p) => p.announceUrl?.includes("speakerphone-challenge.wav")),
+      ).toHaveLength(2);
+      expect(mfParts.some((p) => p.muted !== undefined)).toBe(false);
+      expect(types).not.toContain("SPEAKERPHONE_CALLEE_MUTED");
       expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
       await vs.onSpeakerphoneCleared(sid, "c3");
 
@@ -796,16 +840,22 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
       twilioMock.conferenceUpdateError = null;
       await tick(200);
       const types = await eventTypesOf(sid);
-      expect(types).toContain("SPEAKERPHONE_CALLER_MUTED"); // mute DID land
+      expect(types).toContain("SPEAKERPHONE_CALLER_MUTED"); // inmate mute DID land
+      expect(types).toContain("SPEAKERPHONE_CALLEE_MUTED"); // callee mute DID land
       expect(types).toContain("SPEAKERPHONE_WARNING_FAILED"); // failure recorded
       expect(types).not.toContain("SPEAKERPHONE_WARNING"); // delivery NOT claimed
-      // Failure safety: the inmate was SAFELY UNMUTED right after the failed
-      // announce — never left muted.
+      // Failure safety: BOTH parties were SAFELY UNMUTED right after the
+      // failed announce — nobody is ever left muted.
       const muteIdx = twilioMock.opLog.findIndex((o) => o === "p:CA_af_caller:mute");
       const unmuteIdx = twilioMock.opLog.findIndex((o) => o === "p:CA_af_caller:unmute");
+      const calleeMuteIdx = twilioMock.opLog.findIndex((o) => o === "p:CA_af_legB:mute");
+      const calleeUnmuteIdx = twilioMock.opLog.findIndex((o) => o === "p:CA_af_legB:unmute");
       expect(muteIdx).toBeGreaterThanOrEqual(0);
       expect(unmuteIdx).toBeGreaterThan(muteIdx);
+      expect(calleeMuteIdx).toBeGreaterThanOrEqual(0);
+      expect(calleeUnmuteIdx).toBeGreaterThan(calleeMuteIdx);
       expect(types).toContain("SPEAKERPHONE_CALLER_UNMUTED");
+      expect(types).toContain("SPEAKERPHONE_CALLEE_UNMUTED");
       expect(confOpsOf(sid).some((u) => u.announceUrl)).toBe(false);
 
       // Not marked warned → the next distinct episode retries the warning.
@@ -846,10 +896,14 @@ describe("speakerphone strike ladder (2026-09-05 spec)", () => {
       await tick(2_500); // unmute attempt 3 (+2s) succeeds
       let types = await eventTypesOf(sid);
       expect(types).toContain("SPEAKERPHONE_CALLER_UNMUTED");
+      expect(types).toContain("SPEAKERPHONE_CALLEE_UNMUTED");
       expect(types).toContain("SPEAKERPHONE_WARNING_DELIVERED");
       expect(types).not.toContain("SPEAKERPHONE_UNMUTE_FAILED");
       expect(
         partOpsOf(sid).some((p) => p.participant === "CA_ur_caller" && p.muted === false),
+      ).toBe(true);
+      expect(
+        partOpsOf(sid).some((p) => p.participant === "CA_ur_legB" && p.muted === false),
       ).toBe(true);
       expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
 
@@ -930,13 +984,15 @@ describe("Call Waiting engagement is state-only — Leg B stays clean (legacy to
     expect((await vs.findSession(sid))!.state).toBe(vs.VState.BRIDGED);
   });
 
-  it("a hold engagement DURING a speakerphone episode still drives no audio and adds no strike (state separation)", async () => {
+  it("a hold engagement DURING a speakerphone episode still drives no audio of its own and adds no strike (state separation)", async () => {
     const s = await ladderSession("cwe");
     const sid = s.sessionId;
-    const partBefore = participantUpdates.length;
-    const confBefore = conferenceUpdates.length;
     epOnset(sid, "ep1");
     await tick(150);
+    // The episode's own strike-1 challenge announce to the callee has landed;
+    // from here the Call Waiting state changes must add ZERO further audio.
+    const partAfterOnset = participantUpdates.length;
+    const confAfterOnset = conferenceUpdates.length;
     handleSecondCallEngaged(sid);
     await tick(150);
     expect(vs.isSecondCallEngaged(sid)).toBe(true);
@@ -946,8 +1002,8 @@ describe("Call Waiting engagement is state-only — Leg B stays clean (legacy to
     await vs.onSpeakerphoneCleared(sid, "cleared");
     // Exactly one strike (the episode); Call Waiting state changes are mute.
     expect(await strikesOf(sid)).toHaveLength(1);
-    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
-    expect(conferenceUpdates.slice(confBefore)).toHaveLength(0);
+    expect(participantUpdates.slice(partAfterOnset)).toHaveLength(0);
+    expect(conferenceUpdates.slice(confAfterOnset)).toHaveLength(0);
   });
 
   it("silenceCanaryLoudTone redirects Leg A to leg-a-hold exactly once (idempotent) and logs CANARY_TONE_SILENCED", async () => {
@@ -964,7 +1020,7 @@ describe("Call Waiting engagement is state-only — Leg B stays clean (legacy to
     expect(updatedCalls.slice(updBefore).filter((u) => u.sid === "CA_cs_legA")).toHaveLength(1);
   });
 
-  it("episode onset silences the canary loud tone FIRST, while strike 1 itself stays silent (no audio into any conference participant)", async () => {
+  it("episode onset silences the canary loud tone FIRST, and strike 1 plays exactly ONE challenge sound to the CALLEE (no mute, no conference announce, nothing to the caller)", async () => {
     const s = await ladderSession("co");
     const sid = s.sessionId;
     const updBefore = updatedCalls.length;
@@ -976,10 +1032,18 @@ describe("Call Waiting engagement is state-only — Leg B stays clean (legacy to
     expect(redirects).toHaveLength(1);
     expect(redirects[0].url).toContain("leg-a-hold");
     expect(await eventTypesOf(sid)).toContain("CANARY_TONE_SILENCED");
-    // The strike-1 path injects NOTHING into the conference (the old
-    // challenge-noise announce is gone with the legacy path).
-    expect(participantUpdates.slice(partBefore)).toHaveLength(0);
+    // The strike-1 path plays the challenge sound ONCE to the CALLEE (Leg B
+    // participant) — a single participant announce; never a mute, never a
+    // conference-level announce, never anything to the caller, and never the
+    // removed legacy merge-tone/challenge-noise detection asset.
+    const parts = participantUpdates.slice(partBefore);
+    expect(parts).toHaveLength(1);
+    expect(parts[0].participant).toBe("CA_co_legB");
+    expect(parts[0].announceUrl).toContain("/api/verify/speakerphone-challenge.wav");
+    expect(parts[0].announceUrl).not.toContain("merge-tone");
+    expect(parts[0].announceUrl).not.toContain("challenge-noise");
     expect(conferenceUpdates.slice(confBefore)).toHaveLength(0);
+    expect((await eventTypesOf(sid)).filter((t) => t === "SPEAKERPHONE_CHALLENGE")).toHaveLength(1);
   });
 
   it("the AUTHORISED A→B merge detector is intact — a relay-detected merge still ends the call (MERGE_DETECTED + toneDetected)", async () => {
@@ -1680,6 +1744,7 @@ import { SpeakerphoneDetector } from "./relayguard/speakerphone-detector";
 import { HoldDetector } from "./relayguard/hold-detector";
 import {
   promptLightHandler,
+  speakerphoneChallengeHandler,
   speakerphoneTerminatedHandler,
   speakerphoneWarningHandler,
   verificationConferenceHandler,
@@ -1700,6 +1765,7 @@ hookApp.post("/api/verify/gather/leg-a-ready", verificationGatherLegAReadyHandle
 hookApp.post("/api/verify/voiceprint", verificationVoiceprintHandler);
 hookApp.get("/api/verify/tone.wav", verificationToneHandler);
 hookApp.get("/api/verify/prompt-light.wav", promptLightHandler);
+hookApp.get("/api/verify/speakerphone-challenge.wav", speakerphoneChallengeHandler);
 hookApp.get("/api/verify/speakerphone-warning.wav", speakerphoneWarningHandler);
 hookApp.get("/api/verify/speakerphone-terminated.wav", speakerphoneTerminatedHandler);
 hookApp.post("/api/verify/recording/merge", verificationRecordingHandler);
@@ -1941,6 +2007,17 @@ describe("webhooks", () => {
     // message — a truncated asset would cut the warning text short.
     expect(buf.length).toBeGreaterThan(266496 * 2);
     expect(vs.speakerphoneWarningAudioMs()).toBe(16_656);
+  });
+
+  it("speakerphone-challenge.wav serves the strike-1/2 challenge asset (played once to the callee per episode)", async () => {
+    const res = await hookApp.request("/api/verify/speakerphone-challenge.wav");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("audio/wav");
+    const buf = Buffer.from(await res.arrayBuffer());
+    expect(buf.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    // 64 000 samples × 2 bytes (+ RIFF headers) = the full 4 000ms challenge
+    // sound — the one-shot strike-1/2 callee challenge.
+    expect(buf.length).toBeGreaterThan(64000 * 2);
   });
 
 
