@@ -32,13 +32,6 @@ import path from "path";
 import * as vs from "./verification";
 import { inProcessStreamUrl, relayStreamUrl, streamToken } from "./verification-stream";
 import { PROMPT_LIGHT_DURATION_MS, PROMPT_LIGHT_WAV_FILE } from "./generated/prompt-light-asset";
-import {
-  CHALLENGE_NOISE_LEVEL,
-  CHALLENGE_NOISE_LOOP_SEC,
-  CHALLENGE_NOISE_SEED,
-  challengeNoiseWav,
-} from "./relayguard/noise";
-import { mergeToneWav } from "./relayguard/dtmf";
 import { wavToPcm16 } from "./verification-record";
 import { analyzeClip, type ClipProfile } from "./relayguard/features";
 
@@ -71,59 +64,15 @@ export async function verificationToneHandler(c: Context) {
 }
 
 /**
- * GET /api/verify/challenge-noise.wav — serves the EXACT relayguard
- * challenge-noise probe used by the detector: seed 0x5eed, bass-free
- * 500 Hz–6 kHz band, +4 dB presence at 2 kHz, 70% relayguard slider level,
- * 4-second seamless loop. The production callee path uses the telephony-grade
- * 16 kHz WAV asset; an in-process 8 kHz render is kept as a fallback. Used as
- * the conference announceUrl for the OUTER speakerphone case: Twilio plays it
- * to the CALLER (inmate) participant only, so the party relaying the call
- * over speakerphone is prompted to take it off speaker to hear clearly (the
- * call continues — no hangup). The callee (Leg B) participant NEVER gets
- * this noise — that announce channel is reserved for the merge tone.
- */
-export async function challengeNoiseHandler(c: Context) {
-  const candidates = [
-    path.resolve(import.meta.dirname, "public", "relayguard-challenge-noise-70pct-16k.wav"),
-    path.resolve(import.meta.dirname, "..", "dist", "public", "relayguard-challenge-noise-70pct-16k.wav"),
-    path.resolve(import.meta.dirname, "..", "public", "relayguard-challenge-noise-70pct-16k.wav"),
-    path.resolve(process.cwd(), "dist", "public", "relayguard-challenge-noise-70pct-16k.wav"),
-    path.resolve(process.cwd(), "public", "relayguard-challenge-noise-70pct-16k.wav"),
-  ];
-  for (const p of candidates) {
-    try {
-      const buf = await fs.promises.readFile(p);
-      return c.body(new Uint8Array(buf), 200, {
-        "Content-Type": "audio/wav",
-        "Content-Length": String(buf.byteLength),
-        "Cache-Control": "no-store",
-        "X-Relayguard-Probe": `seed=0x${CHALLENGE_NOISE_SEED.toString(16)};level=${CHALLENGE_NOISE_LEVEL};loop=${CHALLENGE_NOISE_LOOP_SEC}s;band=500-6000Hz;presence=+4dB@2kHz`,
-      });
-    } catch {
-      // try next candidate
-    }
-  }
-  try {
-    const buf = challengeNoiseWav();
-    return c.body(new Uint8Array(buf), 200, {
-      "Content-Type": "audio/wav",
-      "Content-Length": String(buf.byteLength),
-      "Cache-Control": "no-store",
-      "X-Relayguard-Probe": `seed=0x${CHALLENGE_NOISE_SEED.toString(16)};level=${CHALLENGE_NOISE_LEVEL};loop=${CHALLENGE_NOISE_LOOP_SEC}s;band=500-6000Hz;presence=+4dB@2kHz`,
-    });
-  } catch (err) {
-    console.error("[verify] challenge-noise render failed:", err);
-    return c.text("noise unavailable", 500);
-  }
-}
-
-/**
  * Shared static-WAV server for the speakerphone strike-ladder prompts. Both
  * assets live in public/ as 16 kHz mono PCM16 and are announced to
  * conference participants (announceUrl, GET):
- *  - speakerphone-warning.wav   — STRIKE 3 final warning, caller-only
- *    ("your microphone has now been muted … if it is detected again, this
- *    call will be ended and flagged for review");
+ *  - speakerphone-warning.wav   — STRIKE 3 (WARNING FLAG): played to the
+ *    whole CONFERENCE (conference-level announce) while the inmate is muted
+ *    receive-only — "The system has detected speakerphone-like audio or
+ *    excessive background noise. Speakerphone is permitted only in a quiet
+ *    room. Keep the phone close and remove all background voices and noise.
+ *    If this is detected again, this call will end.";
  *  - speakerphone-terminated.wav — SUPREME FLAG termination notice, played to
  *    BOTH parties before the conference is torn down.
  */
@@ -190,32 +139,6 @@ export async function promptLightHandler(c: Context) {
     }
   }
   return c.text("prompt-light not found", 404);
-}
-
-/**
- * GET /api/verify/merge-tone.wav — serves the BRIDGED in-call merge tone:
- * a beep render of the existing merge-tone pair (852+1336 Hz = DTMF-8,
- * VERIFY_MERGE_TONE_SEC seconds, default 0.5s) produced by
- * relayguard/dtmf.ts. Used as the conference announceUrl for the Leg A
- * participant only while the tone is ARMED (HoldDetector second-call
- * engagement), re-announced every VERIFY_MERGE_TONE_REARM_MS so it is
- * effectively continuous; the instant the callee merges, the tone crosses
- * into Leg A's uplink and the stream-side Goertzel detector fires the
- * in-call verdict.
- */
-export async function mergeToneHandler(c: Context) {
-  try {
-    const buf = mergeToneWav(vs.mergeToneSec());
-    return c.body(new Uint8Array(buf), 200, {
-      "Content-Type": "audio/wav",
-      "Content-Length": String(buf.byteLength),
-      "Cache-Control": "no-store",
-      "X-Merge-Tone": `dtmf=8;freq=852+1336Hz;duration=${vs.mergeToneSec()}s`,
-    });
-  } catch (err) {
-    console.error("[verify] merge-tone render failed:", err);
-    return c.text("tone unavailable", 500);
-  }
 }
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -404,9 +327,9 @@ export async function verificationTwimlHandler(c: Context) {
         }
         // Hold-canary forensics: open a NON-BLOCKING <Start><Stream> of the
         // callee's uplink (inbound track) to the in-process analyzer
-        // (HoldDetector second-call engagement + armed merge-tone recognizer;
-        // speakerphone analysis lives on the LEG B stream — Leg A is HELD
-        // after Leg B answers, so relay audio never reaches this stream).
+        // (HoldDetector Call Waiting engagement — pure state telemetry, no
+        // audio; speakerphone analysis lives on the LEG B stream — Leg A is
+        // HELD after Leg B answers, so relay audio never reaches this stream).
         // <Start> does not hold or alter the call — the gather flow below is
         // untouched — and the stream persists for the rest of the call, so it
         // is started once (first prompt only, not on re-prompt redirects).

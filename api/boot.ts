@@ -8,8 +8,6 @@ import { env } from "./lib/env";
 import { createOAuthCallbackHandler } from "./kimi/auth";
 import { statusCallbackHandler, voiceWebhookHandler } from "./twilio-voice";
 import {
-  challengeNoiseHandler,
-  mergeToneHandler,
   promptLightHandler,
   speakerphoneTerminatedHandler,
   speakerphoneWarningHandler,
@@ -79,15 +77,11 @@ app.get("/api/verify/tone.wav", verificationToneHandler);
 // Phase 1 challenge asset (prompt + light DTMF-8 watermark), audio/wav,
 // no-store, measured duration surfaced via X-Prompt-Light-Duration-Ms.
 app.get("/api/verify/prompt-light.wav", promptLightHandler);
-// Relayguard challenge-noise probe (conference announce on suspected speakerphone).
-app.get("/api/verify/challenge-noise.wav", challengeNoiseHandler);
-// Speakerphone strike ladder: strike-3 final warning (caller-only announce)
-// and the supreme-flag termination notice (announced to both live parties).
+// Speakerphone strike ladder: strike-3 warning (conference announce — the
+// recipient hears it, the muted inmate hears it receive-only) and the
+// supreme-flag termination notice (announced to both live parties).
 app.get("/api/verify/speakerphone-warning.wav", speakerphoneWarningHandler);
 app.get("/api/verify/speakerphone-terminated.wav", speakerphoneTerminatedHandler);
-// BRIDGED in-call merge tone (Leg B participant announce while ARMED — the
-// tone crossing a merge fires the in-call verdict on the canary media stream).
-app.get("/api/verify/merge-tone.wav", mergeToneHandler);
 app.use("/api/trpc/*", async (c) => {
   return fetchRequestHandler({
     endpoint: "/api/trpc",

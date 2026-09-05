@@ -1,11 +1,11 @@
 /**
- * Merge-tone detector (Goertzel DSP) tests — no DB, no network.
- * Synthesizes μ-law audio frames exactly as Twilio Media Streams delivers
- * them (base64, 8 kHz mono) and asserts the detector fires only on the
- * continuous DTMF-'9' merge tone (852 Hz + 1336 Hz).
+ * Pre-bridge recording-chunk analysis tests (WAV + Goertzel) — no DB, no network.
+ * The in-call merge detector is the authorised merge-relay A->B path; Leg B never
+ * has a detection tone played INTO it, so there is no in-call DTMF-9 detector here.
+ * decodeMulaw is still covered because verification-record reuses it.
  */
 import { describe, expect, it } from "vitest";
-import { MergeToneDetector, decodeMulaw } from "./verification-stream";
+import { decodeMulaw } from "./verification-stream";
 import { detectMergeToneMs, wavToPcm16 } from "./verification-record";
 
 /** Textbook μ-law encoder (test-side mirror of decodeMulaw). */
@@ -20,103 +20,15 @@ function encodeMulaw(s: number): number {
   return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
 
-/** Build base64 μ-law frames (160 samples = 20 ms each) from a PCM generator. */
-function frames(gen: (i: number) => number, seconds: number): string[] {
-  const total = 8000 * seconds;
-  const out: string[] = [];
-  for (let off = 0; off + 160 <= total; off += 160) {
-    const bytes = Buffer.alloc(160);
-    for (let j = 0; j < 160; j++) bytes[j] = encodeMulaw(gen(off + j));
-    out.push(bytes.toString("base64"));
-  }
-  return out;
-}
-
 const dtmf9 = (amp = 12000) => (i: number) =>
   amp * Math.sin((2 * Math.PI * 852 * i) / 8000) +
   amp * Math.sin((2 * Math.PI * 1336 * i) / 8000);
 
-describe("MergeToneDetector (Goertzel DTMF-9)", () => {
+describe("μ-law codec (shared with verification-record)", () => {
   it("μ-law codec round-trips", () => {
     expect(Math.abs(decodeMulaw(encodeMulaw(12000)) - 12000)).toBeLessThan(1000);
     expect(Math.abs(decodeMulaw(encodeMulaw(-8000)) + 8000)).toBeLessThan(600);
     expect(Math.abs(decodeMulaw(encodeMulaw(0)))).toBeLessThan(200);
-  });
-
-  it("fires on a continuous 852+1336 Hz stream within ~500ms", () => {
-    const d = new MergeToneDetector();
-    let firedAt = -1;
-    frames(dtmf9(), 2).forEach((f, idx) => {
-      if (d.push(f) && firedAt < 0) firedAt = idx;
-    });
-    expect(d.hasFired).toBe(true);
-    expect(firedAt).toBeGreaterThanOrEqual(13); // needs ≥6×50ms windows (300ms)
-    expect(firedAt).toBeLessThan(25); // well under 500ms of audio
-  });
-
-  it("still fires on quiet, codec-degraded tone (amplitude 3000)", () => {
-    const d = new MergeToneDetector();
-    frames(dtmf9(3000), 1).forEach((f) => d.push(f));
-    expect(d.hasFired).toBe(true);
-  });
-
-  it("does NOT fire on silence", () => {
-    const d = new MergeToneDetector();
-    frames(() => 0, 2).forEach((f) => d.push(f));
-    expect(d.hasFired).toBe(false);
-  });
-
-  it("does NOT fire on a single lone frequency (852 Hz only)", () => {
-    const d = new MergeToneDetector();
-    frames((i) => 12000 * Math.sin((2 * Math.PI * 852 * i) / 8000), 2).forEach((f) =>
-      d.push(f),
-    );
-    expect(d.hasFired).toBe(false);
-  });
-
-  it("does NOT fire on white noise / babble", () => {
-    const d = new MergeToneDetector();
-    frames(() => 8000 * (Math.random() - 0.5), 2).forEach((f) => d.push(f));
-    expect(d.hasFired).toBe(false);
-  });
-
-  it("does NOT fire on short 100ms blips (key-click robustness)", () => {
-    const d = new MergeToneDetector();
-    // 100ms tone, 300ms silence, repeat — never 300ms continuous
-    const blip = (i: number) => {
-      const phase = i % 3200; // 400ms cycle
-      return phase < 800 ? dtmf9()(i) : 0;
-    };
-    frames(blip, 4).forEach((f) => d.push(f));
-    expect(d.hasFired).toBe(false);
-  });
-
-  it("elevated energy floor (armed in-call path) rejects a quiet echo, accepts a loud return", () => {
-    // amp 1200/component → mean-square ≈ 1.44e6: ABOVE the legacy 1e6 floor
-    // but BELOW the elevated 2e6 armed floor — the exact quiet-acoustic-echo
-    // case the armed mid-call path must reject.
-    const armedPath = new MergeToneDetector({ energyFloor: 2e6 });
-    frames(dtmf9(1200), 1).forEach((f) => armedPath.push(f));
-    expect(armedPath.hasFired).toBe(false);
-    const legacyPath = new MergeToneDetector(); // default 1e6
-    frames(dtmf9(1200), 1).forEach((f) => legacyPath.push(f));
-    expect(legacyPath.hasFired).toBe(true);
-    // A genuine merged echo of the announced tone returns LOUD (amp 12000 →
-    // ~1.44e8) and clears the elevated floor easily.
-    const loud = new MergeToneDetector({ energyFloor: 2e6 });
-    frames(dtmf9(12000), 1).forEach((f) => loud.push(f));
-    expect(loud.hasFired).toBe(true);
-  });
-
-  it("dynamic energy floor getter: elevated while armed, legacy otherwise", () => {
-    let armed = true;
-    const d = new MergeToneDetector({ energyFloor: () => (armed ? 2e6 : 1e6) });
-    frames(dtmf9(1200), 1).forEach((f) => d.push(f));
-    expect(d.hasFired).toBe(false); // armed: quiet echo rejected
-    const d2 = new MergeToneDetector({ energyFloor: () => (armed ? 2e6 : 1e6) });
-    armed = false; // disarmed before d2 hears the tone
-    frames(dtmf9(1200), 1).forEach((f) => d2.push(f));
-    expect(d2.hasFired).toBe(true); // legacy floor applies again
   });
 });
 
