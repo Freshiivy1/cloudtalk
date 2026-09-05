@@ -143,6 +143,10 @@ function makeTracker(opts: VoiceIdTrackerOptions = {}): { t: VoiceIdTracker; eve
   const events: TrackerEvents = { relay: [], end: [] };
   const t = new VoiceIdTracker({
     now: () => now,
+    // Tests feed pre-trimmed audio with exact window-timing assertions, so
+    // the production beep/echo guard is disabled here by default — it has
+    // its own dedicated tests below.
+    guardMs: 0,
     onRelayConfirmed: (s) => events.relay.push(s),
     onAttemptEnd: (s) => events.end.push(s),
     ...opts,
@@ -556,6 +560,7 @@ describe("VoiceIdTracker relay confirmation (mocked DSP)", () => {
     const events: TrackerEvents = { relay: [], end: [] };
     const t = new VoiceIdTracker({
       now: () => now,
+      guardMs: 0, // pre-trimmed audio with exact window-timing assertions
       onRelayConfirmed: (s) => {
         events.relay.push(s);
         order.push("relay");
@@ -603,15 +608,60 @@ describe("VoiceIdTracker relay confirmation (mocked DSP)", () => {
     expect(snap.relayDecisionMs).toBe(1000);
   });
 
-  it("relayDecisionMs is null when relay confirms before any speech was detected", () => {
+  it("SPEECH GATE: suspicious windows before any user speech are NEVER judged — prompt/beep echo can never confirm (the 2026-09-05 live false-positive)", () => {
     startClock();
     const { t, events } = makeTracker();
-    dsp.score = 0.95;
+    dsp.score = 0.7; // below the single-emission bar: only the consecutive rule can confirm
     dsp.suspicious = true;
     feed(t, silenceFrame(), 50); // 1.0s of silence, but the (mocked) DSP says RED
+    // Fully suppressed: no confirm, no confidence, no consecutive counting —
+    // relay describes how the USER'S VOICE arrives; there is no voice yet.
+    expect(events.relay).toHaveLength(0);
+    expect(t.snapshot().relayConfirmed).toBe(false);
+    expect(t.snapshot().relayConfidence).toBe(0);
+    expect(t.snapshot().relayWindows).toBe(0);
+    // Once the user is actually speaking, the same RED signature is judged:
+    // the suppressed pre-speech window did NOT count, so the consecutive
+    // rule needs both post-speech windows (fed 1.5s and 2.0s) to confirm.
+    feed(t, speechFrame(), 50);
     expect(events.relay).toHaveLength(1);
-    expect(events.relay[0].relayDecisionMs).toBeNull();
-    expect(events.relay[0].speechStartedAtMs).toBeNull();
+    expect(events.relay[0].endReason).toBe("relay");
+    expect(events.relay[0].relayWindows).toBe(2);
+    expect(events.relay[0].relayDecisionMs).toBe(1000);
+  });
+
+  it("SPEECH GATE: less than minVoicedForRelayMs of speech keeps relay suppressed even while detector windows complete", () => {
+    startClock();
+    const { t, events } = makeTracker({ trailingSilenceEndMs: 4000 });
+    dsp.score = 0.7;
+    dsp.suspicious = true;
+    feed(t, speechFrame(), 10); // 200ms speech < 300ms gate
+    feed(t, silenceFrame(), 40); // first detector window completes at fed 1.0s
+    expect(events.relay).toHaveLength(0);
+    expect(t.snapshot().relayWindows).toBe(0);
+    expect(t.snapshot().relayConfirmed).toBe(false);
+    // Once enough real speech accumulates, judged windows confirm normally.
+    feed(t, speechFrame(), 50); // windows at fed 1.5s + 2.0s → 2 consecutive
+    expect(events.relay).toHaveLength(1);
+    expect(events.relay[0].endReason).toBe("relay");
+  });
+
+  it("GUARD: the initial guardMs window is never analysed (beep + acoustic echo-tail protection)", () => {
+    startClock();
+    const { t, events } = makeTracker({ guardMs: 500 }); // the production value
+    dsp.score = 0.95;
+    dsp.suspicious = true;
+    feed(t, speechFrame(), 25); // exactly the 500ms guard window
+    let snap = t.snapshot();
+    expect(snap.voicedDurationMs).toBe(0);
+    expect(snap.speechStartedAtMs).toBeNull();
+    expect(events.relay).toHaveLength(0);
+    // Post-guard audio is analysed normally: the detector's first 1s window
+    // completes after 50 more frames; 0.95 >= 0.9 → single-emission confirm.
+    feed(t, speechFrame(), 50);
+    snap = t.snapshot();
+    expect(snap.voicedDurationMs).toBe(1000);
+    expect(events.relay).toHaveLength(1);
     expect(events.relay[0].endReason).toBe("relay");
   });
 

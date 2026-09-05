@@ -3021,21 +3021,31 @@ describe("guarded single-call flow", () => {
     expect(body).not.toContain("<Record");
     expect(body).not.toContain("/api/verify/voiceprint");
     expect((await vs.findSession(s.sessionId))!.state).toBe(vs.VState.CALL_ACCEPTED);
-    // The voice-id TwiML itself: exact prompt + beep + a SPEECH gather whose
-    // action carries the per-attempt idempotency key (va).
+    // STEP 1 — the voice-id PROMPT TwiML: exact prompt, then a redirect to
+    // the listen step. CRITICALLY: no beep, no gather, and NO attempt is
+    // armed here — the analyzer must never hear the prompt or its echo.
     const vRes = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
     const vBody = await vRes.text();
     expect(vRes.status).toBe(200);
     expect(vBody).toContain(
       "After the beep, turn off speakerphone, hold the phone to your ear, and say: My voice identifies me.",
     );
-    expect(vBody).toContain("/api/verify/voice-id-beep.wav");
-    expect(vBody).toContain("<Gather");
-    expect(vBody).toContain('input="speech"');
-    expect(vBody).toContain('hints="my voice identifies me"');
-    expect(vBody).toContain('speechModel="phone_call"');
-    expect(vBody).toContain(`/api/verify/voice-id-result?sid=${s.sessionId}&amp;a=0&amp;va=`);
-    // The attempt is armed + persisted (PROMPTING, attempt key, counter).
+    expect(vBody).toContain(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&amp;a=0`);
+    expect(vBody).not.toContain("/api/verify/voice-id-beep.wav");
+    expect(vBody).not.toContain("<Gather");
+    expect((await vs.findSession(s.sessionId))!.voiceIdAttemptId).toBeNull();
+    // STEP 2 — the voice-id-listen TwiML (fetched by Twilio only AFTER the
+    // prompt finished): beep + a SPEECH gather whose action carries the
+    // per-attempt idempotency key (va), and the attempt is armed + persisted.
+    const lRes = await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=0`);
+    const lBody = await lRes.text();
+    expect(lRes.status).toBe(200);
+    expect(lBody).toContain("/api/verify/voice-id-beep.wav");
+    expect(lBody).toContain("<Gather");
+    expect(lBody).toContain('input="speech"');
+    expect(lBody).toContain('hints="my voice identifies me"');
+    expect(lBody).toContain('speechModel="phone_call"');
+    expect(lBody).toContain(`/api/verify/voice-id-result?sid=${s.sessionId}&amp;a=0&amp;va=`);
     const after = (await vs.findSession(s.sessionId))!;
     expect(after.voiceIdState).toBe(vs.VoiceIdState.PROMPTING);
     expect(after.voiceIdAttemptId).toBeTruthy();
@@ -3224,18 +3234,26 @@ function goodVoiceIdSnap(overrides: Record<string, unknown> = {}): Record<string
 }
 
 /**
- * Arm a voice-ID attempt via the voice-id TwiML (exactly as Twilio fetches
- * it), feed 50 inbound Leg A frames (~1s — PROMPTING→LISTENING + the
- * validated clip source), and install the fake tracker snapshot. Returns the
- * armed attempt key the gather action must carry.
+ * Arm a voice-ID attempt exactly as Twilio drives it — fetch the voice-id
+ * PROMPT step (assert it redirects to the listen step WITHOUT arming), then
+ * the voice-id-listen step (which arms) — feed 50 inbound Leg A frames (~1s
+ * — PROMPTING→LISTENING + the validated clip source), and install the fake
+ * tracker snapshot. Returns the armed attempt key the gather action carries.
  */
 async function armVoiceIdAttempt(
   s: VerificationSession,
   a = 0,
   snap: Record<string, unknown> | null = null,
 ): Promise<string> {
+  const preArm = (await vs.findSession(s.sessionId))!.voiceIdAttemptId;
+  const promptRes = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=${a}`);
+  expect(promptRes.status).toBe(200);
+  const promptBody = await promptRes.text();
+  expect(promptBody).toContain(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&amp;a=${a}`);
+  // The prompt step NEVER arms (or re-keys) an attempt.
+  expect((await vs.findSession(s.sessionId))!.voiceIdAttemptId).toBe(preArm);
   const before = voiceIdMock.instances.length;
-  const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=${a}`);
+  const res = await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=${a}`);
   expect(res.status).toBe(200);
   const inst = voiceIdMock.instances[before];
   expect(inst).toBeTruthy();
@@ -3399,7 +3417,7 @@ describe("real voice-ID gate (guarded)", () => {
       legACallSid: "CA_nf_legA",
     });
     // Arm WITHOUT feeding any frame: the tracker snapshot is null.
-    const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    const res = await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=0`);
     expect(res.status).toBe(200);
     const attemptId = (await vs.findSession(s.sessionId))!.voiceIdAttemptId!;
     const res2 = await postForm(
@@ -3465,7 +3483,7 @@ describe("real voice-ID gate (guarded)", () => {
         guarded: true,
         legACallSid: "CA_inc_legA",
       });
-      await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+      await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=0`);
       const attemptId = (await vs.findSession(s.sessionId))!.voiceIdAttemptId!;
       const res = await postForm(
         `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=${attemptId}`,
@@ -3490,7 +3508,7 @@ describe("real voice-ID gate (guarded)", () => {
       guarded: true,
       legACallSid: "CA_stale_legA",
     });
-    await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=0`);
     const armed = (await vs.findSession(s.sessionId))!;
     const res = await postForm(
       `/api/verify/voice-id-result?sid=${s.sessionId}&a=0&va=bogus-attempt-id`,
@@ -3516,7 +3534,7 @@ describe("real voice-ID gate (guarded)", () => {
       legACallSid: "CA_fa_legA",
     });
     const before = voiceIdMock.instances.length;
-    await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
+    await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=0`);
     const inst = voiceIdMock.instances[before];
     inst.snap = goodVoiceIdSnap({
       relayConfirmed: true,
@@ -3559,6 +3577,12 @@ describe("real voice-ID gate (guarded)", () => {
     const body = await res.text();
     expect(body).toContain("We could not verify your voice on this line");
     expect(body).toContain("<Hangup");
+    // …and the LISTEN step fails closed identically (a direct/crafted fetch
+    // can never re-open the stage).
+    const lRes = await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=3`);
+    const lBody = await lRes.text();
+    expect(lBody).toContain("We could not verify your voice on this line");
+    expect(lBody).toContain("<Hangup");
     expect((await vs.findSession(s.sessionId))!.voiceIdAttemptId).toBeNull();
     const types = (await events(s.sessionId)).map((e) => e.eventType);
     expect(types).not.toContain("VOICE_ID_ATTEMPT_STARTED");
@@ -3573,6 +3597,9 @@ describe("real voice-ID gate (guarded)", () => {
     const res = await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=0`);
     const body = await res.text();
     expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
+    // …and the listen step is idempotent the same way.
+    const lRes = await postForm(`/api/verify/twiml/voice-id-listen?sid=${s.sessionId}&a=0`);
+    expect(await lRes.text()).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
     // A late/duplicate gather callback after the pass: ignored, re-serves
     // the second press-1 step, never re-arms, never double-stamps.
     const res2 = await postForm(

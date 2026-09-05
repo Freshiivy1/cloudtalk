@@ -374,12 +374,14 @@ export async function verificationTwimlHandler(c: Context) {
       }
 
       case "voice-id": {
-        // REAL voice-ID gate (2026-09-05 C2) — "My voice identifies me".
-        // Serves the reason-appropriate prompt + beep + a speech <Gather>,
-        // and ARMS the streaming analyzer (VoiceIdTracker) on Leg A's inbound
-        // Media Stream for this attempt. The gather action carries the
-        // per-attempt idempotency key; the fallback redirect re-enters the
-        // SAME action with no transcript (no-input → no-speech evaluation).
+        // REAL voice-ID gate (2026-09-05 C2) — PROMPT STEP. Serves ONLY the
+        // reason-appropriate prompt, then redirects to voice-id-listen.
+        // NOTHING is armed here (2026-09-05 live-bugfix): Twilio fetches the
+        // redirect AFTER the <Say> has finished playing, so the streaming
+        // analyzer (armed in voice-id-listen) can never hear the prompt or
+        // its loudspeaker echo — judging that echo was the production false
+        // "speakerphone" verdict that cascaded through all attempts and
+        // ended the call.
         const a = attemptFrom(c);
         const session = sid ? await vs.findSession(sid) : null;
         if (!session || vs.isTerminal(session) || !session.guarded) {
@@ -398,12 +400,6 @@ export async function verificationTwimlHandler(c: Context) {
           vr.hangup();
           break;
         }
-        const begun = await vs.beginVoiceIdAttempt(sid, a);
-        if (!begun.ok || !begun.attemptId) {
-          if (begun.reason === "already verified") serveSecondCallGather(vr, sid);
-          else vr.hangup();
-          break;
-        }
         const prompt =
           session.voiceIdRetryKind === "relay"
             ? P.voiceIdRetryRelay
@@ -415,6 +411,42 @@ export async function verificationTwimlHandler(c: Context) {
                   ? P.voiceIdRetryAudio
                   : P.voiceId;
         vr.say(prompt);
+        vr.redirect({ method: "POST" }, `${vs.twimlUrl("voice-id-listen", sid)}&a=${a}`);
+        break;
+      }
+
+      case "voice-id-listen": {
+        // REAL voice-ID gate — LISTEN STEP. Twilio fetches this ONLY after
+        // the prompt <Say> completed, so arming the streaming analyzer
+        // (VoiceIdTracker on Leg A's inbound Media Stream) here means it
+        // hears exactly the answer window: the beep (covered by the
+        // tracker's guard) and the callee's speech — never the prompt.
+        // The gather action carries the per-attempt idempotency key; the
+        // fallback redirect re-enters the SAME action with no transcript
+        // (no-input → no-speech evaluation).
+        const a = attemptFrom(c);
+        const session = sid ? await vs.findSession(sid) : null;
+        if (!session || vs.isTerminal(session) || !session.guarded) {
+          vr.hangup();
+          break;
+        }
+        if (session.voiceIdState === vs.VoiceIdState.VERIFIED) {
+          serveSecondCallGather(vr, sid);
+          break;
+        }
+        if (a >= vs.maxVoiceIdAttempts()) {
+          // Fail closed — the prompt step already enforces this; a direct/
+          // crafted fetch must never re-open the stage either.
+          vr.say(P.voiceIdFailed);
+          vr.hangup();
+          break;
+        }
+        const begun = await vs.beginVoiceIdAttempt(sid, a);
+        if (!begun.ok || !begun.attemptId) {
+          if (begun.reason === "already verified") serveSecondCallGather(vr, sid);
+          else vr.hangup();
+          break;
+        }
         vr.play(`${vs.requirePublicBaseUrl()}/api/verify/voice-id-beep.wav`);
         vr.gather({
           input: ["speech"],

@@ -6,6 +6,15 @@
  * callee's uplink as 20 ms μ-law frames (base64, 8 kHz mono, exactly as
  * Twilio Media Streams delivers them) and simultaneously
  *
+ * ARMING CONTRACT (2026-09-05 live-bugfix): the integration arms the tracker
+ * ONLY from the voice-id-listen TwiML, which Twilio fetches AFTER the prompt
+ * <Say> has finished playing — so the tracker can never hear the prompt or
+ * its loudspeaker echo (judging that echo was the production false-positive
+ * that burned all 3 attempts and ended the call). The initial guardMs
+ * window additionally covers the beep + echo tail, and relay confirmation
+ * is speech-gated (minVoicedForRelayMs): relay describes how the USER'S
+ * VOICE arrives, so it is only judged while the user is actually speaking.
+ *
  *   1. VAD / STRUCTURE — a cheap per-frame energy VAD (adaptive noise floor,
  *      hangover) that measures voiced duration, splits speech into sections
  *      (word groups) at natural pauses, and detects end-of-speech from the
@@ -146,6 +155,19 @@ export interface VoiceIdTrackerOptions {
   relayHighConfidence?: number;
   /** Consecutive suspicious emissions that confirm relay (default 2). */
   relayConsecutiveEmissions?: number;
+  /** Initial stream window that is NOT analysed (default 500 — covers the
+   *  250 ms beep + its acoustic echo tail after the prompt; the integration
+   *  arms the tracker only AFTER the prompt has finished playing, so the
+   *  only loud outbound audio left to echo is the beep). Pass 0 in tests
+   *  that feed pre-trimmed audio. */
+  guardMs?: number;
+  /** Relay confirmation is SUPPRESSED until this much VAD-voiced user speech
+   *  has accumulated (default 300). Relay describes how the USER'S VOICE
+   *  arrives — it is only decidable while the user is actually speaking, so
+   *  prompt/beep echo, room tone and background can never confirm (the
+   *  2026-09-05 live false-positive: the prompt's own loudspeaker echo was
+   *  judged "speakerphone" while the callee had not said a word). */
+  minVoicedForRelayMs?: number;
   /** Fires ONCE, immediately at relay confirmation (before onAttemptEnd). */
   onRelayConfirmed?: (snap: VoiceIdSnapshot) => void;
   /** Fires ONCE when the attempt ends for any reason. */
@@ -162,6 +184,8 @@ export class VoiceIdTracker {
   private readonly maxAttemptMs: number;
   private readonly relayHighConfidence: number;
   private readonly relayConsecutiveEmissions: number;
+  private readonly guardMs: number;
+  private readonly minVoicedForRelayMs: number;
   private readonly onRelayConfirmedCb?: (snap: VoiceIdSnapshot) => void;
   private readonly onAttemptEndCb?: (snap: VoiceIdSnapshot) => void;
   private readonly nowFn: () => number;
@@ -211,6 +235,8 @@ export class VoiceIdTracker {
     this.maxAttemptMs = opts.maxAttemptMs ?? 15000;
     this.relayHighConfidence = opts.relayHighConfidence ?? 0.9;
     this.relayConsecutiveEmissions = opts.relayConsecutiveEmissions ?? 2;
+    this.guardMs = Math.max(0, opts.guardMs ?? 500);
+    this.minVoicedForRelayMs = Math.max(0, opts.minVoicedForRelayMs ?? 300);
     this.onRelayConfirmedCb = opts.onRelayConfirmed;
     this.onAttemptEndCb = opts.onAttemptEnd;
     this.nowFn = opts.now ?? (() => Date.now());
@@ -251,15 +277,26 @@ export class VoiceIdTracker {
       this.attemptStartedAtMs = this.nowFn();
     }
     // Cheap per-frame VAD over the whole payload (normally exactly 1 frame).
+    // Frames inside the initial guard window (beep + acoustic echo tail) are
+    // NOT analysed — the attempt timeline still advances so all offsets stay
+    // stream-accurate.
+    const payloadStartMs = this.elapsedMs;
     for (let off = 0; off < bytes.length && !this.ended; off += FRAME_SAMPLES) {
       const n = Math.min(FRAME_SAMPLES, bytes.length - off);
+      const frameDurationMs = (n / SAMPLE_RATE) * 1000;
+      if (this.elapsedMs < this.guardMs) {
+        this.elapsedMs += frameDurationMs;
+        continue;
+      }
       const pcm = new Array<number>(n);
       for (let i = 0; i < n; i++) pcm[i] = decodeMulaw(bytes[off + i]);
-      this.processFrame(pcm, (n / SAMPLE_RATE) * 1000);
+      this.processFrame(pcm, frameDurationMs);
       this.checkEndConditions();
     }
-    // Heavy DSP runs inside the detector on its own 0.5 s hop schedule.
-    if (!this.ended) this.detector.push(payloadB64);
+    // Heavy DSP runs inside the detector on its own 0.5 s hop schedule —
+    // only post-guard audio is ever judged (a payload straddling the guard
+    // boundary is dropped whole; 20 ms granularity is immaterial).
+    if (!this.ended && payloadStartMs >= this.guardMs) this.detector.push(payloadB64);
   }
 
   /** Current (or final) attempt state. */
@@ -374,6 +411,12 @@ export class VoiceIdTracker {
   /** One arming-suspicious window from the detector (score >= 0.6 RED). */
   private handleSuspicious(score: number, detail: string): void {
     if (this.ended) return;
+    // SPEECH GATE: relay describes how the USER'S VOICE arrives — a window
+    // is only judgeable once the user is actually speaking. Suspicious
+    // windows before that (prompt/beep echo, room tone, background) are
+    // ignored entirely: they never confirm, never accumulate confidence,
+    // never count toward the consecutive-emission rule.
+    if (this.voicedFrames * FRAME_MS < this.minVoicedForRelayMs) return;
     this.relayConfidence = Math.max(this.relayConfidence, score);
     this.consecutiveSuspicious++;
     this.relayWindows = Math.max(this.relayWindows, this.consecutiveSuspicious);

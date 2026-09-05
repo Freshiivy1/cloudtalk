@@ -568,12 +568,15 @@ export function pushVoiceIdFrame(sessionId: string, payloadB64: string): void {
 }
 
 /**
- * Arm a voice-ID attempt (called by the voice-id TwiML BEFORE the prompt +
- * beep + speech gather are served). Persists VOICE_ID_PROMPTING + the attempt
- * idempotency key, and starts the streaming tracker on the Leg A inbound
- * audio. The system prompt/beep are OUTBOUND audio — they never appear on the
- * callee's inbound track, so the tracker cannot be contaminated by them; the
- * gather itself only begins listening after the prompt and beep complete.
+ * Arm a voice-ID attempt — called ONLY by the voice-id-listen TwiML, which
+ * Twilio fetches AFTER the prompt <Say> has finished playing (2026-09-05
+ * live-bugfix: arming before the prompt let the tracker judge the prompt's
+ * own loudspeaker echo as "speakerphone/relay" while the callee had not said
+ * a word — cascaded false relay verdicts burned every attempt and ended the
+ * call). Persists VOICE_ID_PROMPTING + the attempt idempotency key, and
+ * starts the streaming tracker on the Leg A inbound audio; the tracker's
+ * initial guard window covers the beep + echo tail, and relay confirmation
+ * is speech-gated (only the user's actual speech is ever judged).
  * A retry INVALIDATES the earlier attempt (new attemptId — stale callbacks
  * naming the old one are rejected).
  */
