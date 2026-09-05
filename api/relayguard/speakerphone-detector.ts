@@ -46,6 +46,20 @@
  * can return to normal on the next poll.
  * Re-arming then again requires `consecutiveWindows` consecutive suspicious
  * windows.
+ * CALLEE-ONLY ENFORCEMENT GATE (suppressArming option, wired by
+ * verification-stream.ts from the Leg A caller-activity tracker): the detector
+ * physically hears ONLY the callee's microphone (Leg B inbound). The caller's
+ * voice can appear there in two acoustically-indistinguishable ways — genuine
+ * speakerphone echo (actionable against the callee) and same-room/earpiece
+ * bleed (never the callee's fault — the live "it's detecting speakerphone for
+ * the caller" false positive). BOTH require the caller to be speaking, and
+ * the caller's own Leg A uplink tells us exactly when that is. A suspicious
+ * window captured while the caller was speaking within the gate window is
+ * therefore NEUTRAL: no arming-streak advance, no refire, no arming-streak
+ * reset (a CLEAN streak is still reset — the audio IS relay-like, so an
+ * episode must not clear across it). Episodes can then arm ONLY from audio
+ * captured while the caller is silent — produced on the callee's side.
+ *
  * Detection is advisory — the caller (verification-stream.ts) decides what
  * to do; nothing here ever touches the call legs.
  */
@@ -155,6 +169,16 @@ export interface SpeakerphoneDetectorOptions {
   onClean?: (detail: string) => void;
   /** Called once when the post-BRIDGED calibration warm-up completes. */
   onWarmupComplete?: (detail: string) => void;
+  /**
+   * Callee-only enforcement gate (see the file header): consulted on every
+   * window that would otherwise advance an arming streak or refire an
+   * episode. Returning true marks the window NEUTRAL (the caller was
+   * speaking on Leg A, so the suspicious audio may be the caller's own
+   * voice via echo/bleed). Callback errors fail OPEN (no suppression) with
+   * a throttled warning — a broken gate must never silently disable or
+   * silently enable detection.
+   */
+  suppressArming?: () => boolean;
 }
 
 /** Min wall-clock ms between throttled per-window forensic score logs. */
@@ -262,6 +286,8 @@ export class SpeakerphoneDetector {
   private readonly onSuspicious?: (score: number, detail: string) => void;
   private readonly onClean?: (detail: string) => void;
   private readonly onWarmupComplete?: (detail: string) => void;
+  private readonly suppressArming?: () => boolean;
+  private lastGateLogAt = 0;
   private readonly cleanNeed: number;
   private buf: number[] = [];
   private baseline: ClipProfile | null = null;
@@ -297,6 +323,7 @@ export class SpeakerphoneDetector {
     this.onSuspicious = opts.onSuspicious;
     this.onClean = opts.onClean;
     this.onWarmupComplete = opts.onWarmupComplete;
+    this.suppressArming = opts.suppressArming;
     this.armOnlyWhenBridged = opts.armOnlyWhenBridged ?? false;
     this.cleanNeed = Math.max(1, opts.cleanWindowsToClear ?? 2);
     this.bridged = opts.bridged ?? false;
@@ -373,6 +400,45 @@ export class SpeakerphoneDetector {
   /** Test hook: number of times the rolling baseline was seeded/absorbed. */
   get baselineAbsorptions(): number {
     return this.baselineAbsorbs;
+  }
+
+  /** Test hook: the callee-only caller-activity gate is wired. */
+  get callerGateArmed(): boolean {
+    return !!this.suppressArming;
+  }
+
+  /**
+   * CALLEE-ONLY GATE: true when the caller was speaking on Leg A within the
+   * gate window, so this window's suspicious audio may be the CALLER's voice
+   * (speakerphone echo — indistinguishable from same-room/earpiece bleed on
+   * the callee uplink alone — or pure bleed). Gated windows are NEUTRAL for
+   * arming/refire (see the call sites). Callback errors fail OPEN with a
+   * throttled warning; suppressions are forensic-logged (BRIDGED, throttled).
+   */
+  private armingSuppressed(path: string, fpState: string, fpScore: number): boolean {
+    if (!this.suppressArming) return false;
+    let suppressed: boolean;
+    try {
+      suppressed = this.suppressArming();
+    } catch (err) {
+      if (Date.now() - this.lastGateLogAt >= FORENSIC_LOG_THROTTLE_MS) {
+        this.lastGateLogAt = Date.now();
+        console.warn(
+          `[speakerphone-detector] CALLER_GATE_ERROR path=${path} — gate callback threw (fail-open, no suppression):`,
+          (err as Error).message,
+        );
+      }
+      return false;
+    }
+    if (suppressed && this.bridged && Date.now() - this.lastGateLogAt >= FORENSIC_LOG_THROTTLE_MS) {
+      this.lastGateLogAt = Date.now();
+      console.log(
+        `[speakerphone-detector] CALLER_GATE_NEUTRAL window=${this.windows} path=${path} ` +
+          `relayState=${fpState} relayScore=${fpScore.toFixed(2)} — caller active on Leg A within the gate ` +
+          `window; suspicious audio may be the caller's own voice (echo/bleed) — no arming, no refire`,
+      );
+    }
+    return suppressed;
   }
 
   /**
@@ -492,7 +558,12 @@ export class SpeakerphoneDetector {
           }
         } else {
           this.cleanStreak = 0;
-          if (fp.state === "RED" && Date.now() - this.lastFiredAt >= this.refire) {
+          if (
+            fp.state === "RED" &&
+            Date.now() - this.lastFiredAt >= this.refire &&
+            // Callee-only gate: no refire on audio that may be the caller's.
+            !this.armingSuppressed("no-baseline-refire", fp.state, fp.score)
+          ) {
             this.lastFiredAt = Date.now();
             this.onSuspicious?.(
               fp.score,
@@ -521,19 +592,25 @@ export class SpeakerphoneDetector {
         return;
       }
       if (fp.state === "RED") {
-        this.noBaselineRedStreak++;
-        if (
-          this.noBaselineRedStreak >= this.need &&
-          Date.now() - this.lastFiredAt >= this.refire
-        ) {
-          this.lastFiredAt = Date.now();
-          this.suspecting = true;
-          this.onSuspicious?.(
-            fp.score,
-            `NO_BASELINE absolute arming — relayScore=${fp.score.toFixed(2)} RED for ` +
-              `${this.noBaselineRedStreak} hops (baseline never seeded: relay present ` +
-              `from bridge) top=${topFingerprintFeatures(fp)}`,
-          );
+        // Callee-only gate: a RED window captured while the caller speaks is
+        // NEUTRAL — it neither advances nor resets the absolute-arming streak
+        // (mirrors the AMBER-dip rule: sustained relay rides out caller-speech
+        // overlaps and arms on the next caller-silent RED hops).
+        if (!this.armingSuppressed("no-baseline", fp.state, fp.score)) {
+          this.noBaselineRedStreak++;
+          if (
+            this.noBaselineRedStreak >= this.need &&
+            Date.now() - this.lastFiredAt >= this.refire
+          ) {
+            this.lastFiredAt = Date.now();
+            this.suspecting = true;
+            this.onSuspicious?.(
+              fp.score,
+              `NO_BASELINE absolute arming — relayScore=${fp.score.toFixed(2)} RED for ` +
+                `${this.noBaselineRedStreak} hops (baseline never seeded: relay present ` +
+                `from bridge) top=${topFingerprintFeatures(fp)}`,
+            );
+          }
         }
       } else if (fp.state === "GREEN") {
         this.noBaselineRedStreak = 0;
@@ -603,6 +680,15 @@ export class SpeakerphoneDetector {
     const suspicious = verdict === "SUSPICIOUS RELAY" && fp.state === "RED";
 
     if (suspicious) {
+      // Callee-only gate: the window still resets the clean streak (it IS
+      // relay-like — an episode must never clear across it) but is otherwise
+      // NEUTRAL: no arming-streak advance, no refire, no streak reset. The
+      // caller's own voice (echo/bleed) can therefore never start or sustain
+      // an episode — only audio captured while the caller is silent can.
+      if (this.armingSuppressed("baseline", fp.state, fp.score)) {
+        this.cleanStreak = 0;
+        return;
+      }
       this.streak++;
       this.cleanStreak = 0;
       const detail =

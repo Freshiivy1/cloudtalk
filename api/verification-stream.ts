@@ -37,6 +37,7 @@ import * as vs from "./verification";
 import { getTwilioClient } from "./twilio-voice";
 import { SpeakerphoneDetector } from "./relayguard/speakerphone-detector";
 import { HoldDetector } from "./relayguard/hold-detector";
+import { SpeechActivityVad } from "./relayguard/caller-activity";
 
 /* -------------------------------------------------------------------------- */
 /* Cross-service contract (cloudtalk ↔ merge relay)                             */
@@ -323,6 +324,14 @@ export function decodeMulaw(u: number): number {
   return (u & 0x80) ? 0x84 - t : t - 0x84;
 }
 
+/** Decode a base64 μ-law media payload to 16-bit PCM samples. */
+function decodeMulawPayload(payloadB64: string): number[] {
+  const bytes = Buffer.from(payloadB64, "base64");
+  const pcm = new Array<number>(bytes.length);
+  for (let i = 0; i < bytes.length; i++) pcm[i] = decodeMulaw(bytes[i]);
+  return pcm;
+}
+
 /** Goertzel power of `freq` over the given PCM window. */
 export function goertzelPower(samples: ArrayLike<number>, freq: number): number {
   const w = (2 * Math.PI * freq) / SAMPLE_RATE;
@@ -486,6 +495,56 @@ export function __testSetSpeakerphoneSuspicion(sid: string, active: boolean): vo
 }
 
 /**
+ * CALLER VOICE-ACTIVITY REGISTRY (callee-only speakerphone enforcement).
+ * Every Leg A (hold-canary) inbound frame feeds a per-session
+ * SpeechActivityVad; the Leg B SpeakerphoneDetector's arming gate consults
+ * it via callerSpeakingRecently(). The detector on Leg B physically hears
+ * ONLY the callee's microphone, where the caller's voice can only appear as
+ * speakerphone echo (actionable) or same-room/earpiece bleed (not the
+ * callee's fault) — acoustically indistinguishable, but BOTH require the
+ * caller to be speaking. Gating arming on "caller silent within the gate
+ * window" restricts episodes to audio produced on the callee's side.
+ * Entries are created lazily on the first Leg A frame and removed when the
+ * Leg A stream closes.
+ */
+const callerActivity = new Map<string, SpeechActivityVad>();
+
+/**
+ * True when the caller produced speech on the Leg A uplink within
+ * `windowMs` before `at` (default: now). False when no Leg A activity was
+ * ever seen (the gate then does not suppress — fail-open, pre-gate
+ * behavior, and the Leg A stream is always attached in the normal flow).
+ */
+export function callerSpeakingRecently(sid: string, windowMs: number, at?: number): boolean {
+  return callerActivity.get(sid)?.active(windowMs, at) ?? false;
+}
+
+/** Feed one Leg A inbound frame (base64 μ-law) into the caller-activity VAD. */
+function noteCallerFrame(sid: string, payloadB64: string): void {
+  let vad = callerActivity.get(sid);
+  if (!vad) {
+    vad = new SpeechActivityVad();
+    callerActivity.set(sid, vad);
+  }
+  vad.noteFrame(decodeMulawPayload(payloadB64));
+}
+
+/** Test hook: mark the caller as speaking right now for a session. */
+export function __testNoteCallerSpeech(sid: string): void {
+  let vad = callerActivity.get(sid);
+  if (!vad) {
+    vad = new SpeechActivityVad();
+    callerActivity.set(sid, vad);
+  }
+  vad.noteFrame(new Array<number>(160).fill(12000)); // ≈ −8.7 dBFS — unambiguous speech
+}
+
+/** Test hook: drop all caller-activity state for a session. */
+export function __testClearCallerActivity(sid: string): void {
+  callerActivity.delete(sid);
+}
+
+/**
  * HoldDetector engage wiring (exported for tests). The engagement is
  * ordinary Call Waiting choreography (the callee put Leg A on hold to answer
  * Leg B) — recorded as call state and telemetry ONLY. The legacy merge-tone
@@ -565,6 +624,19 @@ async function buildAnalyzers(
         // be outrun by false-RED windows.
         armOnlyWhenBridged: true,
         bridged,
+        // CALLEE-ONLY ENFORCEMENT (user directive 2026-09-05: "only wanting
+        // it for callee"): a suspicious window captured while the CALLER was
+        // speaking on Leg A within the gate window may be the caller's own
+        // voice (speakerphone echo — indistinguishable from same-room/
+        // earpiece bleed on the callee uplink alone) and is NEUTRAL — it can
+        // never advance or refire an episode. Episodes arm ONLY from audio
+        // captured while the caller is silent, i.e. produced on the callee's
+        // side. VERIFY_SPEAKERPHONE_CALLER_GATE_MS=0 disables (pre-gate
+        // behavior).
+        suppressArming:
+          vs.speakerphoneCallerGateMs() > 0
+            ? () => callerSpeakingRecently(sid, vs.speakerphoneCallerGateMs())
+            : undefined,
         onSuspicious: (score, detail) => {
           // Episode onset = the FIRST emission while no episode is tracked.
           // Must be computed BEFORE adding to the set; the strike ladder
@@ -728,7 +800,12 @@ export function attachVerificationStreamServer(server: HttpServer): void {
       // analyzer (VAD / phrase structure / direct-vs-relay). Explicit mode:
       // this runs ONLY during the voice-ID stage — never live-call strike
       // logic on this stream, never enrollment analysis after bridge.
-      if (st.purpose === "hold-canary") vs.pushVoiceIdFrame(st.sid, payload);
+      if (st.purpose === "hold-canary") {
+        // Callee-only speakerphone enforcement: track CALLER speech activity
+        // on the Leg A uplink — the Leg B detector's arming gate consults it.
+        noteCallerFrame(st.sid, payload);
+        vs.pushVoiceIdFrame(st.sid, payload);
+      }
       if (st.sp || st.hold) {
         // D2: event-driven bridge sync — bridgeGuardedLive() flips an
         // in-process registry flag SYNCHRONOUSLY with the bridge, so the
@@ -770,6 +847,8 @@ export function attachVerificationStreamServer(server: HttpServer): void {
         // not leave a stale "suspecting" marker blocking episode-onset
         // bookkeeping on a replacement stream.
         if (state.purpose === "speakerphone") speakerphoneSuspicion.delete(state.sid);
+        // Caller-activity state dies with the Leg A stream that feeds it.
+        if (state.purpose === "hold-canary") callerActivity.delete(state.sid);
         console.log(
           `[verify-stream] closed sid=${state.sid} purpose=${state.purpose} frames=${state.frames}`,
         );

@@ -1799,6 +1799,9 @@ import {
   activeStreams,
   attachVerificationStreamServer,
   authenticateStreamStart,
+  callerSpeakingRecently,
+  __testClearCallerActivity,
+  __testNoteCallerSpeech,
   fireMergeDetected,
   handleSecondCallDisengaged,
   handleSecondCallEngaged,
@@ -4857,6 +4860,88 @@ describe("in-process stream WebSocket (auth + detector routing)", () => {
     } finally {
       spPush.mockRestore();
       holdPush.mockRestore();
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+  });
+
+  it("CALLEE-ONLY GATE: the speakerphone detector is wired with the caller-activity arming gate (env 0 disables)", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const s = await makeSession(vs.VState.LEG_B_ANSWERED, { guarded: true });
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: s.sessionId,
+        leg: "legB",
+        purpose: "speakerphone",
+        token: streamToken(s.sessionId),
+      });
+      const st = await waitAttached(s.sessionId);
+      expect(st.sp).toBeInstanceOf(SpeakerphoneDetector);
+      expect(st.sp!.callerGateArmed).toBe(true);
+      ws.close();
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+    }
+    // Kill-switch: VERIFY_SPEAKERPHONE_CALLER_GATE_MS=0 → pre-gate behavior.
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    process.env.VERIFY_SPEAKERPHONE_CALLER_GATE_MS = "0";
+    const s2 = await makeSession(vs.VState.LEG_B_ANSWERED, { guarded: true });
+    try {
+      const ws = await connect();
+      sendStart(ws, {
+        sid: s2.sessionId,
+        leg: "legB",
+        purpose: "speakerphone",
+        token: streamToken(s2.sessionId),
+      });
+      const st = await waitAttached(s2.sessionId);
+      expect(st.sp).toBeInstanceOf(SpeakerphoneDetector);
+      expect(st.sp!.callerGateArmed).toBe(false);
+      ws.close();
+    } finally {
+      delete process.env.VERIFY_STREAM_SECRET;
+      delete process.env.VERIFY_SPEAKERPHONE_CALLER_GATE_MS;
+    }
+  });
+
+  it("CALLER ACTIVITY: hold-canary speech frames feed callerSpeakingRecently for the gate", async () => {
+    await boot();
+    process.env.VERIFY_STREAM_SECRET = "test-secret";
+    const s = await makeSession(vs.VState.BRIDGED, { guarded: true });
+    // μ-law 0x00 decodes to ≈ full-scale negative PCM — unambiguous speech.
+    const LOUD_FRAME = Buffer.alloc(160, 0x00).toString("base64");
+    try {
+      __testClearCallerActivity(s.sessionId);
+      expect(callerSpeakingRecently(s.sessionId, 1_200)).toBe(false);
+      const ws = await connect();
+      sendStart(ws, {
+        sid: s.sessionId,
+        leg: "legA",
+        purpose: "hold-canary",
+        token: streamToken(s.sessionId),
+      });
+      await waitAttached(s.sessionId);
+      for (let i = 0; i < 30; i++) {
+        ws.send(
+          JSON.stringify({
+            event: "media",
+            sequenceNumber: String(i + 2),
+            media: { track: "inbound", payload: LOUD_FRAME },
+          }),
+        );
+      }
+      await vi.waitFor(() =>
+        expect(callerSpeakingRecently(s.sessionId, 1_200)).toBe(true),
+      );
+      ws.close();
+      // Test hook covers the same registry entry.
+      __testClearCallerActivity(s.sessionId);
+      expect(callerSpeakingRecently(s.sessionId, 1_200)).toBe(false);
+      __testNoteCallerSpeech(s.sessionId);
+      expect(callerSpeakingRecently(s.sessionId, 1_200)).toBe(true);
+      __testClearCallerActivity(s.sessionId);
+    } finally {
       delete process.env.VERIFY_STREAM_SECRET;
     }
   });

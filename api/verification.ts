@@ -401,6 +401,30 @@ export function forensicsHopSec(): number {
 }
 
 /**
+ * CALLEE-ONLY ENFORCEMENT — caller-activity gate window (ms). The live-call
+ * SpeakerphoneDetector hears ONLY the callee's microphone (Leg B inbound);
+ * the caller's voice can reach it as genuine speakerphone echo (actionable)
+ * or as same-room/earpiece bleed (never the callee's fault — the live "it's
+ * detecting speakerphone for the caller" false positive), and the two are
+ * acoustically indistinguishable on that uplink alone. Both require the
+ * CALLER to be speaking, which the server observes directly on the Leg A
+ * (hold-canary) uplink. A suspicious Leg B window captured within this many
+ * ms of caller speech activity is therefore NEUTRAL — it can never advance
+ * or refire an episode, so episodes can arm ONLY from audio captured while
+ * the caller is silent (produced on the callee's side). The window covers
+ * the detector's trailing 1 s analysis span plus cross-call echo latency.
+ * Default 1200. Env-overridable via VERIFY_SPEAKERPHONE_CALLER_GATE_MS;
+ * 0 disables the gate (pre-gate behavior).
+ */
+export function speakerphoneCallerGateMs(): number {
+  const raw = process.env.VERIFY_SPEAKERPHONE_CALLER_GATE_MS;
+  if (!raw) return 1_200;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < 0) return 1_200;
+  return Math.floor(v);
+}
+
+/**
  * Forensic calibration warm-up (ms) after a session enters BRIDGED: the
  * SpeakerphoneDetector scores windows internally (rebuilding its rolling
  * baseline from LIVE in-call audio — the pre-bridge baseline was ringback/IVR
