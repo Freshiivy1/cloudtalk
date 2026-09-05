@@ -727,7 +727,7 @@ export async function finalizeVoiceIdAttempt(
       session,
       unclear
         ? "Voice ID inconclusive: a trustworthy result could not be produced"
-        : "Voice ID failed: the required phrase could not be verified on the direct handset path",
+        : "Voice ID failed: a clean direct-handset voice sample could not be captured (speakerphone/relay or no usable speech)",
     );
     return { status: unclear ? "inconclusive" : "failed", verdict: decision.verdict };
   }
@@ -845,7 +845,7 @@ async function persistVoiceIdClipAndProfile(
     await logEvent(
       sessionId,
       "VOICEPRINT_CAPTURED",
-      `attemptId=${attemptId} duration=${durationSec}s speechSec=${speechSec.toFixed(2)} voicedFrames=${profile.voicePrint.voicedFrames} — VALIDATED voice-ID enrollment (phrase + direct-path + quality gates passed)`,
+      `attemptId=${attemptId} duration=${durationSec}s speechSec=${speechSec.toFixed(2)} voicedFrames=${profile.voicePrint.voicedFrames} — VALIDATED voice-ID enrollment (direct-handset path + speech-presence + quality gates passed)`,
     );
   } catch (err) {
     console.error(`[verify] voice-id voiceprint failed session=${sessionId}:`, err);

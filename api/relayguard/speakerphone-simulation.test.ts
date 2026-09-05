@@ -75,11 +75,11 @@ function biquad(type: "lowpass" | "highpass" | "peaking", f0: number, q: number,
   const cosw = Math.cos(w0);
   const sinw = Math.sin(w0);
   const alpha = sinw / (2 * q);
-  let b0: number, b1: number, b2: number, a0: number, a1: number, a2: number;
+  let b0: number, b1: number, b2: number;
+  const a0 = 1 + alpha, a1 = -2 * cosw, a2 = 1 - alpha;
   if (type === "lowpass") { b0 = (1 - cosw) / 2; b1 = 1 - cosw; b2 = (1 - cosw) / 2; }
   else if (type === "highpass") { b0 = (1 + cosw) / 2; b1 = -(1 + cosw); b2 = (1 + cosw) / 2; }
   else { b0 = 1 + alpha * A; b1 = -2 * cosw; b2 = 1 - alpha * A; }
-  a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
   return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 };
 }
 function runBiquad(x: Float32Array, f: ReturnType<typeof biquad>): Float32Array {
@@ -291,7 +291,7 @@ describe("speakerphone-relay simulation (real DSP, known audio)", () => {
     const normalTailS = 10;
     const tail = calleeDirect.subarray(0, normalTailS * SR);
 
-    const { d, emissions, clears } = simulate([
+    const { emissions, clears } = simulate([
       { label: "normal", pcm: lead },
       { label: "relay", pcm: callerRelay.subarray(0, relayLenS * SR) },
       { label: "normal-again", pcm: tail },

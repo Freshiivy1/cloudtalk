@@ -595,18 +595,22 @@ export interface VoiceIdDecision {
 
 /**
  * Final per-attempt verdict. Order matters — first match wins:
- *   1. relay confirmed            → retry-relay (beats everything);
+ *   1. relay confirmed            → retry-relay (beats everything — a
+ *                                   speakerphone/relay sample can NEVER be
+ *                                   enrolled as the voiceprint);
  *   2. tracker unavailable        → inconclusive (NEVER pass);
  *   3. no/too little speech       → retry-nospeech;
  *   4. audio unusable             → retry-audio;
- *   5. runaway speech             → retry-phrase (background conversation
- *                                   can never pass);
- *   6. full ordered phrase + enough voiced audio → pass;
- *   7. usable speech, wrong/partial phrase → retry-phrase;
- *   8. anything else              → inconclusive.
- * The transcript anchors are the phrase-completeness evidence; VAD/sections
- * are supporting sanity only (sectionCount is NOT required to equal 4 —
- * fast speakers merge words).
+ *   5. runaway speech (> maxVoicedMs) → retry-audio (background conversation
+ *                                   contaminates the voiceprint);
+ *   6. usable direct-handset speech (≥ minVoicedMs voiced) → PASS;
+ *   7. speech present but too short to trust → inconclusive.
+ * PHRASE IS NOT A GATE (2026-09-05, user directive): the spoken phrase only
+ * elicits a clean sample — the transcript anchors are recorded as EVIDENCE
+ * (scores.phraseCoverage, reasons) but never decide the verdict. What is
+ * enforced: the audio arrived on the direct handset path (not speakerphone/
+ * relay), speech is actually present, and the quality is good enough to
+ * build a trustworthy voiceprint.
  */
 export function decideVoiceId(input: VoiceIdDecisionInput): VoiceIdDecision {
   const minVoicedMs = input.minVoicedMs ?? 400;
@@ -668,45 +672,40 @@ export function decideVoiceId(input: VoiceIdDecisionInput): VoiceIdDecision {
     return { verdict: "retry-audio", reasons, scores };
   }
 
-  // 5. Runaway speech / background conversation can never be the phrase.
+  // 5. Runaway speech / background conversation can never be a CLEAN
+  //    enrollment sample (the voiceprint would be contaminated).
   if (t.voicedDurationMs > maxVoicedMs) {
     reasons.push(
       `voicedDurationMs=${t.voicedDurationMs} > maxVoicedMs=${maxVoicedMs} — ` +
-        `background conversation, not a 4-word phrase`,
+        `background conversation, not a short enrollment utterance`,
     );
-    return { verdict: "retry-phrase", reasons, scores };
+    return { verdict: "retry-audio", reasons, scores };
   }
 
-  // 6. Phrase completeness from the transcript anchors; VAD is sanity support.
+  // 6. Transcript anchors are EVIDENCE ONLY (phrase is not a gate) — logged
+  //    for review, never decides the verdict.
   reasons.push(
-    `phrase coverage=${match.coverage.toFixed(2)} anchors=[${match.matchedAnchors.join(",")}]` +
+    `phrase evidence: coverage=${match.coverage.toFixed(2)} anchors=[${match.matchedAnchors.join(",")}]` +
       `${sttNote} transcript=${transcript ? JSON.stringify(transcript) : "<empty>"}`,
   );
   if (t.sectionCount === 0) {
     reasons.push(`structure sanity failed: sectionCount=0 with voicedDurationMs=${t.voicedDurationMs}`);
     return { verdict: "retry-audio", reasons, scores };
   }
-  if (match.orderedOk && t.voicedDurationMs >= minVoicedMs) {
+  if (t.voicedDurationMs >= minVoicedMs) {
+    // 7. PASS: usable speech on the direct handset path with trustworthy
+    //    quality — exactly what a voiceprint enrollment needs.
     reasons.push(
-      `pass: all 4 anchors in order, voicedDurationMs=${t.voicedDurationMs} >= minVoicedMs=${minVoicedMs}, ` +
-        `sections=${t.sectionCount}, snrDb=${q.snrDb.toFixed(1)}`,
+      `pass: usable direct-handset speech, voicedDurationMs=${t.voicedDurationMs} >= minVoicedMs=${minVoicedMs}, ` +
+        `sections=${t.sectionCount}, snrDb=${q.snrDb.toFixed(1)}, relay=not confirmed`,
     );
     return { verdict: "pass", reasons, scores };
   }
-  if (match.orderedOk) {
-    // Anchors all present but too little voiced audio to be a real utterance
-    // (300–minVoicedMs band) — nothing in the matrix fits: inconclusive.
-    reasons.push(
-      `anchors complete but voicedDurationMs=${t.voicedDurationMs} < minVoicedMs=${minVoicedMs} — ` +
-        `too short to trust`,
-    );
-    return { verdict: "inconclusive", reasons, scores };
-  }
 
-  // 7. Usable speech, but the phrase was not the required one.
+  // 8. Speech is present (>= 300ms) but shorter than the enrollment floor —
+  //    too little to trust; nothing in the matrix fits: inconclusive.
   reasons.push(
-    `phrase incomplete/out-of-order (anchorsMatched=${match.anchorsMatched}/4) with usable speech ` +
-      `(voicedDurationMs=${t.voicedDurationMs}, sections=${t.sectionCount})`,
+    `speech present but voicedDurationMs=${t.voicedDurationMs} < minVoicedMs=${minVoicedMs} — too short to trust`,
   );
-  return { verdict: "retry-phrase", reasons, scores };
+  return { verdict: "inconclusive", reasons, scores };
 }

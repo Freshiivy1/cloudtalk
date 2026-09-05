@@ -285,7 +285,7 @@ describe("decideVoiceId", () => {
     });
     expect(d.verdict).toBe("pass");
     expect(d.scores.phraseCoverage).toBe(1);
-    expect(d.reasons.join(" ")).toContain("all 4 anchors");
+    expect(d.reasons.join(" ")).toContain("phrase evidence: coverage=1.00");
   });
 
   it("relay confirmed beats EVERYTHING — even a perfect phrase on perfect audio", () => {
@@ -347,23 +347,25 @@ describe("decideVoiceId", () => {
     expect(d.reasons.join(" ")).toContain("meanLevelDb=-52.0");
   });
 
-  it("partial phrase → retry-phrase", () => {
+  it("partial transcript still PASSES — the phrase is evidence, not a gate (user directive 2026-09-05)", () => {
     const d = decideVoiceId({
       transcript: "my voice",
       transcriptConfidence: 0.9,
       tracker: mkSnap(),
     });
-    expect(d.verdict).toBe("retry-phrase");
+    expect(d.verdict).toBe("pass");
+    // …but the partial coverage is still recorded as evidence.
     expect(d.scores.phraseCoverage).toBe(0.5);
+    expect(d.reasons.join(" ")).toContain("phrase evidence: coverage=0.50");
   });
 
-  it("voicedDurationMs > maxVoicedMs → retry-phrase even with the complete phrase (background conversation can never pass)", () => {
+  it("voicedDurationMs > maxVoicedMs → retry-audio even with the complete phrase (background conversation can never be a clean enrollment)", () => {
     const d = decideVoiceId({
       transcript: "my voice identifies me",
       transcriptConfidence: 0.9,
       tracker: mkSnap({ voicedDurationMs: 9000, endReason: "max-duration", speechEnded: false }),
     });
-    expect(d.verdict).toBe("retry-phrase");
+    expect(d.verdict).toBe("retry-audio");
     expect(d.reasons.join(" ")).toContain("9000");
   });
 
@@ -401,7 +403,7 @@ describe("decideVoiceId", () => {
     expect(d.verdict).toBe("pass");
   });
 
-  it("long recording without the complete phrase → retry-phrase", () => {
+  it("unrelated words within bounds still PASS — the phrase only elicits the sample; what matters is clean direct-handset audio", () => {
     const d = decideVoiceId({
       transcript: "the weather is nice today and i am feeling good",
       transcriptConfidence: 0.9,
@@ -412,12 +414,22 @@ describe("decideVoiceId", () => {
         speechEnded: false,
       }),
     });
-    expect(d.verdict).toBe("retry-phrase");
+    expect(d.verdict).toBe("pass");
   });
 
-  it("empty transcript with usable speech → retry-phrase", () => {
+  it("empty transcript with usable direct-handset speech still PASSES (STT is supporting evidence only)", () => {
     const d = decideVoiceId({ transcript: "", transcriptConfidence: null, tracker: mkSnap() });
-    expect(d.verdict).toBe("retry-phrase");
+    expect(d.verdict).toBe("pass");
+    expect(d.scores.phraseCoverage).toBe(0);
+  });
+
+  it("speech present but shorter than the enrollment floor (300–400ms band) → inconclusive, never a pass", () => {
+    const d = decideVoiceId({
+      transcript: "my voice identifies me",
+      transcriptConfidence: 0.9,
+      tracker: mkSnap({ voicedDurationMs: 350, sectionCount: 1, sections: [{ startMs: 100, endMs: 450 }] }),
+    });
+    expect(d.verdict).toBe("inconclusive");
   });
 });
 
@@ -652,11 +664,11 @@ function biquad(type: "lowpass" | "highpass" | "peaking", f0: number, q: number,
   const cosw = Math.cos(w0);
   const sinw = Math.sin(w0);
   const alpha = sinw / (2 * q);
-  let b0: number, b1: number, b2: number, a0: number, a1: number, a2: number;
+  let b0: number, b1: number, b2: number;
+  const a0 = 1 + alpha, a1 = -2 * cosw, a2 = 1 - alpha;
   if (type === "lowpass") { b0 = (1 - cosw) / 2; b1 = 1 - cosw; b2 = (1 - cosw) / 2; }
   else if (type === "highpass") { b0 = (1 + cosw) / 2; b1 = -(1 + cosw); b2 = (1 + cosw) / 2; }
   else { b0 = 1 + alpha * A; b1 = -2 * cosw; b2 = 1 - alpha * A; }
-  a0 = 1 + alpha; a1 = -2 * cosw; a2 = 1 - alpha;
   return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 };
 }
 function runBiquad(x: Float32Array, f: ReturnType<typeof biquad>): Float32Array {

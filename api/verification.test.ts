@@ -1796,7 +1796,6 @@ import {
 } from "./verification-record";
 import * as vstream from "./verification-stream";
 import {
-  __testSetSpeakerphoneSuspicion,
   activeStreams,
   attachVerificationStreamServer,
   authenticateStreamStart,
@@ -3303,7 +3302,7 @@ describe("real voice-ID gate (guarded)", () => {
     }
   });
 
-  it("PARTIAL phrase ('my voice') → VOICE_ID_RETRY_PHRASE and the phrase retry prompt on the next attempt", async () => {
+  it("PHRASE IS NOT A GATE (user directive): a partial/wrong transcript with clean direct-handset audio still VERIFIES and enrolls", async () => {
     const s = await makeSession(vs.VState.CALL_ACCEPTED, {
       guarded: true,
       legACallSid: "CA_part_legA",
@@ -3314,18 +3313,15 @@ describe("real voice-ID gate (guarded)", () => {
       { SpeechResult: "my voice", Confidence: "0.9" },
     );
     const body = await res.text();
-    expect(body).toContain(`/api/verify/twiml/voice-id?sid=${s.sessionId}&amp;a=1`);
+    // Straight to the second press-1 gather — no phrase retry.
+    expect(body).toContain(`/api/verify/gather/leg-a-ready?sid=${s.sessionId}`);
     const after = (await vs.findSession(s.sessionId))!;
-    expect(after.voiceIdState).toBe(vs.VoiceIdState.RETRY_PHRASE);
-    expect(after.voiceIdRetryKind).toBe("phrase");
-    expect(after.voiceIdCapturedAt).toBeNull();
-    // The next attempt serves the PHRASE retry prompt (exact copy).
-    const v2 = await (
-      await postForm(`/api/verify/twiml/voice-id?sid=${s.sessionId}&a=1`)
-    ).text();
-    expect(v2).toContain(
-      "I did not hear the complete phrase. After the beep, please say: My voice identifies me.",
-    );
+    expect(after.voiceIdState).toBe(vs.VoiceIdState.VERIFIED);
+    expect(after.voiceIdCapturedAt).not.toBeNull();
+    expect(after.voiceIdRecordingSid).toBe(attemptId);
+    expect(after.voiceRecordingUrl).toBe(`local://voice-id/${attemptId}`);
+    const types = (await events(s.sessionId)).map((e) => e.eventType);
+    expect(types).toContain("VOICE_ID_VERIFIED");
   });
 
   it("RELAY/speakerphone snapshot → VOICE_ID_RETRY_RELAY and the relay retry prompt (never passes)", async () => {
